@@ -7,6 +7,8 @@
 #include "imgui.hpp"
 #include "webgpu/gpu.hpp"
 #include "webgpu/gpu_prof.hpp"
+#include "webgpu/sdl2shim_present.hpp"
+#include <optional>
 #include <webgpu/webgpu_cpp.h>
 #endif
 
@@ -197,7 +199,8 @@ AuroraInfo initialize(int argc, char* argv[], const AuroraConfig& config) noexce
 
 void shutdown() noexcept {
 #ifdef AURORA_ENABLE_GX
-  gfx::render_worker::synchronize();
+  // gpu_synchronize (not render_worker::synchronize) so a worker parked on an EFB slot is released.
+  gfx::gpu_synchronize();
 #ifdef AURORA_ENABLE_RMLUI
   rmlui::shutdown();
 #endif
@@ -269,10 +272,23 @@ void end_frame() noexcept {
 
   gfx::end_frame([rmlBindGroup = std::move(rmlBindGroup), rmlOverlay, viewport,
                   imguiDrawData = std::move(imguiDrawData)](wgpu::CommandEncoder& encoder) {
+    // Dusklight (P4): on the SDL2-shim device path we render the finished frame into a shared EFB
+    // texture and let the main thread blit + swap it (Mali's page flip only works from the display
+    // thread). Everything else about the frame is identical, so this only swaps out where the
+    // present passes draw and who calls Present.
+    const bool efbPresent = webgpu::sdl2shim_present::active();
+    std::optional<webgpu::sdl2shim_present::AcquiredFrame> efbFrame;
+
     wgpu::Texture currentTexture;
     wgpu::TextureView currentView;
     auto surfaceStatus = wgpu::SurfaceGetCurrentTextureStatus::Error;
-    {
+    if (efbPresent) {
+      ZoneScopedN("Acquire EFB slot");
+      efbFrame = webgpu::sdl2shim_present::acquire();
+      if (efbFrame) {
+        currentView = efbFrame->view;
+      }
+    } else {
       window::SurfaceLock surfaceLock;
       if (window::is_presentable() && g_surface) {
         ZoneScopedN("Acquire texture");
@@ -286,7 +302,7 @@ void end_frame() noexcept {
       }
     }
 
-    const bool canPresent = currentTexture && currentView;
+    const bool canPresent = static_cast<bool>(currentView);
     if (canPresent) {
       wgpu::BindGroup presentBindGroup;
       if (rmlBindGroup && !rmlOverlay) {
@@ -355,7 +371,15 @@ void end_frame() noexcept {
       g_queue.Submit(1, &buffer);
     }
     webgpu::gpu_prof::after_submit();
-    if (canPresent && g_surface) {
+    if (efbPresent) {
+      // Hand the slot to the main thread, which fences on Dawn's work and then blits + swaps it.
+      // publish_empty() keeps its accounting exact when this frame produced nothing.
+      if (efbFrame) {
+        webgpu::sdl2shim_present::publish(efbFrame->slot);
+      } else {
+        webgpu::sdl2shim_present::publish_empty();
+      }
+    } else if (canPresent && g_surface) {
       ZoneScopedN("Present");
       wgpu::ConvertibleStatus status = wgpu::Status::Error;
       {

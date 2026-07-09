@@ -84,5 +84,6 @@ void synchronize();
 
 bool is_worker_thread() noexcept;
 bool is_idle() noexcept;
+bool is_running() noexcept;
 
 } // namespace aurora::gfx::render_worker

@@ -198,8 +198,8 @@ ShaderInfo build_shader_info(const ShaderConfig& config) noexcept {
     }
   }
 
-  // 10 position matrices, 10 texture matrices, 10 normal matrices.
-  info.uniformSize += sizeof(Mat3x4<float>) * 30;
+  // 10 position matrices + 10 texture matrices. Normal matrices are added below iff usesNormals.
+  info.uniformSize += sizeof(Mat3x4<float>) * 20;
   info.uniformSize += 16; // active PN matrix index + padding
 
   for (int i = 0; i < config.tevStageCount; ++i) {
@@ -278,6 +278,13 @@ ShaderInfo build_shader_info(const ShaderConfig& config) noexcept {
         info.lightingEnabled = true;
       }
     }
+  }
+  // Normal matrices (nrm_mtx) are read only by lit shaders (lighting_func, per-pixel normal
+  // output, emboss bump) and the normal-visualization debug path. Unlit draws never reference
+  // them, so gate the 480B palette here (lightingEnabled is fully resolved by this point).
+  info.usesNormals = info.lightingEnabled || EnableNormalVisualization;
+  if (info.usesNormals) {
+    info.uniformSize += sizeof(Mat3x4<float>) * MaxPnMtx;
   }
   if (info.lightingEnabled) {
     // Lights + light state for all channels
@@ -408,8 +415,10 @@ gfx::Range build_uniform(const ShaderInfo& info, u32 vtxStart, const BindGroupRa
     buf.append(g_gxState.texMtxs[i]);
   }
 
-  for (int i = 0; i < MaxPnMtx; i++) {
-    buf.append(g_gxState.pnMtx[i].nrm);
+  if (info.usesNormals) {
+    for (int i = 0; i < MaxPnMtx; i++) {
+      buf.append(g_gxState.pnMtx[i].nrm);
+    }
   }
 
   for (int i = 0; i < info.loadsTevReg.size(); ++i) {

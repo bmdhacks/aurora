@@ -956,10 +956,39 @@ std::string build_shader_source(const ShaderConfig& config) noexcept {
     vtxXfrAttrsPre += "\n    let in_pnmtxidx = ubuf.current_pnmtx;";
   }
 
+  // Native vertex fetch: present attrs arrive as real @location inputs (CPU-expanded)
+  // rather than being software-fetched from vbuf. This attribute order MUST match
+  // native_vertex_layout() (pipeline.cpp) and build_native_layout()
+  // (command_processor.cpp) — canonical GX attr order, one @location per present attr.
+  if (config.nativeVertexFetch) {
+    u32 location = 0;
+    const auto addNativeInput = [&](GXAttr attr, std::string_view type) {
+      if (config.attrs[attr].attrType == GX_NONE) {
+        return;
+      }
+      vtxInAttrs += fmt::format(",\n    @location({}) {}: {}", location++, vtx_attr(config, attr), type);
+    };
+    addNativeInput(GX_VA_PNMTXIDX, "u32");
+    for (GXAttr attr = GX_VA_TEX0MTXIDX; attr <= GX_VA_TEX7MTXIDX; attr = static_cast<GXAttr>(attr + 1)) {
+      addNativeInput(attr, "u32");
+    }
+    addNativeInput(GX_VA_POS, "vec3f");
+    addNativeInput(GX_VA_NRM, "vec3f");
+    addNativeInput(GX_VA_CLR0, "vec4f");
+    addNativeInput(GX_VA_CLR1, "vec4f");
+    for (GXAttr attr = GX_VA_TEX0; attr <= GX_VA_TEX7; attr = static_cast<GXAttr>(attr + 1)) {
+      addNativeInput(attr, "vec2f");
+    }
+  }
+
   // Load vertex attributes
   for (GXAttr attr = GX_VA_PNMTXIDX; attr <= GX_VA_TEX7; attr = static_cast<GXAttr>(attr + 1)) {
     const auto attrType = config.attrs[attr].attrType;
     if (attrType == GX_NONE) {
+      continue;
+    }
+    // Native inputs are already bound by name (in_pos, in_pnmtxidx, ...) — no software load.
+    if (config.nativeVertexFetch) {
       continue;
     }
     // in_pnmtxidx and in_pos written above for line mode
@@ -988,9 +1017,9 @@ std::string build_shader_source(const ShaderConfig& config) noexcept {
 
   if (config.lineMode == 0) {
     vtxXfrAttrsPre += fmt::format(
-        "\n    let mv_pos = vec4f({}, 1.0) * ubuf.postex_mtx[in_pnmtxidx];"
+        "\n    let mv_pos = vec4f({}, 1.0) * ubuf.{}[in_pnmtxidx];"
         "\n    out.pos = vec4f(mv_pos, 1.0) * ubuf.proj;",
-        vtx_attr(config, GX_VA_POS));
+        vtx_attr(config, GX_VA_POS), "postex_mtx");
   } else if (config.lineMode == 3) {
     // GX_POINTS: expand single vertex to axis-aligned screen-space square
     vtxXfrAttrsPre +=
@@ -1024,10 +1053,12 @@ std::string build_shader_source(const ShaderConfig& config) noexcept {
   } else {
     vtxXfrAttrsPre += "\n    out.pos.z += out.pos.w;";
   }
-  vtxXfrAttrsPre += fmt::format(
-      "\n    let nrm_tmp = vec4f({}, 0.0) * ubuf.nrm_mtx[in_pnmtxidx];"
-      "\n    let mv_nrm = select(nrm_tmp, normalize(nrm_tmp), dot(nrm_tmp, nrm_tmp) > 1e-10);",
-      vtx_attr(config, GX_VA_NRM));
+  if (info.usesNormals) {
+    vtxXfrAttrsPre += fmt::format(
+        "\n    let nrm_tmp = vec4f({}, 0.0) * ubuf.{}[in_pnmtxidx];"
+        "\n    let mv_nrm = select(nrm_tmp, normalize(nrm_tmp), dot(nrm_tmp, nrm_tmp) > 1e-10);",
+        vtx_attr(config, GX_VA_NRM), "nrm_mtx");
+  }
   if constexpr (EnableNormalVisualization) {
     vtxOutAttrs += fmt::format("\n    @location({}) nrm: vec3f,", vtxOutIdx++);
     vtxXfrAttrsPre += "\n    out.nrm = mv_nrm;";
@@ -1035,7 +1066,9 @@ std::string build_shader_source(const ShaderConfig& config) noexcept {
 
   uniBufAttrs += "\n    proj: mat4x4f,";
   uniBufAttrs += fmt::format("\n    postex_mtx: array<mat3x4f, {}>,", MaxPnMtx + MaxTexMtx);
-  uniBufAttrs += fmt::format("\n    nrm_mtx: array<mat3x4f, {}>,", MaxPnMtx);
+  if (info.usesNormals) {
+    uniBufAttrs += fmt::format("\n    nrm_mtx: array<mat3x4f, {}>,", MaxPnMtx);
+  }
   std::string fragmentFnPre;
   std::string fragmentFn;
 
@@ -1564,7 +1597,11 @@ std::string build_shader_source(const ShaderConfig& config) noexcept {
     fragmentFn += "\n    prev = vec4f(in.nrm, prev.a);";
   }
 
-  const auto shaderSource = fmt::format(R"""(
+  // Storage/texture vertex fetch needs the byte-loader prelude and the vbuf/abuf
+  // storage bindings; native fetch omits both. Mali counts even an unused
+  // vertex-stage storage block against its zero limit, and the loaders are dead code
+  // in native mode (all attrs arrive as hardware @location inputs).
+  const std::string storageFetchPrelude = config.nativeVertexFetch ? std::string() : fmt::format(R"""(
 fn bswap32(v: u32, le: bool) -> u32 {{
   if (le) {{
     return v;
@@ -1875,6 +1912,17 @@ fn fetch_rgba8(p: ptr<storage, array<u32>>, byte_off: u32, le: bool) -> vec4f {{
   let v = raw_fetch_u8_4(p, byte_off);
   return vec4f(v) / 255.0;
 }}
+)""");
+
+  const std::string staticVtxBindings = config.nativeVertexFetch ? std::string() : R"""(
+@group(0) @binding(0)
+var<storage, read> vbuf: array<u32>;
+@group(0) @binding(1)
+var<storage, read> abuf: array<u32>;)""";
+
+  // tev_overflow_* are fragment/TEV helpers (not vertex fetch) — always emitted.
+  const auto shaderSource = fmt::format(R"""(
+{9}
 
 fn tev_overflow_f32(in: f32) -> f32 {{
   let byte_space = in * 255.0;
@@ -1900,11 +1948,7 @@ struct Uniform {{
     logical_viewport_size: vec2f,
     pad: vec2u,
     array_start: array<u32, 12>,{0}
-}};
-@group(0) @binding(0)
-var<storage, read> vbuf: array<u32>;
-@group(0) @binding(1)
-var<storage, read> abuf: array<u32>;
+}};{10}
 @group(1) @binding(0)
 var<uniform> ubuf: Uniform;{1}
 
@@ -1926,7 +1970,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4f {{{6}{5}
 }}
 )""",
                                         uniBufAttrs, texBindings, vtxOutAttrs, vtxInAttrs, vtxXfrAttrs, fragmentFn,
-                                        fragmentFnPre, vtxXfrAttrsPre, uniformPre);
+                                        fragmentFnPre, vtxXfrAttrsPre, uniformPre, storageFetchPrelude, staticVtxBindings);
   if (EnableDebugPrints) {
     Log.info("Generated shader (hash {:x}): {}", hash, shaderSource);
   }

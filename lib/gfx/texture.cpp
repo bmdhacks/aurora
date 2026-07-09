@@ -76,7 +76,9 @@ TextureHandle new_static_texture_2d(uint32_t width, uint32_t height, uint32_t mi
   }
 
   uint32_t offset = 0;
-  for (uint32_t mip = 0; mip < mips; ++mip) {
+  // Use ref.mipCount (already clamped in new_dynamic_texture_2d), not the raw mips
+  // argument — otherwise we'd write past the texture's actual mip levels.
+  for (uint32_t mip = 0; mip < ref.mipCount; ++mip) {
     const wgpu::Extent3D mipSize{
         .width = std::max(ref.size.width >> mip, 1u),
         .height = std::max(ref.size.height >> mip, 1u),
@@ -114,6 +116,29 @@ TextureHandle new_static_texture_2d(uint32_t width, uint32_t height, uint32_t mi
 TextureHandle new_dynamic_texture_2d(uint32_t width, uint32_t height, uint32_t mips, u32 gxFormat,
                                      const char* label) noexcept {
   ZoneScopedS(3);
+  // A zero-sized texture makes Mali's glTexStorage2D fail with GL_INVALID_VALUE and lose
+  // the device (desktop Mesa tolerates it). GX can request 0-dim copies/targets when a
+  // subsystem is scaled to nothing (e.g. shadows under shadowResolutionMultiplier=0), so
+  // clamp to at least 1x1 — the texture is valid and the draw becomes an effective no-op.
+  width = width < 1u ? 1u : width;
+  height = height < 1u ? 1u : height;
+  // Mali's GLES rejects glTexStorage2D with GL_INVALID_VALUE when the requested mip
+  // count exceeds floor(log2(max(w,h)))+1. Some GX textures over-specify their mip
+  // chain (harmless on desktop Mesa, fatal on Mali), so clamp to the legal maximum.
+  {
+    uint32_t maxMips = 1;
+    for (uint32_t d = (width > height ? width : height); d > 1u; d >>= 1) {
+      ++maxMips;
+    }
+    if (mips > maxMips) {
+      Log.warn("Clamping texture '{}' mip levels {} -> {} for {}x{} (Mali glTexStorage2D limit)", label, mips, maxMips,
+               width, height);
+      mips = maxMips;
+    }
+    if (mips == 0) {
+      mips = 1;
+    }
+  }
   const auto wgpuFormat = to_wgpu(gxFormat);
   const wgpu::Extent3D size{
       .width = width,
@@ -149,6 +174,10 @@ TextureHandle new_dynamic_texture_2d(uint32_t width, uint32_t height, uint32_t m
 TextureHandle new_render_texture(uint32_t width, uint32_t height, u32 gxFormat, const char* label) noexcept {
   ZoneScoped;
 
+  // Clamp to at least 1x1 — a 0-sized target (e.g. a shadow EFB-resolve copy under
+  // shadowResolutionMultiplier=0) crashes Mali's glTexStorage2D with GL_INVALID_VALUE.
+  width = width < 1u ? 1u : width;
+  height = height < 1u ? 1u : height;
   const auto wgpuFormat = webgpu::g_graphicsConfig.surfaceConfiguration.format;
   const wgpu::Extent3D size{
       .width = width,
@@ -182,6 +211,9 @@ TextureHandle new_render_texture(uint32_t width, uint32_t height, u32 gxFormat, 
 TextureHandle new_conv_texture(uint32_t width, uint32_t height, u32 gxFormat, const char* label) noexcept {
   ZoneScoped;
 
+  // Clamp to at least 1x1 — a 0-sized copy-conv target crashes Mali's glTexStorage2D.
+  width = width < 1u ? 1u : width;
+  height = height < 1u ? 1u : height;
   const auto wgpuFormat = to_wgpu(gxFormat);
   const wgpu::Extent3D size{
       .width = width,

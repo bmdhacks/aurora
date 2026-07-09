@@ -29,7 +29,15 @@ extern "C" void Android_UnlockActivityMutex(void);
 
 #include <algorithm>
 #include <atomic>
+#include <cstdlib>
 #include <vector>
+
+#if defined(SDL_PLATFORM_LINUX)
+#include <fcntl.h>
+#include <linux/fb.h>
+#include <sys/ioctl.h>
+#include <unistd.h>
+#endif
 
 #include "rmlui.hpp"
 #include "dolphin/vi/vi_internal.hpp"
@@ -80,6 +88,42 @@ Vec2<int> fit_frame_buffer_to_aspect(int width, int height, float aspect) {
   }
   return {width, std::max(1, static_cast<int>(std::lround(static_cast<float>(width) / aspect)))};
 }
+
+int positive_env_or(const char* name, int fallback) noexcept {
+  const char* value = SDL_getenv(name);
+  if (value == nullptr || value[0] == '\0') {
+    return fallback;
+  }
+  return std::max(1, std::atoi(value));
+}
+
+bool portmaster_constrained_render_surface() noexcept {
+  return SDL_getenv("DUSKLIGHT_PORTMASTER_EGL_FBDEV_SURFACE") != nullptr ||
+         SDL_getenv("DUSKLIGHT_PORTMASTER_SDL2SHIM_EGL_SURFACE") != nullptr ||
+         SDL_getenv("DUSKLIGHT_PORTMASTER_FORCE_VERTEX_TEXTURE") != nullptr;
+}
+
+bool portmaster_prefer_fbdev_output_size() noexcept {
+  return SDL_getenv("DUSKLIGHT_PORTMASTER_EGL_FBDEV_SURFACE") != nullptr;
+}
+
+#if defined(SDL_PLATFORM_LINUX)
+bool fbdev_physical_size(int& width, int& height) noexcept {
+  int fd = open("/dev/fb0", O_RDONLY, 0);
+  if (fd < 0) {
+    return false;
+  }
+  fb_var_screeninfo vinfo{};
+  const bool ok = ioctl(fd, FBIOGET_VSCREENINFO, &vinfo) == 0 && vinfo.xres > 0 && vinfo.yres > 0;
+  close(fd);
+  if (!ok) {
+    return false;
+  }
+  width = static_cast<int>(vinfo.xres);
+  height = static_cast<int>(vinfo.yres);
+  return true;
+}
+#endif
 
 void resize_swapchain() noexcept {
   const auto size = get_window_size();
@@ -257,7 +301,13 @@ const AuroraEvent* poll_events() {
 }
 
 bool create_window(AuroraBackend backend) {
-  SDL_WindowFlags flags = SDL_WINDOW_HIGH_PIXEL_DENSITY;
+  SDL_WindowFlags flags = 0;
+  // The SDL2-shim borrowed-EGL surface path presents at the shim's own drawable
+  // size; high-DPI scaling here would desync the WebGPU swapchain extent from the
+  // borrowed surface. Skip it in that mode.
+  if (SDL_getenv("DUSKLIGHT_PORTMASTER_SDL2SHIM_EGL_SURFACE") == nullptr) {
+    flags |= SDL_WINDOW_HIGH_PIXEL_DENSITY;
+  }
 #if TARGET_OS_IOS || TARGET_OS_TV
   flags |= SDL_WINDOW_FULLSCREEN;
 #else
@@ -266,6 +316,36 @@ bool create_window(AuroraBackend backend) {
     flags |= SDL_WINDOW_FULLSCREEN;
   }
 #endif
+  switch (backend) {
+#ifdef AURORA_ENABLE_GX
+#ifdef DAWN_ENABLE_BACKEND_VULKAN
+  case BACKEND_VULKAN:
+    flags |= SDL_WINDOW_VULKAN;
+    break;
+#endif
+#ifdef DAWN_ENABLE_BACKEND_METAL
+  case BACKEND_METAL:
+    flags |= SDL_WINDOW_METAL;
+    break;
+#endif
+#ifdef DAWN_ENABLE_BACKEND_OPENGL
+  case BACKEND_OPENGL:
+  case BACKEND_OPENGLES:
+    // Only let SDL create/own a GL context when Dawn will NOT own EGL itself.
+    // With DUSKLIGHT_PORTMASTER_X11_DAWN set, Dawn creates its own EGL context
+    // on the render-worker thread; an SDL-owned context on the main thread then
+    // makes Dawn's eglMakeCurrent fail with EGL_BAD_ACCESS. This is how GLES
+    // runs on desktop X11 and on the Mali device. (Mali-bringup step #2.)
+    if (SDL_getenv("DUSKLIGHT_PORTMASTER_X11_DAWN") == nullptr &&
+        SDL_getenv("DUSKLIGHT_PORTMASTER_SDL_RENDERER_PRESENT") == nullptr) {
+      flags |= SDL_WINDOW_OPENGL;
+    }
+    break;
+#endif
+#endif
+  default:
+    break;
+  }
   auto width = static_cast<Sint32>(g_config.windowWidth);
   auto height = static_cast<Sint32>(g_config.windowHeight);
   if (width == 0 || height == 0) {
@@ -378,6 +458,10 @@ void shutdown() {
   SDL_RemoveEventWatch(lifecycle_event_watch, nullptr);
   destroy_window();
   TRY_WARN(SDL_EnableScreenSaver(), "Error enabling screensaver: {}", SDL_GetError());
+  if (SDL_getenv("DUSKLIGHT_PORTMASTER_SDL2SHIM_OWNED_EGL") != nullptr) {
+    Log.info("PortMaster SDL2-shim owned EGL: skipping SDL_Quit during process shutdown");
+    return;
+  }
   SDL_Quit();
 }
 
@@ -389,6 +473,42 @@ AuroraWindowSize get_window_size() {
   ASSERT(SDL_GetWindowSize(g_window, &width, &height), "Failed to get window size: {}", SDL_GetError());
   ASSERT(SDL_GetWindowSizeInPixels(g_window, &native_fb_w, &native_fb_h), "Failed to get window size in pixels: {}",
          SDL_GetError());
+
+#if defined(SDL_PLATFORM_LINUX)
+  if (portmaster_prefer_fbdev_output_size()) {
+    const int oldNativeFbW = native_fb_w;
+    const int oldNativeFbH = native_fb_h;
+    if (fbdev_physical_size(native_fb_w, native_fb_h) && (native_fb_w != oldNativeFbW || native_fb_h != oldNativeFbH)) {
+      static bool loggedFbdevOverride = false;
+      if (!loggedFbdevOverride) {
+        Log.info("PortMaster output size override: SDL drawable {}x{} -> fbdev {}x{}", oldNativeFbW, oldNativeFbH,
+                 native_fb_w, native_fb_h);
+        loggedFbdevOverride = true;
+      }
+    }
+  } else if (SDL_getenv("DUSKLIGHT_PORTMASTER_USE_FBDEV_SIZE") != nullptr) {
+    int visibleW = 0;
+    int visibleH = 0;
+    if (fbdev_physical_size(visibleW, visibleH)) {
+      static bool loggedFbdevVisible = false;
+      if (!loggedFbdevVisible) {
+        Log.info("PortMaster visible output area: SDL drawable {}x{} fbdev {}x{}", native_fb_w, native_fb_h, visibleW,
+                 visibleH);
+        loggedFbdevVisible = true;
+      }
+      char widthBuf[16];
+      char heightBuf[16];
+      SDL_snprintf(widthBuf, sizeof(widthBuf), "%d", visibleW);
+      SDL_snprintf(heightBuf, sizeof(heightBuf), "%d", visibleH);
+      if (SDL_getenv("DUSKLIGHT_PORTMASTER_VISIBLE_WIDTH") == nullptr) {
+        SDL_setenv_unsafe("DUSKLIGHT_PORTMASTER_VISIBLE_WIDTH", widthBuf, 1);
+      }
+      if (SDL_getenv("DUSKLIGHT_PORTMASTER_VISIBLE_HEIGHT") == nullptr) {
+        SDL_setenv_unsafe("DUSKLIGHT_PORTMASTER_VISIBLE_HEIGHT", heightBuf, 1);
+      }
+    }
+  }
+#endif
 
   int fb_w = native_fb_w;
   int fb_h = native_fb_h;
@@ -408,6 +528,13 @@ AuroraWindowSize get_window_size() {
       fb_w = fitW;
       fb_h = fitH;
     }
+  }
+
+  if (portmaster_constrained_render_surface()) {
+    const int cappedW = positive_env_or("DUSKLIGHT_PORTMASTER_RENDER_WIDTH", fb_w);
+    const int cappedH = positive_env_or("DUSKLIGHT_PORTMASTER_RENDER_HEIGHT", fb_h);
+    fb_w = std::min(fb_w, cappedW);
+    fb_h = std::min(fb_h, cappedH);
   }
 
   const float scale = SDL_GetWindowDisplayScale(g_window);

@@ -12,13 +12,20 @@
 #include <absl/container/flat_hash_map.h>
 #include <tracy/Tracy.hpp>
 
+#include <bit>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <optional>
+#include <vector>
 
 namespace aurora::gx::fifo {
 static Module Log("aurora::gx::fifo");
+
+// Bumped by GX_CMD_INVL_VC (GXInvalidateVtxCache); invalidates the memoized attribute
+// array content hashes the native geometry cache keys indexed draws by.
+static u32 s_gxArrayInvalidateGen = 0;
 
 static u16 prepare_idx_buffer(ByteBuffer& buf, GXPrimitive prim, u16 vtxStart, u16 vtxCount) {
   u16 numIndices = 0;
@@ -88,6 +95,35 @@ static u16 prepare_idx_buffer(ByteBuffer& buf, GXPrimitive prim, u16 vtxStart, u
   } else
     UNLIKELY FATAL("unsupported primitive type {}", static_cast<u32>(prim));
   return numIndices;
+}
+
+// Emit index data that keeps a triangle strip AS a strip on the GPU (TriangleStrip
+// topology), rather than unrolling it into an independent triangle list. `restart`
+// prepends a 0xffff primitive-restart index so an earlier strip in the same index
+// buffer ends before this one begins. Returns the index count written (incl. restart).
+static u16 build_triangle_strip_topology_indices(ByteBuffer& buf, u16 vtxStart, u16 vtxCount, bool restart) {
+  const u16 numIndices = static_cast<u16>(vtxCount + (restart ? 1 : 0));
+  buf.reserve_extra(static_cast<size_t>(numIndices) * sizeof(u16));
+  if (restart) {
+    buf.append<u16>(0xffff);
+  }
+  for (u16 v = 0; v < vtxCount; ++v) {
+    buf.append(static_cast<u16>(vtxStart + v));
+  }
+  return numIndices;
+}
+
+// Concatenate several strips into one index buffer with 0xffff restart markers between
+// them, so a whole run of adjacent strip draws collapses into a single DrawIndexed.
+static u32 build_triangle_strip_batch_topology_indices(ByteBuffer& buf, const std::vector<u16>& stripCounts) {
+  u32 indexCount = 0;
+  u16 vtxStart = 0;
+  for (size_t i = 0; i < stripCounts.size(); ++i) {
+    const bool restart = i != 0;
+    indexCount += build_triangle_strip_topology_indices(buf, vtxStart, stripCounts[i], restart);
+    vtxStart = static_cast<u16>(vtxStart + stripCounts[i]);
+  }
+  return indexCount;
 }
 
 // GX FIFO opcodes - use CP_ prefix to avoid clashing with GXCommandList.h macros
@@ -441,7 +477,9 @@ void process(const u8* data, u32 size, bool bigEndian) {
     }
 
     case CP_CMD_INVAL_VTX: {
-      // Invalidate vertex cache
+      // Invalidate vertex cache: the game may have rewritten attribute array contents in
+      // place (e.g. particle systems), so drop memoized array content hashes.
+      ++s_gxArrayInvalidateGen;
       break;
     }
 
@@ -1553,6 +1591,21 @@ static u32 calculate_last_vtx_size(GXVtxFmt fmt) {
 static void handle_draw_unmerged(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Range vertRange);
 static void push_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Range vertRange, gfx::Range idxRange,
                          u32 numIndices);
+// Mali fork: storage vertex fetch is impossible on the target
+// (GL_MAX_VERTEX_SHADER_STORAGE_BLOCKS=0), so a draw that native fetch declines —
+// instanced lines/points (e.g. GX_LINESTRIP minimap draws), NBT normals, exotic
+// component types — is dropped instead of building a storage pipeline that can't
+// link and aborts the device. If any dropped geometry turns out to matter, extend
+// native fetch to cover it (e.g. instanced lines); texture-vertex fetch is NOT an
+// option — it's unusably slow on Mali. Flip to false only to exercise storage on desktop.
+static constexpr bool kSkipStorageVertexFetch = true;
+
+static bool native_vertex_mode() noexcept;
+static bool try_native_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, const u8* data, u32& pos, u32 vtxSize);
+static bool try_native_draw_run(u8 cmd, GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, u32 vtxSize, const u8* data,
+                                u32& pos, u32 size, bool bigEndian);
+static bool try_native_draw_indexed(GXVtxFmt fmt, u16 vtxCount, const u8* vtxData, u32 vtxSize, const u8* idxData,
+                                    u32 idxBytes, u32 indexCount);
 
 // Draw command handler - parses vertices inline and caches results
 static ByteBuffer handle_draw_idx_buf;
@@ -1569,9 +1622,16 @@ static void draw_prim(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, const u8* da
   if (pos + totalVtxBytes > size)
     UNLIKELY { handle_draw_overrun(totalVtxBytes, data, pos, size); }
 
+  // Native vertex fetch expands supported layouts to hardware attributes on the CPU
+  // (advancing pos itself). Unsupported layouts fall through to the storage path.
+  if (native_vertex_mode() && try_native_draw(prim, fmt, vtxCount, data, pos, vtxSize)) {
+    return;
+  }
+
   auto* lastDraw = !g_gxState.stateDirty ? gfx::get_last_draw_command<DrawData>() : nullptr;
+  // A storage draw must never merge into a native draw's range (incompatible buffer layout).
   const bool canMerge = lastDraw != nullptr && prim != GX_LINES && prim != GX_LINESTRIP && prim != GX_POINTS &&
-                        lastDraw->instanceCount == 1;
+                        lastDraw->instanceCount == 1 && !lastDraw->nativeVertexFetch;
 
   // Push raw vertex data to buffer. Merged draws must remain byte-contiguous with the previous range.
   gfx::Range vertRange = gfx::push_verts(data + pos, totalVtxBytes, canMerge ? 0 : 4);
@@ -1623,6 +1683,19 @@ static void handle_draw(u8 cmd, const u8* data, u32& pos, u32 size, bool bigEndi
   u16 vtxCount = read_u16(data + pos, bigEndian);
   pos += 2;
 
+  u32 vtxSize;
+  if (g_gxState.lastVtxFmt == fmt)
+    LIKELY { vtxSize = g_gxState.lastVtxSize; }
+  else
+    UNLIKELY { vtxSize = calculate_last_vtx_size(fmt); }
+
+  // Fold this draw plus any immediately-following identical draw commands into one native
+  // hardware draw (strip topology + primitive restart). Unsupported primitives/layouts fall
+  // through to draw_prim (single native, else the storage/software path).
+  if (native_vertex_mode() && try_native_draw_run(cmd, prim, fmt, vtxCount, vtxSize, data, pos, size, bigEndian)) {
+    return;
+  }
+
   draw_prim(prim, fmt, vtxCount, data, pos, size);
 }
 
@@ -1646,6 +1719,18 @@ static void handle_draw_unmerged(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, g
 
 static void push_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Range vertRange, gfx::Range idxRange,
                          u32 numIndices) {
+  if constexpr (kSkipStorageVertexFetch) {
+    // Native fetch declined this layout; the storage fallback would bind vertex SSBOs
+    // and can't link on Mali. The caller already consumed the FIFO vertices, so just
+    // drop the draw. Warn a few times so we know what geometry is being skipped.
+    static Module Log("aurora::gx");
+    static int warned = 0;
+    if (warned++ < 8) {
+      Log.warn("Dropping non-native draw (prim={} fmt={} verts={}) — storage vertex fetch unavailable on Mali",
+               static_cast<int>(prim), static_cast<int>(fmt), vtxCount);
+    }
+    return;
+  }
   // Build pipeline, bind groups, and push draw command
   BindGroupRanges ranges{};
   for (int i = GX_VA_POS; i <= GX_VA_TEX7; ++i) {
@@ -1688,6 +1773,778 @@ static void push_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Rang
       .bindGroups = bindGroups,
       .dstAlpha = g_gxState.dstAlpha,
   });
+}
+
+// ---------------------------------------------------------------------------
+// Native vertex fetch (M1: correctness-first, no cache/batching).
+//
+// The default (storage) path software-fetches GX vertices from SSBOs, which
+// (a) miscompiles the per-vertex matrix-palette index into slot 0 on AGX/Mali
+// (the "porcupine") and (b) cannot link on Mali (0 vertex-stage SSBOs). Here we
+// expand each GX vertex on the CPU into real hardware vertex attributes — most
+// importantly pnmtxidx becomes a plain Uint32 attribute, so it never flows
+// through the miscompiled byte-load — and let the fixed-function vertex input
+// path feed the shader. Skinning/projection stay on the GPU.
+// ---------------------------------------------------------------------------
+
+static bool native_vertex_mode() noexcept {
+  static const bool mode = [] {
+    if (const char* e = std::getenv("DUSKLIGHT_GX_VERTEX_MODE")) {
+      // "storage" forces the legacy SSBO path (for A/B comparison); anything else
+      // (incl. the "native" default) uses native fetch. "texture" is a later milestone.
+      if (std::strcmp(e, "storage") == 0) {
+        return false;
+      }
+    }
+    return true;
+  }();
+  return mode;
+}
+
+// Canonical hardware-attribute byte width per GX attr (must match native_vertex_layout).
+static u8 canonical_attr_size(GXAttr attr) noexcept {
+  if (attr == GX_VA_PNMTXIDX || (attr >= GX_VA_TEX0MTXIDX && attr <= GX_VA_TEX7MTXIDX)) {
+    return 4; // Uint32
+  }
+  if (attr == GX_VA_POS || attr == GX_VA_NRM) {
+    return 12; // Float32x3
+  }
+  if (attr == GX_VA_CLR0 || attr == GX_VA_CLR1) {
+    return 4; // Unorm8x4
+  }
+  return 8; // TEXn: Float32x2
+}
+
+static bool native_component_decodable(GXCompType type) noexcept {
+  switch (type) {
+  case GX_U8:
+  case GX_S8:
+  case GX_U16:
+  case GX_S16:
+  case GX_F32:
+    return true;
+  default:
+    return false;
+  }
+}
+
+static bool native_color_decodable(GXCompType type) noexcept {
+  switch (type) {
+  case GX_RGB565:
+  case GX_RGB8:
+  case GX_RGBX8:
+  case GX_RGBA4:
+  case GX_RGBA6:
+  case GX_RGBA8:
+    return true;
+  default:
+    return false;
+  }
+}
+
+static f32 read_component_as_float(const u8* p, GXCompType type, u8 frac, bool bigEndian) noexcept {
+  const f32 scale = 1.0f / static_cast<f32>(1u << frac);
+  switch (type) {
+  case GX_U8:
+    return static_cast<f32>(*p) * scale;
+  case GX_S8:
+    return static_cast<f32>(static_cast<int8_t>(*p)) * scale;
+  case GX_U16:
+    return static_cast<f32>(read_u16(p, bigEndian)) * scale;
+  case GX_S16:
+    return static_cast<f32>(static_cast<int16_t>(read_u16(p, bigEndian))) * scale;
+  case GX_F32:
+    return std::bit_cast<f32>(read_u32(p, bigEndian));
+  default:
+    return 0.0f;
+  }
+}
+
+static u32 expand_bits_to_8(u32 v, u32 bits) noexcept {
+  const u32 shifted = v << (8u - bits);
+  return shifted | (shifted >> bits);
+}
+
+// Decode a GX color to a packed u32 (byte 0 = R, byte 3 = A) for a Unorm8x4 attribute.
+static u32 read_color_as_rgba8(const u8* p, GXCompType type, bool bigEndian) noexcept {
+  const auto pack = [](u32 r, u32 g, u32 b, u32 a) { return r | (g << 8) | (b << 16) | (a << 24); };
+  switch (type) {
+  case GX_RGB8:
+  case GX_RGBX8:
+    return pack(p[0], p[1], p[2], 0xFFu);
+  case GX_RGBA8:
+    return pack(p[0], p[1], p[2], p[3]);
+  case GX_RGB565: {
+    const u16 v = read_u16(p, bigEndian);
+    return pack(expand_bits_to_8((v >> 11) & 0x1Fu, 5), expand_bits_to_8((v >> 5) & 0x3Fu, 6),
+                expand_bits_to_8(v & 0x1Fu, 5), 0xFFu);
+  }
+  case GX_RGBA4: {
+    const u16 v = read_u16(p, bigEndian);
+    return pack(expand_bits_to_8((v >> 12) & 0xFu, 4), expand_bits_to_8((v >> 8) & 0xFu, 4),
+                expand_bits_to_8((v >> 4) & 0xFu, 4), expand_bits_to_8(v & 0xFu, 4));
+  }
+  case GX_RGBA6: {
+    const u32 v = bigEndian ? (u32(p[0]) << 16) | (u32(p[1]) << 8) | u32(p[2])
+                            : (u32(p[2]) << 16) | (u32(p[1]) << 8) | u32(p[0]);
+    return pack(expand_bits_to_8((v >> 18) & 0x3Fu, 6), expand_bits_to_8((v >> 12) & 0x3Fu, 6),
+                expand_bits_to_8((v >> 6) & 0x3Fu, 6), expand_bits_to_8(v & 0x3Fu, 6));
+  }
+  default:
+    return 0xFFFFFFFFu;
+  }
+}
+
+// One present GX attr in a native-expanded vertex: how to read it from the FIFO
+// record / indexed array, and (via canonical order) where it lands in the output.
+struct NativeAttrDesc {
+  GXAttr attr;
+  u8 attrType;  // GX_DIRECT / GX_INDEX8 / GX_INDEX16
+  u8 srcOffset; // byte offset of this attr (direct) or its index (indexed) in the FIFO record
+  u8 compType;  // GXCompType of the source component(s)
+  u8 cnt;       // source component count
+  u8 compSize;  // bytes per source component
+  u8 frac;      // fixed-point fraction bits
+  u8 arrayStride;
+  bool le; // source endianness (direct FIFO = false = big-endian)
+};
+
+// Build the native attribute layout for the current vertex format. Returns false
+// (declines to the storage path) for anything native cannot faithfully express:
+// NBT normals, exotic component types, missing position, >16 attributes, or an
+// indexed attr whose source array is not resident.
+// Diagnostic: flip kLogNativeDecline to true to log (rate-limited) why a layout
+// declined native fetch and fell back to storage. Storage is impossible on Mali
+// (GL_MAX_VERTEX_SHADER_STORAGE_BLOCKS=0), so every decline logged here is a draw
+// that gets dropped on Mali (see kSkipStorageVertexFetch) — the fix, if it matters,
+// is to widen native fetch, not texture fetch. Compile-time so there's no env cruft.
+static constexpr bool kLogNativeDecline = false;
+static bool native_decline(int reason, GXVtxFmt fmt, int attr) {
+  if constexpr (kLogNativeDecline) {
+    static Module Log("aurora::gx");
+    static int counts[8] = {};
+    static const char* const reasons[8] = {"NBT-normal",     "undecodable-type", "nonresident-index-array",
+                                            "non-direct-type", ">16-attrs",       "no-position",
+                                            "?",              "?"};
+    if (reason >= 0 && reason < 8 && counts[reason]++ < 6) {
+      Log.warn("native fetch DECLINED reason={} fmt={} attr={} -> storage fallback (breaks on Mali)",
+               reasons[reason], static_cast<int>(fmt), attr);
+    }
+  }
+  return false;
+}
+
+static bool build_native_layout(GXVtxFmt fmt, std::vector<NativeAttrDesc>& descs, u8& nativeStride,
+                                std::array<AttrConfig, MaxVtxAttr>& nativeAttrs) {
+  const auto& vtxFmt = g_gxState.vtxFmts[fmt];
+  descs.clear();
+  nativeAttrs = {};
+  u8 srcOffset = 0;
+  u8 outOffset = 0;
+  bool hasPos = false;
+  int count = 0;
+  for (int i = GX_VA_PNMTXIDX; i <= GX_VA_TEX7; ++i) {
+    const auto attr = static_cast<GXAttr>(i);
+    const auto type = g_gxState.vtxDesc[i];
+    if (type == GX_NONE) {
+      continue;
+    }
+    const auto& attrFmt = vtxFmt.attrs[i];
+    const auto cnt = comp_cnt_count(attr, attrFmt.cnt);
+    const bool isMtxIdx = attr == GX_VA_PNMTXIDX || (attr >= GX_VA_TEX0MTXIDX && attr <= GX_VA_TEX7MTXIDX);
+    const bool isColor = attr == GX_VA_CLR0 || attr == GX_VA_CLR1;
+    // Native provides only a 3-component normal; NBT/NBT3 (cnt 9) falls back to storage.
+    if (attr == GX_VA_NRM && cnt > 3) {
+      return native_decline(0, fmt, i);
+    }
+    if (!isMtxIdx) {
+      const auto compType = static_cast<GXCompType>(attrFmt.type);
+      if (isColor ? !native_color_decodable(compType) : !native_component_decodable(compType)) {
+        return native_decline(1, fmt, i);
+      }
+    }
+
+    NativeAttrDesc d{};
+    d.attr = attr;
+    d.attrType = static_cast<u8>(type);
+    d.srcOffset = srcOffset;
+    d.compType = static_cast<u8>(attrFmt.type);
+    d.cnt = cnt;
+    d.frac = attrFmt.frac;
+    if (type == GX_DIRECT) {
+      d.le = false;
+      d.compSize = isMtxIdx ? 1 : comp_type_size(attr, attrFmt.type);
+      srcOffset += isMtxIdx ? 1 : static_cast<u8>(comp_type_size(attr, attrFmt.type) * cnt);
+    } else if (type == GX_INDEX8 || type == GX_INDEX16) {
+      const auto& array = g_gxState.arrays[i];
+      if (array.data == nullptr || array.size == 0 || array.stride == 0) {
+        return native_decline(2, fmt, i);
+      }
+      d.le = array.le;
+      d.arrayStride = array.stride;
+      d.compSize = comp_type_size(attr, attrFmt.type);
+      srcOffset += (type == GX_INDEX8) ? 1 : 2;
+    } else {
+      return native_decline(3, fmt, i);
+    }
+
+    auto& na = nativeAttrs[i];
+    na.attrType = GX_DIRECT;
+    na.offset = outOffset;
+    na.cnt = isMtxIdx ? 1 : (isColor ? 1 : (attr == GX_VA_POS || attr == GX_VA_NRM ? 3 : 2));
+    na.compType = static_cast<u8>(attrFmt.type);
+    outOffset += canonical_attr_size(attr);
+    descs.push_back(d);
+    if (attr == GX_VA_POS) {
+      hasPos = true;
+    }
+    if (++count > 16) {
+      return native_decline(4, fmt, i);
+    }
+  }
+  if (!hasPos) {
+    return native_decline(5, fmt, GX_VA_POS);
+  }
+  nativeStride = outOffset;
+  return true;
+}
+
+// Expand one GX vertex (FIFO record at `rec`) into hardware attributes.
+static void expand_native_vertex(const std::vector<NativeAttrDesc>& descs, const u8* rec, ByteBuffer& out) {
+  for (const auto& d : descs) {
+    const u8* p;
+    if (d.attrType == GX_DIRECT) {
+      p = rec + d.srcOffset;
+    } else {
+      u32 index = d.attrType == GX_INDEX8 ? u32(*(rec + d.srcOffset)) : u32(read_u16(rec + d.srcOffset, true));
+      const auto& array = g_gxState.arrays[d.attr];
+      const u32 maxIndex = d.arrayStride != 0 ? static_cast<u32>(array.size) / d.arrayStride : 0u;
+      if (index >= maxIndex) {
+        index = 0; // guard against malformed indices; valid content never hits this
+      }
+      p = static_cast<const u8*>(array.data) + static_cast<size_t>(index) * d.arrayStride;
+    }
+    const bool be = !d.le;
+    const auto attr = d.attr;
+    const auto compType = static_cast<GXCompType>(d.compType);
+    if (attr == GX_VA_PNMTXIDX) {
+      out.append<u32>(u32(*p) / 3u); // /3: GX counts matrix rows; shader indexes postex_mtx[in_pnmtxidx] directly
+    } else if (attr >= GX_VA_TEX0MTXIDX && attr <= GX_VA_TEX7MTXIDX) {
+      out.append<u32>(u32(*p)); // raw; shader divides by 3
+    } else if (attr == GX_VA_POS || attr == GX_VA_NRM) {
+      for (int c = 0; c < 3; ++c) {
+        out.append<f32>(c < d.cnt ? read_component_as_float(p + c * d.compSize, compType, d.frac, be) : 0.0f);
+      }
+    } else if (attr == GX_VA_CLR0 || attr == GX_VA_CLR1) {
+      out.append<u32>(read_color_as_rgba8(p, compType, be));
+    } else { // TEXn
+      for (int c = 0; c < 2; ++c) {
+        out.append<f32>(c < d.cnt ? read_component_as_float(p + c * d.compSize, compType, d.frac, be) : 0.0f);
+      }
+    }
+  }
+}
+
+static ByteBuffer s_nativeVtxBuf;
+static ByteBuffer s_nativeIdxBuf;
+static std::vector<NativeAttrDesc> s_nativeDescs;
+
+// ---------------------------------------------------------------------------
+// Native geometry cache (M2)
+//
+// CPU-expanded native vertex/index data is uploaded once into persistent GPU buffers and
+// replayed on later frames by content hash. Because skinning stays on the GPU (bone
+// matrices are per-draw uniforms, not baked into the verts), a mesh's expanded bytes are
+// byte-identical every frame — so steady-state world and character geometry expands +
+// uploads exactly once, and every subsequent frame is just a hash lookup plus a draw that
+// references the cached range. This is the fix for the "M1: no cache" per-frame re-expand
+// + re-upload cost. Keyed by the source FIFO bytes plus the decode layout (and, for
+// indexed attributes, the referenced arrays' contents) so two draws collide in the cache
+// only when they truly expand to identical geometry.
+static constexpr bool kNativeGeomCacheEnabled = true;
+// Byte floor below which caching isn't worth the hash/bookkeeping. NOTE: the 2-frame
+// recurrence gate in native_geom_resolve_ranges (not this size gate) is what actually keeps
+// transient one-shot draws out of the persistent cache, so this only needs to skip trivially
+// tiny draws. Lowered 1024 -> 64 so the shadow pre-pass (16B/vert x 4-21 verts = 64-336B) and
+// small static props become cacheable and stop re-uploading into the per-frame vertex ring
+// every frame -- that ring was ~440KB/frame, ~38% of the per-frame libmali upload volume that
+// is the device CPU bottleneck.
+static constexpr size_t kNativeGeomCacheMinBytes = 64;
+
+// Keep triangle strips as strips on the GPU (TriangleStrip topology + primitive restart)
+// so a run of adjacent strip draws collapses to one DrawIndexed, instead of unrolling
+// each into an independent triangle list. This is the top CPU-side draw-submission lever:
+// far fewer draw commands and index bytes in strip-heavy world scenes.
+static constexpr bool kStripTopology = true;
+
+// Emit a periodic one-line cache/batching summary to confirm the geometry cache is
+// actually hitting on-device (and how effective run-batching is). Perf-tuning scaffolding;
+// off by default in shipped builds.
+static constexpr bool kLogNativeGeomCacheStats = false;
+static constexpr u32 kNativeGeomStatsLogInterval = 300; // frames between summaries
+// Per-window counters (reset each log interval).
+static u64 s_geomCacheHits = 0;       // draws served from the persistent cache (no expand/upload)
+static u64 s_geomCacheMisses = 0;     // draws that had to expand this frame
+static u64 s_geomCachePromotes = 0;   // expansions promoted into the persistent cache
+static u64 s_geomCacheRingPushes = 0; // expansions that went to the per-frame ring
+static u64 s_geomCacheFull = 0;       // promotions that failed (cache exhausted -> reset)
+static u64 s_geomRunsBatched = 0;     // native strip/prim runs emitted (raw-FIFO handle_draw)
+static u64 s_geomSegmentsBatched = 0; // draw commands folded into those runs
+static u64 s_geomDrawsIndexed = 0;    // draws via GX_AURORA_DRAW_INDEXED (dl::optimize output)
+static u64 s_geomDrawsSingle = 0;     // draws via GX_AURORA_DRAW_SIZED (single native)
+static u32 s_geomStatsLastFrame = 0;
+
+struct NativeGeomKey {
+  u64 fifoHash = 0;
+  u64 metaHash = 0;
+  u32 srcBytes = 0;
+  bool operator==(const NativeGeomKey& o) const noexcept {
+    return fifoHash == o.fifoHash && metaHash == o.metaHash && srcBytes == o.srcBytes;
+  }
+};
+struct NativeGeomKeyHash {
+  size_t operator()(const NativeGeomKey& k) const noexcept {
+    return static_cast<size_t>(k.fifoHash ^ (k.metaHash * 0x9e3779b97f4a7c15ull) ^ k.srcBytes);
+  }
+};
+struct NativeGeomEntry {
+  gfx::Range vertRange;
+  gfx::Range idxRange;
+  u32 indexCount = 0;
+};
+static absl::flat_hash_map<NativeGeomKey, NativeGeomEntry, NativeGeomKeyHash> s_nativeGeomCache;
+// Keys seen but not yet promoted, mapped to the frame they were last seen in. Content is
+// promoted to the persistent cache only once it recurs across frames, which keeps
+// single-shot and per-frame-animated geometry from ever entering the cache.
+static absl::flat_hash_map<NativeGeomKey, u32, NativeGeomKeyHash> s_nativeGeomSeen;
+static u32 s_nativeGeomCacheGen = 0;
+
+// Emit a cache/batching summary every kNativeGeomStatsLogInterval frames. Called once
+// per native draw attempt; the frame-delta guard keeps it to one line per interval.
+static void native_geom_cache_maybe_log_stats() {
+  if constexpr (!kLogNativeGeomCacheStats) {
+    return;
+  }
+  const u32 frame = gfx::current_frame();
+  if (frame == UINT32_MAX || frame - s_geomStatsLastFrame < kNativeGeomStatsLogInterval) {
+    return;
+  }
+  const u32 frames = frame - s_geomStatsLastFrame;
+  s_geomStatsLastFrame = frame;
+  const u64 draws = s_geomCacheHits + s_geomCacheMisses;
+  Log.info(
+      "[geom-cache] {}f: {} draws, {}/{} hit ({:.1f}%), {} promote, {} ring, {} full; "
+      "src {} run/{} indexed/{} sized, batched {}<-{} segs ({:.2f}/run); {} entries",
+      frames, draws, s_geomCacheHits, draws, draws != 0 ? 100.0 * static_cast<double>(s_geomCacheHits) / draws : 0.0,
+      s_geomCachePromotes, s_geomCacheRingPushes, s_geomCacheFull, s_geomRunsBatched, s_geomDrawsIndexed,
+      s_geomDrawsSingle, s_geomRunsBatched, s_geomSegmentsBatched,
+      s_geomRunsBatched != 0 ? static_cast<double>(s_geomSegmentsBatched) / s_geomRunsBatched : 0.0,
+      s_nativeGeomCache.size());
+  // Per-frame staging->GPU upload volume (last completed frame). This is what feeds the libmali
+  // copy worker: ring verts/indices (cache misses), uniforms (every draw, no dedup), and texture
+  // uploads. Cached geometry lives in a persistent buffer and does NOT appear in lastVertSize.
+  const double kib = 1.0 / 1024.0;
+  const u64 uploadTotal = static_cast<u64>(gfx::g_stats.lastVertSize) + gfx::g_stats.lastIndexSize +
+                          gfx::g_stats.lastUniformSize + gfx::g_stats.lastTextureUploadSize +
+                          gfx::g_stats.lastStorageSize;
+  Log.info("[upload] last-frame: vert {:.1f}K, idx {:.1f}K, uni {:.1f}K, tex {:.1f}K, storage {:.1f}K -> total {:.1f}K",
+           gfx::g_stats.lastVertSize * kib, gfx::g_stats.lastIndexSize * kib,
+           gfx::g_stats.lastUniformSize * kib, gfx::g_stats.lastTextureUploadSize * kib,
+           gfx::g_stats.lastStorageSize * kib, static_cast<double>(uploadTotal) * kib);
+  s_geomCacheHits = 0;
+  s_geomCacheMisses = 0;
+  s_geomCachePromotes = 0;
+  s_geomCacheRingPushes = 0;
+  s_geomCacheFull = 0;
+  s_geomRunsBatched = 0;
+  s_geomSegmentsBatched = 0;
+  s_geomDrawsIndexed = 0;
+  s_geomDrawsSingle = 0;
+}
+
+// The persistent cache byte regions are recycled on reset (generation bump), which
+// invalidates every cached (key -> range) mapping. Drop both maps when that happens.
+static void native_geom_sync_generation() {
+  native_geom_cache_maybe_log_stats();
+  const u32 gen = gfx::native_geom_cache_generation();
+  if (gen != s_nativeGeomCacheGen) {
+    s_nativeGeomCacheGen = gen;
+    s_nativeGeomCache.clear();
+    s_nativeGeomSeen.clear();
+  }
+}
+
+// Content hash of an indexed attribute's source array, memoized per (pointer, frame,
+// invalidate gen). Frame-scoped so arrays the game rewrites in place between frames (CPU
+// envelope skinning deforms positions into the same buffers) are re-hashed each frame;
+// GXInvalidateVtxCache handles rewrites within a frame.
+struct ArrayHashMemo {
+  u32 frame = UINT32_MAX;
+  u32 invalGen = UINT32_MAX;
+  u32 size = 0;
+  u64 hash = 0;
+};
+static absl::flat_hash_map<const void*, ArrayHashMemo> s_arrayHashMemo;
+
+static u64 native_array_content_hash(const AttrArray& array) {
+  if (s_arrayHashMemo.size() > 1024) {
+    s_arrayHashMemo.clear();
+  }
+  const u32 frame = gfx::current_frame();
+  auto [it, inserted] = s_arrayHashMemo.try_emplace(array.data);
+  auto& memo = it->second;
+  if (inserted || memo.frame != frame || memo.invalGen != s_gxArrayInvalidateGen || memo.size != array.size) {
+    memo.frame = frame;
+    memo.invalGen = s_gxArrayInvalidateGen;
+    memo.size = array.size;
+    memo.hash = xxh3_hash_s(array.data, array.size);
+  }
+  return memo.hash;
+}
+
+// Fold the decode-relevant layout into the meta hasher: which attrs are present, their
+// formats, and for indexed attrs the referenced array's per-frame content hash. Two draws
+// with equal FIFO bytes and equal meta hash expand to identical native vertices.
+static void native_geom_hash_layout(Hasher& h, const std::vector<NativeAttrDesc>& descs) {
+  for (const auto& d : descs) {
+    h.update(static_cast<u8>(d.attr));
+    h.update(d.attrType);
+    h.update(d.compType);
+    h.update(d.cnt);
+    h.update(d.compSize);
+    h.update(d.frac);
+    h.update(d.arrayStride);
+    h.update(static_cast<u8>(d.le ? 1 : 0));
+    if (d.attrType == GX_INDEX8 || d.attrType == GX_INDEX16) {
+      h.update(native_array_content_hash(g_gxState.arrays[d.attr]));
+    }
+  }
+}
+
+// Resolve the GPU ranges for a freshly expanded batch. On the first cross-frame recurrence
+// of identical content the batch is promoted into the persistent cache; otherwise it goes
+// to the per-frame ring. `cached` reports which buffers the returned ranges address.
+// `idxData`/`idxBytes` may be null/0 for non-indexed (triangle-list) draws.
+static void native_geom_resolve_ranges(const NativeGeomKey& key, const ByteBuffer& vtxBytes, const u8* idxData,
+                                       size_t idxBytes, u32 numIndices, gfx::Range& vertRange, gfx::Range& idxRange,
+                                       bool& cached) {
+  cached = false;
+  if (kNativeGeomCacheEnabled && vtxBytes.size() >= kNativeGeomCacheMinBytes) {
+    const u32 frame = gfx::current_frame();
+    auto [seenIt, inserted] = s_nativeGeomSeen.emplace(key, frame);
+    if (!inserted && seenIt->second != frame) {
+      // Content recurred across frames — promote into the persistent cache.
+      auto [cv, vok] = gfx::push_native_cached_verts(vtxBytes.data(), vtxBytes.size());
+      gfx::Range ci{};
+      bool iok = true;
+      if (idxData != nullptr && idxBytes > 0) {
+        const auto pushed = gfx::push_native_cached_indices(idxData, idxBytes);
+        ci = pushed.first;
+        iok = pushed.second;
+      }
+      if (vok && iok) {
+        vertRange = cv;
+        idxRange = ci;
+        cached = true;
+        s_nativeGeomCache.emplace(key, NativeGeomEntry{.vertRange = cv, .idxRange = ci, .indexCount = numIndices});
+        s_nativeGeomSeen.erase(seenIt);
+        ++s_geomCachePromotes;
+        return;
+      }
+      // Cache exhausted — recycle it at the next frame boundary and use the ring now.
+      ++s_geomCacheFull;
+      gfx::request_native_geometry_cache_reset();
+    } else if (!inserted) {
+      seenIt->second = frame;
+    }
+    if (s_nativeGeomSeen.size() > 16384) {
+      s_nativeGeomSeen.clear();
+    }
+  }
+  // Per-frame ring fallback.
+  ++s_geomCacheRingPushes;
+  vertRange = gfx::push_verts(vtxBytes.data(), vtxBytes.size(), 4);
+  if (idxData != nullptr && idxBytes > 0) {
+    idxRange = gfx::push_indices(idxData, idxBytes, 4);
+  }
+}
+
+static void push_native_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount,
+                                const std::array<AttrConfig, MaxVtxAttr>& nativeAttrs, u8 nativeStride,
+                                gfx::Range vertRange, gfx::Range idxRange, u32 numIndices, bool cachedGeometry = false,
+                                bool stripTopology = false) {
+  PipelineConfig config{};
+  populate_pipeline_config(config, prim, fmt); // TEV/color/blend/etc; also fills storage attrs (overwritten below)
+  config.shaderConfig.attrs = nativeAttrs;
+  config.shaderConfig.vtxStride = nativeStride;
+  config.shaderConfig.nativeVertexFetch = 1;
+  config.triangleStripTopology = stripTopology ? 1u : 0u;
+
+  const auto info = build_shader_info(config.shaderConfig);
+  resolve_sampled_textures(info);
+  const auto bindGroups = build_bind_groups(info);
+  const auto pipeline = gfx::pipeline_ref(config);
+
+  BindGroupRanges ranges{}; // native resolves indexed attrs on the CPU — no array uploads
+  gfx::push_draw_command(DrawData{
+      .pipeline = pipeline,
+      .vertRange = vertRange,
+      .idxRange = idxRange,
+      .uniformRange = build_uniform(info, vertRange.offset, ranges),
+      .vtxCount = vtxCount,
+      .indexCount = numIndices,
+      .instanceCount = 1,
+      .bindGroups = bindGroups,
+      .dstAlpha = g_gxState.dstAlpha,
+      .nativeVertexFetch = true,
+      .cachedGeometry = cachedGeometry,
+  });
+}
+
+// Expand `vtxCount` raw FIFO vertices and push a native draw, serving steady-state
+// geometry from the persistent content-hash cache (no re-expand, no re-upload).
+static bool try_native_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, const u8* data, u32& pos, u32 vtxSize) {
+  if (prim != GX_TRIANGLES && prim != GX_TRIANGLESTRIP && prim != GX_TRIANGLEFAN && prim != GX_QUADS) {
+    return false;
+  }
+  u8 nativeStride = 0;
+  std::array<AttrConfig, MaxVtxAttr> nativeAttrs{};
+  if (!build_native_layout(fmt, s_nativeDescs, nativeStride, nativeAttrs)) {
+    return false;
+  }
+  ++s_geomDrawsSingle;
+  const u32 srcBytes = static_cast<u32>(vtxCount) * vtxSize;
+
+  // Content-hash key: source FIFO bytes + decode layout (+ indexed array contents). A hit
+  // replays the cached GPU ranges without touching the CPU-side vertex data at all.
+  NativeGeomKey key{};
+  if constexpr (kNativeGeomCacheEnabled) {
+    Hasher fifo;
+    fifo.update(data + pos, srcBytes);
+    Hasher meta;
+    meta.update(static_cast<u8>(prim));
+    meta.update(static_cast<u8>(fmt));
+    meta.update(vtxSize);
+    meta.update(vtxCount);
+    native_geom_hash_layout(meta, s_nativeDescs);
+    key = {fifo.digest(), meta.digest(), srcBytes};
+    native_geom_sync_generation();
+    if (const auto it = s_nativeGeomCache.find(key); it != s_nativeGeomCache.end()) {
+      ++s_geomCacheHits;
+      pos += srcBytes;
+      push_native_gx_draw(prim, fmt, vtxCount, nativeAttrs, nativeStride, it->second.vertRange, it->second.idxRange,
+                          it->second.indexCount, /*cachedGeometry=*/true);
+      return true;
+    }
+    ++s_geomCacheMisses;
+  }
+
+  // Miss — expand the run into flat native attributes.
+  s_nativeVtxBuf.clear();
+  s_nativeVtxBuf.reserve_extra(static_cast<u32>(vtxCount) * nativeStride);
+  for (u32 v = 0; v < vtxCount; ++v) {
+    expand_native_vertex(s_nativeDescs, data + pos + static_cast<size_t>(v) * vtxSize, s_nativeVtxBuf);
+  }
+  pos += srcBytes;
+
+  // Strips/fans/quads get a generated index buffer; plain triangle lists draw non-indexed.
+  const bool indexed = prim != GX_TRIANGLES;
+  u32 numIndices = 0;
+  s_nativeIdxBuf.clear();
+  if (indexed) {
+    numIndices = prepare_idx_buffer(s_nativeIdxBuf, prim, 0, vtxCount);
+  }
+
+  gfx::Range vertRange{};
+  gfx::Range idxRange{};
+  bool cached = false;
+  native_geom_resolve_ranges(key, s_nativeVtxBuf, indexed ? s_nativeIdxBuf.data() : nullptr,
+                             indexed ? s_nativeIdxBuf.size() : 0, numIndices, vertRange, idxRange, cached);
+  s_nativeIdxBuf.clear();
+
+  push_native_gx_draw(prim, fmt, vtxCount, nativeAttrs, nativeStride, vertRange, idxRange, numIndices, cached);
+  return true;
+}
+
+// Batched native path for raw-FIFO draw commands. Display lists emit runs of back-to-back
+// identical draw commands (same VAT byte ⇒ same primitive + layout; no state change can
+// sit between adjacent draws), so this collapses a whole run into ONE hardware draw — the
+// biggest CPU-side win, since per-draw pipeline/bind-group/uniform submission dominates
+// strip-heavy scenes. Triangle strips keep strip topology with 0xffff primitive-restart
+// separators rather than being unrolled to a triangle list. `pos` enters at the first
+// draw's vertex data (cmd + vtxCount already consumed) and is advanced past the whole
+// consumed run on success. Serves steady-state geometry from the persistent content-hash
+// cache (no re-expand, no re-upload).
+static bool try_native_draw_run(u8 cmd, GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, u32 vtxSize, const u8* data,
+                                u32& pos, u32 size, bool bigEndian) {
+  if (prim != GX_TRIANGLES && prim != GX_TRIANGLESTRIP && prim != GX_TRIANGLEFAN && prim != GX_QUADS) {
+    return false;
+  }
+  if (vtxSize == 0 || vtxCount == 0) {
+    return false;
+  }
+  u8 nativeStride = 0;
+  std::array<AttrConfig, MaxVtxAttr> nativeAttrs{};
+  if (!build_native_layout(fmt, s_nativeDescs, nativeStride, nativeAttrs)) {
+    return false;
+  }
+
+  // Scan forward across back-to-back identical draw commands. FIFO layout per draw is
+  // [cmd][vtxCount:u16][vtxData]; require the same cmd byte and a whole vertex block.
+  static std::vector<u16> segCounts;
+  static std::vector<u32> segOffsets;
+  segCounts.clear();
+  segOffsets.clear();
+  segCounts.push_back(vtxCount);
+  segOffsets.push_back(pos);
+  u32 batchVtxCount = vtxCount;
+  u32 scan = pos + static_cast<u32>(vtxCount) * vtxSize;
+  const u16 minVtx = prim == GX_QUADS ? 4 : 3;
+  while (scan + 3 <= size && data[scan] == cmd) {
+    const u16 nextVtxCount = read_u16(data + scan + 1, bigEndian);
+    // Cap the batch below 0xffff verts so no index collides with the 0xffff restart marker.
+    if (nextVtxCount < minVtx || batchVtxCount + nextVtxCount >= 0xffffu) {
+      break;
+    }
+    const u32 nextVtxBytes = static_cast<u32>(nextVtxCount) * vtxSize;
+    if (scan + 3 + nextVtxBytes > size) {
+      break;
+    }
+    segCounts.push_back(nextVtxCount);
+    segOffsets.push_back(scan + 3);
+    batchVtxCount += nextVtxCount;
+    scan += 3 + nextVtxBytes;
+  }
+
+  ++s_geomRunsBatched;
+  s_geomSegmentsBatched += segCounts.size();
+  const bool stripTopology = prim == GX_TRIANGLESTRIP && kStripTopology;
+  const u32 srcBytes = batchVtxCount * vtxSize;
+
+  // Content-hash key: FIFO bytes of every segment + decode layout + the run's segment
+  // structure (+ indexed array contents). A hit replays cached GPU ranges with no CPU work.
+  NativeGeomKey key{};
+  if constexpr (kNativeGeomCacheEnabled) {
+    Hasher fifo;
+    for (size_t s = 0; s < segCounts.size(); ++s) {
+      fifo.update(data + segOffsets[s], static_cast<size_t>(segCounts[s]) * vtxSize);
+    }
+    Hasher meta;
+    meta.update(static_cast<u8>(prim));
+    meta.update(static_cast<u8>(fmt));
+    meta.update(vtxSize);
+    meta.update(batchVtxCount);
+    meta.update(segCounts.data(), segCounts.size() * sizeof(u16));
+    native_geom_hash_layout(meta, s_nativeDescs);
+    key = {fifo.digest(), meta.digest(), srcBytes};
+    native_geom_sync_generation();
+    if (const auto it = s_nativeGeomCache.find(key); it != s_nativeGeomCache.end()) {
+      ++s_geomCacheHits;
+      pos = scan;
+      push_native_gx_draw(prim, fmt, static_cast<u16>(batchVtxCount), nativeAttrs, nativeStride, it->second.vertRange,
+                          it->second.idxRange, it->second.indexCount, /*cachedGeometry=*/true, stripTopology);
+      return true;
+    }
+    ++s_geomCacheMisses;
+  }
+
+  // Miss — expand every segment into flat native attributes (contiguous in one buffer).
+  s_nativeVtxBuf.clear();
+  s_nativeVtxBuf.reserve_extra(batchVtxCount * nativeStride);
+  for (size_t s = 0; s < segCounts.size(); ++s) {
+    const u8* segData = data + segOffsets[s];
+    for (u16 v = 0; v < segCounts[s]; ++v) {
+      expand_native_vertex(s_nativeDescs, segData + static_cast<size_t>(v) * vtxSize, s_nativeVtxBuf);
+    }
+  }
+  pos = scan;
+
+  // Index topology for the run: strips stay strips (restart-separated); a plain triangle
+  // list draws non-indexed; fans/quads (and strips when strip topology is off) unroll to a
+  // per-segment triangle list.
+  s_nativeIdxBuf.clear();
+  u32 numIndices = 0;
+  bool indexed = true;
+  if (stripTopology) {
+    numIndices = build_triangle_strip_batch_topology_indices(s_nativeIdxBuf, segCounts);
+  } else if (prim == GX_TRIANGLES) {
+    indexed = false; // numIndices stays 0 -> non-indexed Draw(batchVtxCount)
+  } else {
+    u16 segStart = 0;
+    for (const u16 count : segCounts) {
+      numIndices += prepare_idx_buffer(s_nativeIdxBuf, prim, segStart, count);
+      segStart = static_cast<u16>(segStart + count);
+    }
+  }
+
+  gfx::Range vertRange{};
+  gfx::Range idxRange{};
+  bool cached = false;
+  native_geom_resolve_ranges(key, s_nativeVtxBuf, indexed ? s_nativeIdxBuf.data() : nullptr,
+                             indexed ? s_nativeIdxBuf.size() : 0, numIndices, vertRange, idxRange, cached);
+  s_nativeIdxBuf.clear();
+
+  push_native_gx_draw(prim, fmt, static_cast<u16>(batchVtxCount), nativeAttrs, nativeStride, vertRange, idxRange,
+                      numIndices, cached, stripTopology);
+  return true;
+}
+
+// Emit ONE GX_AURORA_DRAW_INDEXED normally (no merge): expand the (already deduped) vertices and use
+// the supplied triangle-list indices, both served from the content-hash cache on recurrence.
+static bool native_emit_indexed(GXVtxFmt fmt, u16 vtxCount, const u8* vtxData, u32 vtxSize, const u8* idxData,
+                                u32 idxBytes, u32 indexCount) {
+  u8 nativeStride = 0;
+  std::array<AttrConfig, MaxVtxAttr> nativeAttrs{};
+  if (!build_native_layout(fmt, s_nativeDescs, nativeStride, nativeAttrs)) {
+    return false;
+  }
+  const u32 srcBytes = static_cast<u32>(vtxCount) * vtxSize;
+
+  NativeGeomKey key{};
+  if constexpr (kNativeGeomCacheEnabled) {
+    Hasher fifo;
+    fifo.update(vtxData, srcBytes);
+    Hasher meta;
+    meta.update(static_cast<u8>(GX_TRIANGLES));
+    meta.update(static_cast<u8>(fmt));
+    meta.update(vtxSize);
+    meta.update(vtxCount);
+    native_geom_hash_layout(meta, s_nativeDescs);
+    if (idxData != nullptr && idxBytes > 0) {
+      meta.update(idxData, idxBytes); // index buffer is part of the geometry identity
+    }
+    key = {fifo.digest(), meta.digest(), srcBytes};
+    native_geom_sync_generation();
+    if (const auto it = s_nativeGeomCache.find(key); it != s_nativeGeomCache.end()) {
+      ++s_geomCacheHits;
+      push_native_gx_draw(GX_TRIANGLES, fmt, vtxCount, nativeAttrs, nativeStride, it->second.vertRange,
+                          it->second.idxRange, it->second.indexCount, /*cachedGeometry=*/true);
+      return true;
+    }
+    ++s_geomCacheMisses;
+  }
+
+  s_nativeVtxBuf.clear();
+  s_nativeVtxBuf.reserve_extra(static_cast<u32>(vtxCount) * nativeStride);
+  for (u32 v = 0; v < vtxCount; ++v) {
+    expand_native_vertex(s_nativeDescs, vtxData + static_cast<size_t>(v) * vtxSize, s_nativeVtxBuf);
+  }
+
+  gfx::Range vertRange{};
+  gfx::Range idxRange{};
+  bool cached = false;
+  native_geom_resolve_ranges(key, s_nativeVtxBuf, idxData, idxBytes, indexCount, vertRange, idxRange, cached);
+
+  push_native_gx_draw(GX_TRIANGLES, fmt, vtxCount, nativeAttrs, nativeStride, vertRange, idxRange, indexCount, cached);
+  return true;
+}
+
+// Native path for GX_AURORA_DRAW_INDEXED: expand the marker's vertices into hardware attributes and
+// emit one native draw (served from the content-hash cache on recurrence).
+static bool try_native_draw_indexed(GXVtxFmt fmt, u16 vtxCount, const u8* vtxData, u32 vtxSize, const u8* idxData,
+                                    u32 idxBytes, u32 indexCount) {
+  ++s_geomDrawsIndexed;
+  return native_emit_indexed(fmt, vtxCount, vtxData, vtxSize, idxData, idxBytes, indexCount);
 }
 
 std::string read_string(const u8* data, u32& pos, u32 size, bool bigEndian) {
@@ -1914,8 +2771,9 @@ void handle_aurora(const u8* data, u32& pos, u32 size, bool bigEndian) {
            static_cast<u32>(prim));
     const u32 idxBytes = indexCount * static_cast<u32>(sizeof(u16));
     CHECK(pos + idxBytes <= size, "GX_AURORA_DRAW_INDEXED index data overrun");
-    // Index data is always host-endian; push it to the GPU buffer as-is
-    const gfx::Range idxRange = gfx::push_indices(data + pos, idxBytes, 4);
+    // Index data is always host-endian. The native path pushes it (to the geometry cache
+    // or the per-frame ring) itself; the storage fallback pushes it to the ring below.
+    const u8* idxData = data + pos;
     pos += idxBytes;
     u32 vtxSize;
     if (g_gxState.lastVtxFmt == fmt) {
@@ -1925,10 +2783,15 @@ void handle_aurora(const u8* data, u32& pos, u32 size, bool bigEndian) {
     }
     const u32 totalVtxBytes = vtxCount * vtxSize;
     CHECK(pos + totalVtxBytes <= size, "GX_AURORA_DRAW_INDEXED vertex data overrun");
-    const gfx::Range vertRange = gfx::push_verts(data + pos, totalVtxBytes, 4);
+    const u8* vtxData = data + pos;
     pos += totalVtxBytes;
     if (indexCount != 0) {
-      push_gx_draw(prim, fmt, vtxCount, vertRange, idxRange, indexCount);
+      if (!(native_vertex_mode() &&
+            try_native_draw_indexed(fmt, vtxCount, vtxData, vtxSize, idxData, idxBytes, indexCount))) {
+        const gfx::Range idxRange = gfx::push_indices(idxData, idxBytes, 4);
+        const gfx::Range vertRange = gfx::push_verts(vtxData, totalVtxBytes, 4);
+        push_gx_draw(prim, fmt, vtxCount, vertRange, idxRange, indexCount);
+      }
     }
   } else if (subCmd == GX_AURORA_DEBUG_GROUP_PUSH) {
     auto label = read_string(data, pos, size, bigEndian);

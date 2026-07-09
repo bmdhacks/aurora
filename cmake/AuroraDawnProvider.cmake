@@ -133,8 +133,10 @@ if (_aurora_dawn_provider STREQUAL "vendor")
     endif ()
 
     include(FetchContent)
+    # Dusklight (Mali port): google/dawn, not upstream's encounter/dawn fork — see
+    # AuroraDependencyVersions.cmake's AURORA_DAWN_REF override.
     FetchContent_Declare(dawn
-      URL "https://github.com/encounter/dawn/archive/${AURORA_DAWN_REF}.tar.gz"
+      URL "https://github.com/google/dawn/archive/${AURORA_DAWN_REF}.tar.gz"
       DOWNLOAD_EXTRACT_TIMESTAMP FALSE
       EXCLUDE_FROM_ALL
     )

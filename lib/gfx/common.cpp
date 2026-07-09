@@ -5,6 +5,7 @@
 #include "../internal.hpp"
 #include "../webgpu/gpu.hpp"
 #include "../webgpu/gpu_prof.hpp"
+#include "../webgpu/sdl2shim_present.hpp"
 #include "../gx/pipeline.hpp"
 #ifdef AURORA_ENABLE_RMLUI
 #include "../rmlui/pipeline.hpp"
@@ -196,6 +197,20 @@ wgpu::Buffer g_vertexBuffer;
 wgpu::Buffer g_uniformBuffer;
 wgpu::Buffer g_indexBuffer;
 wgpu::Buffer g_storageBuffer;
+// Persistent caches for CPU-expanded native-fetch geometry. Separate from the per-frame
+// staging rings so cached ranges can never be clobbered by ring uploads. Filled once per
+// unique mesh (by content hash) and referenced every subsequent frame.
+wgpu::Buffer g_nativeVertexCacheBuffer;
+wgpu::Buffer g_nativeIndexCacheBuffer;
+static constexpr uint64_t NativeGeomVertexCacheSize = 24ull * 1024 * 1024;
+static constexpr uint64_t NativeGeomIndexCacheSize = 4ull * 1024 * 1024;
+// Bump-allocator cursors; on exhaustion the whole cache is reset (deferred to a frame
+// boundary). The generation counter bumps on each reset so CPU-side content maps can
+// drop entries that point at now-recycled ranges.
+static uint32_t s_nativeVertexCacheOffset = 0;
+static uint32_t s_nativeIndexCacheOffset = 0;
+static uint32_t s_nativeGeomCacheGeneration = 0;
+static bool s_nativeGeomCacheResetPending = false;
 enum class BufferMapState {
   Unmapped,
   Mapping,
@@ -333,6 +348,10 @@ static std::atomic_bool g_processEventsQueued = false;
 static std::atomic_int64_t g_lastPresentNs = 0;
 static std::atomic_int64_t g_presentPeriodNs = 0;
 static std::atomic_int64_t g_cpuFrameTimeNs = 0;
+// Dusklight: emit a periodic presented-frame-rate line for on-device perf measurement. Cheap;
+// constexpr-gated (no env var, per the single-purpose Mali fork convention).
+static constexpr bool kLogFps = true;
+static constexpr double kFpsLogIntervalSeconds = 30.0;
 static PresentClock::time_point g_cpuFrameStart;
 static constexpr auto FrameStartSafetyMargin = std::chrono::milliseconds{2};
 static constexpr auto MaxPacingSample = std::chrono::milliseconds{250};
@@ -993,6 +1012,12 @@ bool push_custom_draw(DrawTypeId type, const void* payload, size_t payloadSize) 
 }
 
 static OffscreenCacheEntry get_offscreen_textures(uint32_t width, uint32_t height) {
+  // A zero-sized offscreen (e.g. the shadow system under shadowResolutionMultiplier=0)
+  // makes glTexStorage2D fail with GL_INVALID_VALUE and lose the device on Mali. Clamp
+  // to at least 1x1: the render becomes an effective no-op (disabled shadow) but the
+  // texture is valid and the begin/end offscreen pass stays balanced.
+  width = width < 1u ? 1u : width;
+  height = height < 1u ? 1u : height;
   OffscreenCacheKey key{width, height};
   if (const auto it = g_offscreenCache.find(key); it != g_offscreenCache.end()) {
     return it->second;
@@ -1346,7 +1371,20 @@ void initialize() {
     std::lock_guard lock{g_presentStatsMutex};
     g_presentTimes.clear();
   }
-  render_worker::initialize();
+  // Dusklight (P4): run the Aurora render worker on GL/GLES too, so per-frame encode + submit +
+  // present execute on a dedicated context-owning thread while the game thread races ahead with
+  // logic + FIFO decode (the heavy per-frame vertex/uniform/index data lands in CPU-mapped staging
+  // buffers, so decode touches GL only on cache misses). Upstream disabled the worker here because
+  // Dawn's GL EGL context was bound to its creating thread; we now enable Dawn's
+  // "gl_allow_context_on_multi_threads" toggle (gpu.cpp) so the context migrates safely to the
+  // worker. The producer/consumer frame model itself is unchanged and already ships on the other
+  // backends. constexpr-gated per the single-purpose-fork convention (no env var).
+  static constexpr bool kRenderWorkerOnGLES = true;
+  const bool isGLBackend = webgpu::g_backendType == wgpu::BackendType::OpenGL ||
+                           webgpu::g_backendType == wgpu::BackendType::OpenGLES;
+  if (!isGLBackend || kRenderWorkerOnGLES) {
+    render_worker::initialize();
+  }
   // This appears to take a while and blocks the render thread for periods of time
   // render_worker::set_event_pump([] {
   //   if (g_instance) {
@@ -1481,6 +1519,7 @@ void initialize() {
 }
 
 void shutdown() {
+  webgpu::sdl2shim_present::recycle_pending();
   render_worker::synchronize();
   render_worker::shutdown();
   g_processEventsQueued.store(false, std::memory_order_release);
@@ -1522,6 +1561,12 @@ void shutdown() {
   g_uniformBuffer = {};
   g_indexBuffer = {};
   g_storageBuffer = {};
+  g_nativeVertexCacheBuffer = {};
+  g_nativeIndexCacheBuffer = {};
+  s_nativeVertexCacheOffset = 0;
+  s_nativeIndexCacheOffset = 0;
+  s_nativeGeomCacheResetPending = false;
+  ++s_nativeGeomCacheGeneration;
   g_stagingBuffers.fill({});
   for (auto& packet : g_framePackets) {
     packet = {};
@@ -1606,6 +1651,17 @@ bool begin_frame() {
   g_recordingFrameSlot = frameSlot;
   g_passSnapshotPools[frameSlot].used = 0;
 
+  if (s_nativeGeomCacheResetPending) {
+    // Deferred cache reset: every frame that referenced the old cached ranges has already
+    // been submitted, and queue.WriteBuffer is ordered after those submits, so recycling
+    // the cache regions from offset 0 cannot race the GPU's reads of the old contents.
+    // Bump the generation so the CPU-side content maps drop their now-stale entries.
+    s_nativeGeomCacheResetPending = false;
+    s_nativeVertexCacheOffset = 0;
+    s_nativeIndexCacheOffset = 0;
+    ++s_nativeGeomCacheGeneration;
+  }
+
   size_t bufferOffset = 0;
   const auto& stagingBuf = g_stagingBuffers[*stagingSlot];
   const auto mapBuffer = [&](ByteBuffer& buf, uint64_t size) {
@@ -1669,11 +1725,34 @@ void end_frame(EndFrameCallback callback) {
   ZoneScoped;
   ASSERT(!g_inOffscreen, "end_frame called while offscreen rendering is active");
   ASSERT(g_currentRenderPass == UINT32_MAX, "end_frame called before finish finalized the current render pass");
+  // Dusklight (P4): present the frame the worker finished while we were decoding this one. Doing it
+  // here rather than at the top of the frame is what preserves the overlap: by now the worker has
+  // had our whole decode to run its Submit, so the wait below is usually near-zero.
+  webgpu::sdl2shim_present::flush_present();
   if (g_cpuFrameStart.time_since_epoch().count() != 0) {
     const auto cpuFrameTime = PresentClock::now() - g_cpuFrameStart;
     update_ema(g_cpuFrameTimeNs, duration_ns(cpuFrameTime));
     const double cpuFrameTimeMs = std::chrono::duration<double, std::milli>{cpuFrameTime}.count();
     TracyPlot("aurora: cpuFrameTimeMs", cpuFrameTimeMs);
+  }
+  // Dusklight: periodic wall-clock FPS. Reports presented-frame rate, wall ms/frame, and the
+  // CPU-side portion (g_cpuFrameTimeNs EMA) so we can read CPU- vs present-bound at a glance.
+  if constexpr (kLogFps) {
+    static uint32_t s_fpsFrames = 0;
+    static PresentClock::time_point s_fpsMark{};
+    const auto fpsNow = PresentClock::now();
+    if (s_fpsMark.time_since_epoch().count() == 0) {
+      s_fpsMark = fpsNow;
+    }
+    ++s_fpsFrames;
+    const double fpsElapsed = std::chrono::duration<double>{fpsNow - s_fpsMark}.count();
+    if (fpsElapsed >= kFpsLogIntervalSeconds) {
+      Log.info("[fps] {:.2f} fps, {:.1f} ms/frame (cpu {:.1f} ms) over {} frames",
+               s_fpsFrames / fpsElapsed, 1000.0 * fpsElapsed / s_fpsFrames,
+               g_cpuFrameTimeNs.load(std::memory_order_relaxed) / 1.0e6, s_fpsFrames);
+      s_fpsFrames = 0;
+      s_fpsMark = fpsNow;
+    }
   }
   auto& frame = current_frame_packet();
   frame.stats.drawCallCount = g_drawCallCount;
@@ -1708,6 +1787,9 @@ void end_frame(EndFrameCallback callback) {
 #endif
 
   const size_t stagingSlot = frame.stagingBuffer;
+  // Dusklight (P4): tell the present module a frame is on its way, so the next flush_present()
+  // knows to wait for it. Must precede the enqueue, which is what produces that frame.
+  webgpu::sdl2shim_present::note_frame_enqueued();
   render_worker::enqueue_end_frame(frameId, [frameSlot, stagingSlot, callback = std::move(callback)]() mutable {
     auto& packet = g_framePackets[frameSlot];
     g_stagingBuffers[stagingSlot].Unmap();
@@ -1966,7 +2048,12 @@ static void render(wgpu::CommandEncoder& cmd, FramePacket& frame, RenderPass& pa
 
 void after_submit() noexcept { depth_peek::after_submit(); }
 
-void gpu_synchronize() { render_worker::synchronize(); }
+void gpu_synchronize() {
+  // The worker can be parked waiting for the main thread to release an EFB slot. Nothing else will
+  // release it while we block here, so drop whatever it is holding out to us first.
+  webgpu::sdl2shim_present::recycle_pending();
+  render_worker::synchronize();
+}
 
 void synchronize() { render_worker::synchronize(); }
 
@@ -2232,6 +2319,68 @@ Range push_indices(const uint8_t* data, size_t length, size_t alignment) {
   }
   return push(current_frame_packet().indices, data, length, alignment);
 }
+
+static bool ensure_native_geom_cache_buffers() {
+  if (g_nativeVertexCacheBuffer && g_nativeIndexCacheBuffer) {
+    return true;
+  }
+  if (!g_device) {
+    return false;
+  }
+  const wgpu::BufferDescriptor vtxDescriptor{
+      .label = "Native Geometry Vertex Cache",
+      .usage = wgpu::BufferUsage::Vertex | wgpu::BufferUsage::CopyDst,
+      .size = NativeGeomVertexCacheSize,
+  };
+  g_nativeVertexCacheBuffer = g_device.CreateBuffer(&vtxDescriptor);
+  const wgpu::BufferDescriptor idxDescriptor{
+      .label = "Native Geometry Index Cache",
+      .usage = wgpu::BufferUsage::Index | wgpu::BufferUsage::CopyDst,
+      .size = NativeGeomIndexCacheSize,
+  };
+  g_nativeIndexCacheBuffer = g_device.CreateBuffer(&idxDescriptor);
+  return g_nativeVertexCacheBuffer && g_nativeIndexCacheBuffer;
+}
+
+// Bump-allocate `length` bytes from a persistent cache buffer and upload the data with a
+// queue write (ordered after prior submits, so it never races a prior frame's reads).
+static std::pair<Range, bool> push_native_cached(const wgpu::Buffer& buffer, uint32_t& cursor, uint64_t limit,
+                                                 const uint8_t* data, size_t length) {
+  static ByteBuffer s_pad;
+  const uint32_t offset = static_cast<uint32_t>(AURORA_ALIGN(cursor, 4));
+  const size_t alignedSize = AURORA_ALIGN(length, 4); // WriteBuffer requires a 4-byte-aligned size
+  if (static_cast<uint64_t>(offset) + alignedSize > limit) {
+    return {{}, false};
+  }
+  if (alignedSize == length) {
+    g_queue.WriteBuffer(buffer, offset, data, length);
+  } else {
+    s_pad.clear();
+    s_pad.append(data, length);
+    s_pad.append_zeroes(alignedSize - length);
+    g_queue.WriteBuffer(buffer, offset, s_pad.data(), s_pad.size());
+  }
+  cursor = offset + static_cast<uint32_t>(alignedSize);
+  return {Range{offset, static_cast<uint32_t>(length)}, true};
+}
+
+std::pair<Range, bool> push_native_cached_verts(const uint8_t* data, size_t length) {
+  if (!ensure_native_geom_cache_buffers()) {
+    return {{}, false};
+  }
+  return push_native_cached(g_nativeVertexCacheBuffer, s_nativeVertexCacheOffset, NativeGeomVertexCacheSize, data,
+                            length);
+}
+
+std::pair<Range, bool> push_native_cached_indices(const uint8_t* data, size_t length) {
+  if (!ensure_native_geom_cache_buffers()) {
+    return {{}, false};
+  }
+  return push_native_cached(g_nativeIndexCacheBuffer, s_nativeIndexCacheOffset, NativeGeomIndexCacheSize, data, length);
+}
+
+void request_native_geometry_cache_reset() noexcept { s_nativeGeomCacheResetPending = true; }
+uint32_t native_geom_cache_generation() noexcept { return s_nativeGeomCacheGeneration; }
 
 Range push_uniform(const uint8_t* data, size_t length) {
   ZoneScoped;

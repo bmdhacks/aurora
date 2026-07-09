@@ -14,9 +14,16 @@ struct DrawData {
   uint32_t instanceCount;
   GXBindGroups bindGroups;
   uint32_t dstAlpha;
+  // When true, bind vertRange as a hardware vertex buffer (slot 0) instead of
+  // relying on the group-0 storage buffers. Set by the native-fetch draw path.
+  bool nativeVertexFetch = false;
+  // When true, vertRange/idxRange address the persistent native geometry cache buffers
+  // (g_nativeVertexCacheBuffer / g_nativeIndexCacheBuffer) rather than the per-frame
+  // rings. Implies nativeVertexFetch. Set by the native geometry cache on a hit/promote.
+  bool cachedGeometry = false;
 };
 
-constexpr uint32_t GXPipelineConfigVersion = 13;
+constexpr uint32_t GXPipelineConfigVersion = 15;
 struct PipelineConfig {
   uint32_t version = GXPipelineConfigVersion;
   uint32_t msaaSamples = 1;
@@ -27,6 +34,10 @@ struct PipelineConfig {
   GXBlendFactor blendFacSrc, blendFacDst;
   GXLogicOp blendOp;
   uint32_t dstAlpha;
+  // Non-zero when this draw keeps GX triangle-strip topology on the GPU (TriangleStrip
+  // primitive + 0xffff primitive-restart separators) instead of being unrolled to a
+  // triangle list. Set by the native strip-batching path; drives to_primitive_state.
+  uint32_t triangleStripTopology;
   uint32_t polygonOffsetBits;
   uint32_t polygonOffsetScaleBits;
   uint32_t polygonOffsetClampBits;

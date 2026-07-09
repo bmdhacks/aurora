@@ -4,6 +4,8 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -12,6 +14,8 @@
 #include <aurora/aurora.h>
 #include <aurora/gfx.h>
 #include <magic_enum.hpp>
+#include <SDL3/SDL_loadso.h>
+#include <SDL3/SDL_video.h>
 #include <webgpu/webgpu_cpp.h>
 
 #include "../gfx/common.hpp"
@@ -19,11 +23,13 @@
 #include "../internal.hpp"
 #include "../window.hpp"
 #include "gpu_prof.hpp"
+#include "sdl2shim_present.hpp"
 
 #ifdef WEBGPU_DAWN
 #include "../dawn/BackendBinding.hpp"
 #include "../dawn/TracyPlatform.hpp"
 #include <dawn/native/DawnNative.h>
+#include <dawn/native/OpenGLBackend.h>
 #endif
 
 namespace aurora::gx {
@@ -65,6 +71,203 @@ bool g_bcTexturesSupported = false;
 bool g_astcTexturesSupported = false;
 bool g_textureComponentSwizzleSupported = false;
 static std::atomic_bool g_initialized = false;
+
+// --- PortMaster SDL2-shim borrowed-EGL surface glue (Mali display bringup #15) ---
+// On Mali handhelds the firmware SDL2 (an fbdev/kmsdrm build, wrapped by our SDL3
+// shim) owns the EGL display/surface/context. The shim publishes them as window
+// properties; we hand Dawn's GLES adapter a getProc loader bound to that EGL
+// display so it renders into the borrowed surface. See BackendBinding.cpp for the
+// matching surface-descriptor sentinel and the Dawn SwapChainEGL borrow patch.
+constexpr const char* SDL2_SHIM_EGL_DISPLAY_PROP = "SDL.window.sdl2_backend.egl_display";
+constexpr const char* SDL2_SHIM_EGL_SURFACE_PROP = "SDL.window.sdl2_backend.egl_surface";
+constexpr const char* SDL2_SHIM_GL_GET_PROC_PROP = "SDL.window.sdl2_backend.gl_get_proc";
+constexpr const char* SDL2_SHIM_WINDOW_PROP = "SDL.window.sdl2_backend.window";
+constexpr const char* SDL2_SHIM_GL_SWAP_WINDOW_PROP = "SDL.window.sdl2_backend.gl_swap_window";
+
+static SDL_GLContext g_sdl2ShimBootstrapContext = nullptr;
+
+static bool is_sdl2shim_driver() {
+  const char* driver = SDL_GetCurrentVideoDriver();
+  return driver != nullptr && SDL_strcmp(driver, "sdl2") == 0;
+}
+
+static void set_pointer_env(const char* name, void* pointer) {
+  if (pointer == nullptr) {
+    return;
+  }
+  char value[32] = {};
+  std::snprintf(value, sizeof(value), "%p", pointer);
+  ::setenv(name, value, 1);
+}
+
+static void publish_sdl2shim_present_env(SDL_PropertiesID props) {
+  void* sdl2Window = SDL_GetPointerProperty(props, SDL2_SHIM_WINDOW_PROP, nullptr);
+  void* sdl2SwapWindow = SDL_GetPointerProperty(props, SDL2_SHIM_GL_SWAP_WINDOW_PROP, nullptr);
+  set_pointer_env("DUSKLIGHT_PORTMASTER_SDL2SHIM_WINDOW", sdl2Window);
+  set_pointer_env("DUSKLIGHT_PORTMASTER_SDL2SHIM_SWAP_WINDOW", sdl2SwapWindow);
+}
+
+static bool ensure_sdl2shim_egl_properties(SDL_Window* window) {
+  if (window == nullptr || !is_sdl2shim_driver()) {
+    return false;
+  }
+
+  SDL_PropertiesID props = SDL_GetWindowProperties(window);
+  void* eglDisplay = SDL_GetPointerProperty(props, SDL2_SHIM_EGL_DISPLAY_PROP, nullptr);
+  void* eglSurface = SDL_GetPointerProperty(props, SDL2_SHIM_EGL_SURFACE_PROP, nullptr);
+  void* glGetProc = SDL_GetPointerProperty(props, SDL2_SHIM_GL_GET_PROC_PROP, nullptr);
+  if (eglDisplay != nullptr && eglSurface != nullptr && glGetProc != nullptr) {
+    publish_sdl2shim_present_env(props);
+    return true;
+  }
+
+  if (g_sdl2ShimBootstrapContext == nullptr) {
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
+    SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
+    g_sdl2ShimBootstrapContext = SDL_GL_CreateContext(window);
+    if (g_sdl2ShimBootstrapContext == nullptr) {
+      Log.error("SDL2-shim EGL bootstrap context creation failed: {}", SDL_GetError());
+      return false;
+    }
+    SDL_GL_SetSwapInterval(0);
+  }
+
+  props = SDL_GetWindowProperties(window);
+  eglDisplay = SDL_GetPointerProperty(props, SDL2_SHIM_EGL_DISPLAY_PROP, nullptr);
+  eglSurface = SDL_GetPointerProperty(props, SDL2_SHIM_EGL_SURFACE_PROP, nullptr);
+  glGetProc = SDL_GetPointerProperty(props, SDL2_SHIM_GL_GET_PROC_PROP, nullptr);
+  void* sdl2Window = SDL_GetPointerProperty(props, SDL2_SHIM_WINDOW_PROP, nullptr);
+  void* sdl2SwapWindow = SDL_GetPointerProperty(props, SDL2_SHIM_GL_SWAP_WINDOW_PROP, nullptr);
+  publish_sdl2shim_present_env(props);
+  Log.info("SDL2-shim EGL properties: display={} surface={} getProc={} window={} swapWindow={}", eglDisplay,
+           eglSurface, glGetProc, sdl2Window, sdl2SwapWindow);
+  return eglDisplay != nullptr && eglSurface != nullptr && glGetProc != nullptr;
+}
+
+#ifdef WEBGPU_DAWN
+static SDL_SharedObject* g_portmasterEglLibrary = nullptr;
+static SDL_SharedObject* g_portmasterGlesLibrary = nullptr;
+using PortMasterEglGetProcAddressFn = SDL_FunctionPointer (*)(const char*);
+static PortMasterEglGetProcAddressFn g_portmasterEglGetProcAddress = nullptr;
+
+static dawn::native::opengl::EGLFunctionPointerType portmaster_egl_get_proc(const char* name) {
+  if (name == nullptr) {
+    return nullptr;
+  }
+
+  if (g_portmasterEglLibrary == nullptr) {
+    for (const char* libraryName : {"libEGL.so.1", "libEGL.so"}) {
+      g_portmasterEglLibrary = SDL_LoadObject(libraryName);
+      if (g_portmasterEglLibrary != nullptr) {
+        Log.info("PortMaster EGL proc loader opened {}", libraryName);
+        g_portmasterEglGetProcAddress =
+            reinterpret_cast<PortMasterEglGetProcAddressFn>(SDL_LoadFunction(g_portmasterEglLibrary, "eglGetProcAddress"));
+        break;
+      }
+    }
+  }
+
+  if (g_portmasterEglLibrary != nullptr) {
+    if (SDL_FunctionPointer function = SDL_LoadFunction(g_portmasterEglLibrary, name)) {
+      return reinterpret_cast<dawn::native::opengl::EGLFunctionPointerType>(function);
+    }
+    if (g_portmasterEglGetProcAddress != nullptr) {
+      if (SDL_FunctionPointer function = g_portmasterEglGetProcAddress(name)) {
+        return reinterpret_cast<dawn::native::opengl::EGLFunctionPointerType>(function);
+      }
+    }
+  }
+
+  if (g_portmasterGlesLibrary == nullptr) {
+    for (const char* libraryName : {"libGLESv2.so.2", "libGLESv2.so"}) {
+      g_portmasterGlesLibrary = SDL_LoadObject(libraryName);
+      if (g_portmasterGlesLibrary != nullptr) {
+        Log.info("PortMaster GLES proc loader opened {}", libraryName);
+        break;
+      }
+    }
+  }
+
+  if (g_portmasterGlesLibrary != nullptr) {
+    if (SDL_FunctionPointer function = SDL_LoadFunction(g_portmasterGlesLibrary, name)) {
+      return reinterpret_cast<dawn::native::opengl::EGLFunctionPointerType>(function);
+    }
+  }
+
+  return reinterpret_cast<dawn::native::opengl::EGLFunctionPointerType>(SDL_GL_GetProcAddress(name));
+}
+
+static bool configure_portmaster_egl_proc(dawn::native::opengl::RequestAdapterOptionsGetGLProc& glProcOptions) {
+  if (std::getenv("DUSKLIGHT_PORTMASTER_EGL_FBDEV_SURFACE") == nullptr &&
+      std::getenv("DUSKLIGHT_PORTMASTER_FBDEV_PRESENT") == nullptr &&
+      std::getenv("DUSKLIGHT_PORTMASTER_SDL2SHIM_EXTERNAL_PRESENT") == nullptr) {
+    return false;
+  }
+
+  glProcOptions.getProc = portmaster_egl_get_proc;
+  glProcOptions.display = nullptr;
+  Log.info("Requesting Dawn OpenGL adapter through PortMaster EGL proc loader");
+  return true;
+}
+
+static bool configure_sdl2shim_gl_proc(dawn::native::opengl::RequestAdapterOptionsGetGLProc& glProcOptions) {
+  SDL_Window* window = window::get_sdl_window();
+  if (!ensure_sdl2shim_egl_properties(window)) {
+    return false;
+  }
+
+  SDL_PropertiesID props = SDL_GetWindowProperties(window);
+  void* eglDisplay = SDL_GetPointerProperty(props, SDL2_SHIM_EGL_DISPLAY_PROP, nullptr);
+  void* glGetProc = SDL_GetPointerProperty(props, SDL2_SHIM_GL_GET_PROC_PROP, nullptr);
+  if (eglDisplay == nullptr || glGetProc == nullptr) {
+    return false;
+  }
+
+  auto sdlGetProc = reinterpret_cast<dawn::native::opengl::EGLGetProcProc>(glGetProc);
+  const bool useSystemEglProc =
+      std::getenv("DUSKLIGHT_PORTMASTER_SDL2SHIM_DAWN_CONTEXT_PRESENT") != nullptr ||
+      sdlGetProc("eglChooseConfig") == nullptr;
+  glProcOptions.getProc = useSystemEglProc ? portmaster_egl_get_proc : sdlGetProc;
+  glProcOptions.display = eglDisplay;
+  Log.info("Requesting Dawn OpenGL adapter through SDL2-shim EGL display={} getProc={} loader={}", eglDisplay,
+           glGetProc, useSystemEglProc ? "libEGL" : "SDL_GL_GetProcAddress");
+  return true;
+}
+
+// Dusklight (P4): the SDL2-shim bootstrap (ensure_sdl2shim_egl_properties → SDL_GL_CreateContext)
+// makes the firmware's borrowed EGL context+surface current on this init/main thread and leaves it
+// bound (every Dawn scoped make-current on the main thread restores it as mPrevState). The Aurora
+// render worker owns presentation, so it must eglMakeCurrent that *same* borrowed surface on the
+// worker thread — which EGL refuses (EGL_BAD_ACCESS) while the surface is still bound on the main
+// thread. This is the one device-only pin that made the render-thread split crash on Mali while it
+// worked on desktop (where Dawn owns its own, unbound, surface). Once Dawn is fully initialized,
+// release the borrowed context from the main thread. From then on both threads acquire Dawn's single
+// EGL context only through the exclusive make-current mutex (gl_allow_context_on_multi_threads): the
+// worker for present, the main thread for its rare cache-miss geometry GL — same shared-serialized
+// model as desktop. Harmless single-threaded (present on main just re-binds it each frame).
+static void release_sdl2shim_bootstrap_current() {
+  SDL_Window* window = window::get_sdl_window();
+  if (window == nullptr || !is_sdl2shim_driver() || g_sdl2ShimBootstrapContext == nullptr) {
+    return;
+  }
+  SDL_PropertiesID props = SDL_GetWindowProperties(window);
+  void* eglDisplay = SDL_GetPointerProperty(props, SDL2_SHIM_EGL_DISPLAY_PROP, nullptr);
+  if (eglDisplay == nullptr) {
+    return;
+  }
+  using EglMakeCurrentFn = unsigned int (*)(void*, void*, void*, void*);
+  auto eglMakeCurrent = reinterpret_cast<EglMakeCurrentFn>(portmaster_egl_get_proc("eglMakeCurrent"));
+  if (eglMakeCurrent == nullptr) {
+    Log.warn("SDL2-shim: eglMakeCurrent unavailable; cannot release borrowed context (render worker may crash)");
+    return;
+  }
+  // EGL_NO_SURFACE / EGL_NO_CONTEXT are (void*)0.
+  eglMakeCurrent(eglDisplay, nullptr, nullptr, nullptr);
+  Log.info("SDL2-shim: released borrowed EGL context from main thread (render worker owns present)");
+}
+#endif
 
 namespace {
 
@@ -220,6 +423,15 @@ wgpu::TextureFormat to_linear(wgpu::TextureFormat format) {
     return wgpu::TextureFormat::BGRA8Unorm;
   }
   return format;
+}
+
+bool surface_supports_format(wgpu::TextureFormat wanted) {
+  for (size_t i = 0; i < g_surfaceCapabilities.formatCount; ++i) {
+    if (to_linear(g_surfaceCapabilities.formats[i]) == wanted) {
+      return true;
+    }
+  }
+  return false;
 }
 
 wgpu::TextureFormat best_surface_format() {
@@ -649,7 +861,8 @@ const TextureWithSampler& resample_present_source(const wgpu::CommandEncoder& en
       .frameWidth = static_cast<float>(width),
       .frameHeight = static_cast<float>(height),
   };
-  ASSERT(gfx::render_worker::is_worker_thread(), "Present resample queue write must run on the render worker");
+  ASSERT(gfx::render_worker::is_worker_thread() || !gfx::render_worker::is_running(),
+         "Present resample queue write must run on the render worker");
   g_queue.WriteBuffer(g_ResampleUniformBuffer, 0, &uniform, sizeof(uniform));
 
   const std::array bindGroupEntries{
@@ -732,6 +945,11 @@ static bool create_surface() {
     return false;
   }
   window::SurfaceLock surfaceLock;
+  // On the Mali SDL2-shim path the firmware SDL2 only exposes its borrowed EGL
+  // display/surface/context once a GL context exists. Force that here (bootstraps
+  // one if needed) BEFORE reading the window's EGL properties for the surface
+  // descriptor — otherwise the sdl2 branch below sees no handles and bails. (#15)
+  ensure_sdl2shim_egl_properties(window);
   const auto chainedDescriptor = utils::SetupWindowAndGetSurfaceDescriptor(window);
   if (!chainedDescriptor) {
     Log.error("Failed to create surface descriptor for current window");
@@ -786,8 +1004,29 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
     return false;
   }
   {
+    // Dawn's OpenGL/OpenGLES adapters only enumerate under the WebGPU
+    // Compatibility feature level; Core is not fully supported on GL/GLES.
+    // Without this, RequestAdapter returns "No supported adapters" on Mesa and
+    // Aurora silently falls back to Vulkan. Mali handhelds are GLES-only, so
+    // this is Mali-bringup step #1. (PortMaster: see CLAUDE.md.)
+    wgpu::FeatureLevel featureLevel = wgpu::FeatureLevel::Undefined;
+    if (backend == wgpu::BackendType::OpenGLES || backend == wgpu::BackendType::OpenGL) {
+      featureLevel = wgpu::FeatureLevel::Compatibility;
+    }
+    const wgpu::ChainedStruct* adapterNextInChain = nullptr;
+#ifdef WEBGPU_DAWN
+    // On the Mali SDL2-shim path, bind Dawn's GLES adapter to the shim's borrowed
+    // EGL display + proc loader so it renders into the firmware-owned surface.
+    // (Mali display bringup #15; no-op on desktop where these env vars are unset.)
+    dawn::native::opengl::RequestAdapterOptionsGetGLProc glProcOptions;
+    if ((backend == wgpu::BackendType::OpenGLES || backend == wgpu::BackendType::OpenGL) &&
+        (configure_sdl2shim_gl_proc(glProcOptions) || configure_portmaster_egl_proc(glProcOptions))) {
+      adapterNextInChain = &glProcOptions;
+    }
+#endif
     const wgpu::RequestAdapterOptions options{
-        .featureLevel = wgpu::FeatureLevel::Compatibility,
+        .nextInChain = adapterNextInChain,
+        .featureLevel = featureLevel,
         .powerPreference = wgpu::PowerPreference::HighPerformance,
         .backendType = backend,
         .compatibleSurface = g_surface,
@@ -931,7 +1170,7 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
         .functionUserdata = nullptr,
     });
 
-    constexpr std::array enableToggles{
+    constexpr std::array enableTogglesBase{
 #if _WIN32
         "use_dxc",
 #ifndef NDEBUG
@@ -950,6 +1189,14 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
         "enable_immediate_error_handling",
         "gl_allow_context_on_multi_threads",
     };
+    std::vector<const char*> enableToggles(enableTogglesBase.begin(), enableTogglesBase.end());
+    // Dusklight (P4): on GL/GLES, let Dawn's single EGL context migrate between the game/decode
+    // (main) thread and the Aurora render worker. Without this, the worker's first eglMakeCurrent
+    // fails with EGL_BAD_ACCESS and the game/render-thread split (kRenderWorkerOnGLES in
+    // gfx/common.cpp) can't run. GL-specific, so only added for the GL backends.
+    if (g_backendType == wgpu::BackendType::OpenGLES || g_backendType == wgpu::BackendType::OpenGL) {
+      enableToggles.push_back("gl_allow_context_on_multi_threads");
+    }
     constexpr std::array disableToggles{
         "timestamp_quantization",
     };
@@ -1020,7 +1267,12 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
     Log.error("Surface has no present modes");
     return false;
   }
-  auto surfaceFormat = best_surface_format();
+  // Dusklight (P4): on the SDL2-shim device path the render worker owns Dawn's context while the
+  // main thread presents (Mali's kmsdrm page-flip is display-thread-bound). The two threads use
+  // different EGL contexts and share the finished frame as an EGLImage, which the present module
+  // allocates as GL_RGBA8 — so pin the format the present pass renders instead of negotiating one.
+  const bool wantEfbPresent = is_sdl2shim_driver() && surface_supports_format(wgpu::TextureFormat::RGBA8Unorm);
+  auto surfaceFormat = wantEfbPresent ? wgpu::TextureFormat::RGBA8Unorm : best_surface_format();
   auto presentMode = best_present_mode(g_config.vsync);
   Log.info("Using surface format {}, present mode {}", magic_enum::enum_name(surfaceFormat),
            magic_enum::enum_name(presentMode));
@@ -1041,7 +1293,25 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
   create_copy_pipeline();
   create_resample_pipeline();
   gpu_prof::initialize();
+#ifdef WEBGPU_DAWN
+  // Must happen before resize_swapchain: when the EFB path comes up, Dawn's swapchain is never
+  // configured at all, so SwapChainEGL never touches the borrowed window surface.
+  if (wantEfbPresent) {
+    SDL_PropertiesID props = SDL_GetWindowProperties(window::get_sdl_window());
+    void* eglDisplay = SDL_GetPointerProperty(props, SDL2_SHIM_EGL_DISPLAY_PROP, nullptr);
+    sdl2shim_present::initialize(
+        [](const char* name) -> void* { return reinterpret_cast<void*>(portmaster_egl_get_proc(name)); },
+        eglDisplay, size.native_fb_width, size.native_fb_height, surfaceFormat);
+  }
+#endif
   resize_swapchain(size.fb_width, size.fb_height, size.native_fb_width, size.native_fb_height, true);
+#ifdef WEBGPU_DAWN
+  if (!sdl2shim_present::active()) {
+    // Fallback (EFB present unavailable, or a non-shim GL driver): the worker presents through
+    // Dawn's swapchain, so the borrowed context must not stay pinned to this thread.
+    release_sdl2shim_bootstrap_current();
+  }
+#endif
   g_initialized = true;
   return true;
 }
@@ -1049,6 +1319,10 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
 void shutdown() {
   g_initialized = false;
   gfx::gpu_synchronize();
+#ifdef WEBGPU_DAWN
+  // Releases the shared EGLImages and their fences; needs g_device, so it must precede its reset.
+  sdl2shim_present::shutdown();
+#endif
   gpu_prof::shutdown();
   g_CopyBindGroupLayout = {};
   g_CopyPipeline = {};
@@ -1094,9 +1368,16 @@ static void resize_swapchain_internal(uint32_t width, uint32_t height, uint32_t 
   }
   g_graphicsConfig.surfaceConfiguration.width = nativeWidth;
   g_graphicsConfig.surfaceConfiguration.height = nativeHeight;
-  auto surfaceConfiguration = g_graphicsConfig.surfaceConfiguration;
-  surfaceConfiguration.device = g_device;
+#ifdef WEBGPU_DAWN
+  if (sdl2shim_present::active()) {
+    // The EFB path never presents through Dawn, so the surface stays unconfigured (which also keeps
+    // SwapChainEGL, and its thread-affine eglSwapBuffers, out of the picture entirely).
+    sdl2shim_present::resize(nativeWidth, nativeHeight, g_graphicsConfig.surfaceConfiguration.format);
+  } else
+#endif
   {
+    auto surfaceConfiguration = g_graphicsConfig.surfaceConfiguration;
+    surfaceConfiguration.device = g_device;
     window::SurfaceLock surfaceLock;
     g_surface.Configure(&surfaceConfiguration);
   }
