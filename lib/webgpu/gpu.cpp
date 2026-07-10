@@ -861,8 +861,7 @@ const TextureWithSampler& resample_present_source(const wgpu::CommandEncoder& en
       .frameWidth = static_cast<float>(width),
       .frameHeight = static_cast<float>(height),
   };
-  ASSERT(gfx::render_worker::is_worker_thread() || !gfx::render_worker::is_running(),
-         "Present resample queue write must run on the render worker");
+  ASSERT(gfx::render_worker::is_worker_thread(), "Present resample queue write must run on the render worker");
   g_queue.WriteBuffer(g_ResampleUniformBuffer, 0, &uniform, sizeof(uniform));
 
   const std::array bindGroupEntries{
@@ -1004,15 +1003,6 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
     return false;
   }
   {
-    // Dawn's OpenGL/OpenGLES adapters only enumerate under the WebGPU
-    // Compatibility feature level; Core is not fully supported on GL/GLES.
-    // Without this, RequestAdapter returns "No supported adapters" on Mesa and
-    // Aurora silently falls back to Vulkan. Mali handhelds are GLES-only, so
-    // this is Mali-bringup step #1. (PortMaster: see CLAUDE.md.)
-    wgpu::FeatureLevel featureLevel = wgpu::FeatureLevel::Undefined;
-    if (backend == wgpu::BackendType::OpenGLES || backend == wgpu::BackendType::OpenGL) {
-      featureLevel = wgpu::FeatureLevel::Compatibility;
-    }
     const wgpu::ChainedStruct* adapterNextInChain = nullptr;
 #ifdef WEBGPU_DAWN
     // On the Mali SDL2-shim path, bind Dawn's GLES adapter to the shim's borrowed
@@ -1026,7 +1016,7 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
 #endif
     const wgpu::RequestAdapterOptions options{
         .nextInChain = adapterNextInChain,
-        .featureLevel = featureLevel,
+        .featureLevel = wgpu::FeatureLevel::Compatibility,
         .powerPreference = wgpu::PowerPreference::HighPerformance,
         .backendType = backend,
         .compatibleSurface = g_surface,
@@ -1180,7 +1170,7 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
         .functionUserdata = nullptr,
     });
 
-    constexpr std::array enableTogglesBase{
+    constexpr std::array enableToggles{
 #if _WIN32
         "use_dxc",
 #ifndef NDEBUG
@@ -1199,14 +1189,6 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
         "enable_immediate_error_handling",
         "gl_allow_context_on_multi_threads",
     };
-    std::vector<const char*> enableToggles(enableTogglesBase.begin(), enableTogglesBase.end());
-    // Dusklight (P4): on GL/GLES, let Dawn's single EGL context migrate between the game/decode
-    // (main) thread and the Aurora render worker. Without this, the worker's first eglMakeCurrent
-    // fails with EGL_BAD_ACCESS and the game/render-thread split (kRenderWorkerOnGLES in
-    // gfx/common.cpp) can't run. GL-specific, so only added for the GL backends.
-    if (g_backendType == wgpu::BackendType::OpenGLES || g_backendType == wgpu::BackendType::OpenGL) {
-      enableToggles.push_back("gl_allow_context_on_multi_threads");
-    }
     constexpr std::array disableToggles{
         "timestamp_quantization",
     };

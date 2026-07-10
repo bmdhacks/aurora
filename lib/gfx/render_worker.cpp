@@ -267,9 +267,4 @@ bool is_worker_thread() noexcept { return g_workerThreadId == std::this_thread::
 
 bool is_idle() noexcept { return g_pendingItems.load(std::memory_order_acquire) == 0; }
 
-// True when the worker thread is running. When false (the OpenGL/GLES backend is
-// single-threaded, so the worker is never started), enqueue() runs work inline
-// on the calling thread and worker-thread assertions must accept it instead.
-bool is_running() noexcept { return g_running.load(std::memory_order_acquire); }
-
 } // namespace aurora::gfx::render_worker

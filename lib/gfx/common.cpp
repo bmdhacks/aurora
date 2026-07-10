@@ -1371,20 +1371,7 @@ void initialize() {
     std::lock_guard lock{g_presentStatsMutex};
     g_presentTimes.clear();
   }
-  // Dusklight (P4): run the Aurora render worker on GL/GLES too, so per-frame encode + submit +
-  // present execute on a dedicated context-owning thread while the game thread races ahead with
-  // logic + FIFO decode (the heavy per-frame vertex/uniform/index data lands in CPU-mapped staging
-  // buffers, so decode touches GL only on cache misses). Upstream disabled the worker here because
-  // Dawn's GL EGL context was bound to its creating thread; we now enable Dawn's
-  // "gl_allow_context_on_multi_threads" toggle (gpu.cpp) so the context migrates safely to the
-  // worker. The producer/consumer frame model itself is unchanged and already ships on the other
-  // backends. constexpr-gated per the single-purpose-fork convention (no env var).
-  static constexpr bool kRenderWorkerOnGLES = true;
-  const bool isGLBackend = webgpu::g_backendType == wgpu::BackendType::OpenGL ||
-                           webgpu::g_backendType == wgpu::BackendType::OpenGLES;
-  if (!isGLBackend || kRenderWorkerOnGLES) {
-    render_worker::initialize();
-  }
+  render_worker::initialize();
   // This appears to take a while and blocks the render thread for periods of time
   // render_worker::set_event_pump([] {
   //   if (g_instance) {
