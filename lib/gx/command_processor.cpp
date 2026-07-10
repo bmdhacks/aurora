@@ -1600,7 +1600,6 @@ static void push_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Rang
 // option — it's unusably slow on Mali. Flip to false only to exercise storage on desktop.
 static constexpr bool kSkipStorageVertexFetch = true;
 
-static bool native_vertex_mode() noexcept;
 static bool try_native_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, const u8* data, u32& pos, u32 vtxSize);
 static bool try_native_draw_run(u8 cmd, GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, u32 vtxSize, const u8* data,
                                 u32& pos, u32 size, bool bigEndian);
@@ -1624,7 +1623,7 @@ static void draw_prim(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, const u8* da
 
   // Native vertex fetch expands supported layouts to hardware attributes on the CPU
   // (advancing pos itself). Unsupported layouts fall through to the storage path.
-  if (native_vertex_mode() && try_native_draw(prim, fmt, vtxCount, data, pos, vtxSize)) {
+  if (try_native_draw(prim, fmt, vtxCount, data, pos, vtxSize)) {
     return;
   }
 
@@ -1692,7 +1691,7 @@ static void handle_draw(u8 cmd, const u8* data, u32& pos, u32 size, bool bigEndi
   // Fold this draw plus any immediately-following identical draw commands into one native
   // hardware draw (strip topology + primitive restart). Unsupported primitives/layouts fall
   // through to draw_prim (single native, else the storage/software path).
-  if (native_vertex_mode() && try_native_draw_run(cmd, prim, fmt, vtxCount, vtxSize, data, pos, size, bigEndian)) {
+  if (try_native_draw_run(cmd, prim, fmt, vtxCount, vtxSize, data, pos, size, bigEndian)) {
     return;
   }
 
@@ -1776,30 +1775,17 @@ static void push_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Rang
 }
 
 // ---------------------------------------------------------------------------
-// Native vertex fetch (M1: correctness-first, no cache/batching).
+// Native vertex fetch.
 //
-// The default (storage) path software-fetches GX vertices from SSBOs, which
-// (a) miscompiles the per-vertex matrix-palette index into slot 0 on AGX/Mali
-// (the "porcupine") and (b) cannot link on Mali (0 vertex-stage SSBOs). Here we
-// expand each GX vertex on the CPU into real hardware vertex attributes — most
-// importantly pnmtxidx becomes a plain Uint32 attribute, so it never flows
-// through the miscompiled byte-load — and let the fixed-function vertex input
-// path feed the shader. Skinning/projection stay on the GPU.
+// The storage path software-fetches GX vertices from SSBOs, which (a) miscompiles
+// the per-vertex matrix-palette index into slot 0 on AGX/Mali (the "porcupine")
+// and (b) cannot link on Mali (0 vertex-stage SSBOs). Here we expand each GX vertex
+// on the CPU into real hardware vertex attributes — most importantly pnmtxidx
+// becomes a plain Uint32 attribute, so it never flows through the miscompiled
+// byte-load — and let the fixed-function vertex input path feed the shader.
+// Skinning/projection stay on the GPU. Layouts native fetch can't express fall
+// through to the storage path per-draw (try_native_draw* return false).
 // ---------------------------------------------------------------------------
-
-static bool native_vertex_mode() noexcept {
-  static const bool mode = [] {
-    if (const char* e = std::getenv("DUSKLIGHT_GX_VERTEX_MODE")) {
-      // "storage" forces the legacy SSBO path (for A/B comparison); anything else
-      // (incl. the "native" default) uses native fetch. "texture" is a later milestone.
-      if (std::strcmp(e, "storage") == 0) {
-        return false;
-      }
-    }
-    return true;
-  }();
-  return mode;
-}
 
 // Canonical hardware-attribute byte width per GX attr (must match native_vertex_layout).
 static u8 canonical_attr_size(GXAttr attr) noexcept {
@@ -2786,8 +2772,7 @@ void handle_aurora(const u8* data, u32& pos, u32 size, bool bigEndian) {
     const u8* vtxData = data + pos;
     pos += totalVtxBytes;
     if (indexCount != 0) {
-      if (!(native_vertex_mode() &&
-            try_native_draw_indexed(fmt, vtxCount, vtxData, vtxSize, idxData, idxBytes, indexCount))) {
+      if (!try_native_draw_indexed(fmt, vtxCount, vtxData, vtxSize, idxData, idxBytes, indexCount)) {
         const gfx::Range idxRange = gfx::push_indices(idxData, idxBytes, 4);
         const gfx::Range vertRange = gfx::push_verts(vtxData, totalVtxBytes, 4);
         push_gx_draw(prim, fmt, vtxCount, vertRange, idxRange, indexCount);
