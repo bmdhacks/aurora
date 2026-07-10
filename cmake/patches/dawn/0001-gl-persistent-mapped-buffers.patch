@@ -1,0 +1,253 @@
+diff --git a/src/dawn/native/opengl/BufferGL.cpp b/src/dawn/native/opengl/BufferGL.cpp
+index 0f5c65065..b72de6b91 100644
+--- a/src/dawn/native/opengl/BufferGL.cpp
++++ b/src/dawn/native/opengl/BufferGL.cpp
+@@ -28,6 +28,7 @@
+ #include "src/dawn/native/opengl/BufferGL.h"
+ 
+ #include <algorithm>
++#include <cstring>
+ #include <utility>
+ #include <vector>
+ 
+@@ -75,7 +76,30 @@ ResultOrError<Ref<Buffer>> Buffer::Create(Device* device,
+         DAWN_GL_TRY(gl, BindBuffer(GL_ARRAY_BUFFER, buffer->mBuffer));
+ 
+         auto allocatedSize = buffer->mAllocatedSize.value();
+-        if (clear) {
++
++        // Dusklight/Mali: back per-frame buffers with immutable, persistently-mapped storage. The
++        // destination targets use coherent (write-combine) memory so CPU stores are fast and the GPU
++        // sees them without a copy; staging sources use cached client memory for fast readback in the
++        // CopyBufferToBuffer memcpy. Falls back to glBufferData when EXT_buffer_storage is absent.
++        if (buffer->mPersistentKind != PersistentKind::None && gl.BufferStorage != nullptr) {
++            const bool dest = buffer->mPersistentKind == PersistentKind::WriteCombineDest;
++            GLbitfield storageFlags = GL_DYNAMIC_STORAGE_BIT | GL_MAP_WRITE_BIT | GL_MAP_PERSISTENT_BIT;
++            GLbitfield mapFlags = GL_MAP_WRITE_BIT | GL_MAP_PERSISTENT_BIT;
++            if (dest) {
++                storageFlags |= GL_MAP_COHERENT_BIT;
++                mapFlags |= GL_MAP_COHERENT_BIT;
++            } else {
++                storageFlags |= GL_MAP_READ_BIT | GL_CLIENT_STORAGE_BIT;
++                mapFlags |= GL_MAP_READ_BIT | GL_MAP_FLUSH_EXPLICIT_BIT;
++            }
++            DAWN_GL_TRY_ALWAYS_CHECK(
++                gl, BufferStorage(GL_ARRAY_BUFFER, allocatedSize, nullptr, storageFlags));
++            buffer->mPersistentMap = DAWN_GL_TRY_ALWAYS_CHECK(
++                gl, MapBufferRange(GL_ARRAY_BUFFER, 0, allocatedSize, mapFlags));
++            if (clear && buffer->mPersistentMap != nullptr) {
++                DAWN_UNSAFE_TODO(memset(buffer->mPersistentMap, 1, allocatedSize));
++            }
++        } else if (clear) {
+             std::vector<uint8_t> clearValues(allocatedSize, 1u);
+             DAWN_GL_TRY_ALWAYS_CHECK(
+                 gl, BufferData(GL_ARRAY_BUFFER, allocatedSize, clearValues.data(), GL_STATIC_DRAW));
+@@ -107,6 +131,23 @@ Buffer::Buffer(Device* device, const UnpackedPtr<BufferDescriptor>& descriptor)
+         alignment = 16u;
+     }
+     mAllocatedSize = Align(std::max(GetSize(), uint64_t(4u)), alignment);
++
++    // Dusklight/Mali: classify buffers we back with immutable EXT_buffer_storage + a persistent CPU
++    // mapping so per-frame uploads bypass libmali's slow uncached device-memory copy worker. Exclude
++    // mapped-at-creation buffers (their init flows through a distinct GL map path).  The actual
++    // allocation only takes this path when glBufferStorage is available (checked in Create()).
++    if (!descriptor->mappedAtCreation) {
++        const wgpu::BufferUsage usage = GetUsage();
++        if (usage & wgpu::BufferUsage::MapWrite) {
++            // Staging uploads (MapWrite|CopySrc): CPU-written and read back by our copy memcpy —
++            // keep in cached client memory for fast reads.
++            mPersistentKind = PersistentKind::CachedStaging;
++        } else if ((usage & wgpu::BufferUsage::CopyDst) && !(usage & wgpu::BufferUsage::MapRead)) {
++            // Per-frame device targets (…|CopyDst): GPU-read, CPU-filled via memcpy — coherent
++            // write-combine so the CPU stores are fast and the GPU sees them without a driver copy.
++            mPersistentKind = PersistentKind::WriteCombineDest;
++        }
++    }
+ }
+ 
+ Buffer::~Buffer() = default;
+@@ -184,6 +225,16 @@ MaybeError Buffer::InitializeToZero() {
+ 
+     Device* device = ToBackend(GetDevice());
+ 
++    if (mPersistentMap != nullptr) {
++        // Immutable persistent buffer: zero it directly through the live mapping (glBufferSubData on
++        // an immutable buffer would otherwise re-enter libmali's slow uncached store path).
++        DAWN_UNSAFE_TODO(memset(mPersistentMap, 0, GetAllocatedSize()));
++        device->IncrementLazyClearCountForTesting();
++        TrackUsage();
++        SetInitialized(true);
++        return {};
++    }
++
+     DAWN_TRY(device->EnqueueGL([self = Ref<Buffer>(this), size = GetAllocatedSize()](
+                                    const OpenGLFunctions& gl) -> MaybeError {
+         const std::vector<uint8_t> clearValues(size, 0u);
+@@ -221,6 +272,15 @@ MaybeError Buffer::MapAtCreationImpl() {
+ }
+ 
+ MaybeError Buffer::MapAsyncImpl(wgpu::MapMode mode, size_t offset, size_t size) {
++    if (mPersistentMap != nullptr) {
++        // Immutable persistent mapping: hand back the live pointer with no GL round-trip and no
++        // GPU->CPU sync. The frontend applies `offset` itself via GetMappedRange().
++        auto deviceGuard = GetDevice()->GetGuard();
++        DAWN_TRY(EnsureDataInitialized());
++        mMappedData = mPersistentMap;
++        return {};
++    }
++
+     // This allows the specific code sequence of MapAsync(Write) / WaitAny() to work in deferral
+     // at the cost of a host-side copy. This should be removed in favour of eager buffer mapping,
+     // once that's implemented.
+@@ -287,6 +347,11 @@ void Buffer::UnmapImpl(BufferState oldState, BufferState newState) {
+     if (newState == BufferState::Destroyed) {
+         return;
+     }
++    if (mPersistentMap != nullptr) {
++        // Persistent mapping stays live for the buffer's lifetime — nothing to unmap. Coherent
++        // (write-combine) targets need no flush; cached staging is CPU-only and never GPU-read.
++        return;
++    }
+     IgnoreErrors(
+         device->EnqueueGL([self = Ref<Buffer>(this)](const OpenGLFunctions& gl) -> MaybeError {
+             DAWN_GL_TRY(gl, BindBuffer(GL_ARRAY_BUFFER, self->mBuffer));
+@@ -304,6 +369,8 @@ void Buffer::UnmapImpl(BufferState oldState, BufferState newState) {
+ void Buffer::DestroyImpl(DestroyReason reason) {
+     BufferBase::DestroyImpl(reason);
+     mMappedData = nullptr;
++    // glDeleteBuffers (enqueued below) implicitly unmaps a persistent mapping.
++    mPersistentMap = nullptr;
+ 
+     IgnoreErrors(ToBackend(GetDevice())
+                      ->EnqueueDestroyGL(this, &Buffer::GetHandle, reason,
+diff --git a/src/dawn/native/opengl/BufferGL.h b/src/dawn/native/opengl/BufferGL.h
+index 50a2ccc08..2e2a908d4 100644
+--- a/src/dawn/native/opengl/BufferGL.h
++++ b/src/dawn/native/opengl/BufferGL.h
+@@ -48,6 +48,11 @@ class Buffer final : public BufferBase {
+ 
+     GLuint GetHandle() const;
+ 
++    // Dusklight/Mali: non-null once this buffer is backed by immutable EXT_buffer_storage with a
++    // persistent CPU mapping. CopyBufferToBuffer / WriteBuffer fill it with a plain memcpy,
++    // bypassing libmali's slow uncached device-memory copy worker.
++    void* GetPersistentMap() const { return mPersistentMap; }
++
+     MaybeError EnsureDataInitialized(bool* outDidDataInitialization = nullptr);
+     MaybeError EnsureDataInitializedAsDestination(uint64_t offset,
+                                                   uint64_t size,
+@@ -70,8 +75,18 @@ class Buffer final : public BufferBase {
+ 
+     MaybeError InitializeToZero();
+ 
++    // Dusklight/Mali: EXT_buffer_storage persistent-mapped storage classes.
++    enum class PersistentKind {
++        None,              // ordinary mutable glBufferData buffer
++        WriteCombineDest,  // GPU-read device target (…|CopyDst): CPU fills it via memcpy (coherent)
++        CachedStaging,     // CPU-only upload source (MapWrite): read back by the copy memcpy
++    };
++
+     GLuint mBuffer = 0;
+     raw_ptr<void> mMappedData = nullptr;
++    // Live persistent mapping (owned for the buffer's lifetime; glDeleteBuffers unmaps it).
++    void* mPersistentMap = nullptr;
++    PersistentKind mPersistentKind = PersistentKind::None;
+     std::vector<char> mCPUStaging;  // used for GLDefer
+ };
+ 
+diff --git a/src/dawn/native/opengl/CommandBufferGL.cpp b/src/dawn/native/opengl/CommandBufferGL.cpp
+index 57a944400..65f1af1ea 100644
+--- a/src/dawn/native/opengl/CommandBufferGL.cpp
++++ b/src/dawn/native/opengl/CommandBufferGL.cpp
+@@ -865,6 +865,37 @@ MaybeError CommandBuffer::Execute(const OpenGLFunctions& gl) {
+                     ToBackend(copy->destination)
+                         ->EnsureDataInitializedAsDestination(copy->destinationOffset, copy->size));
+ 
++                // Dusklight/Mali fast path: if the destination is a coherent persistent mapping,
++                // fill it with a CPU memcpy instead of glCopyBufferSubData, which libmali otherwise
++                // services on a worker thread with a slow uncached device-memory store loop.
++                if (void* dstMap = ToBackend(copy->destination)->GetPersistentMap();
++                    dstMap != nullptr) {
++                    auto src = ToBackend(copy->source);
++                    const uint8_t* srcData = nullptr;
++                    bool srcTransient = false;
++                    if (void* srcMap = src->GetPersistentMap(); srcMap != nullptr) {
++                        srcData = static_cast<const uint8_t*>(srcMap) + copy->sourceOffset;
++                    } else {
++                        DAWN_GL_TRY(gl, BindBuffer(GL_COPY_READ_BUFFER, src->GetHandle()));
++                        void* p = DAWN_GL_TRY_ALWAYS_CHECK(
++                            gl, MapBufferRange(GL_COPY_READ_BUFFER, copy->sourceOffset, copy->size,
++                                               GL_MAP_READ_BIT | GL_MAP_UNSYNCHRONIZED_BIT));
++                        srcData = static_cast<const uint8_t*>(p);
++                        srcTransient = true;
++                    }
++                    DAWN_UNSAFE_TODO(memcpy(static_cast<uint8_t*>(dstMap) + copy->destinationOffset,
++                                            srcData, copy->size));
++                    if (srcTransient) {
++                        DAWN_GL_TRY(gl, UnmapBuffer(GL_COPY_READ_BUFFER));
++                        DAWN_GL_TRY(gl, BindBuffer(GL_COPY_READ_BUFFER, 0));
++                    }
++                    // Destination is a coherent mapping: the write is visible to subsequent draws
++                    // in this submission with no explicit flush.
++                    src->TrackUsage();
++                    ToBackend(copy->destination)->TrackUsage();
++                    break;
++                }
++
+                 DAWN_GL_TRY(gl,
+                             BindBuffer(GL_PIXEL_PACK_BUFFER, ToBackend(copy->source)->GetHandle()));
+                 DAWN_GL_TRY(gl, BindBuffer(GL_PIXEL_UNPACK_BUFFER,
+diff --git a/src/dawn/native/opengl/OpenGLFunctions.cpp b/src/dawn/native/opengl/OpenGLFunctions.cpp
+index cf46a96a0..73f37ded7 100644
+--- a/src/dawn/native/opengl/OpenGLFunctions.cpp
++++ b/src/dawn/native/opengl/OpenGLFunctions.cpp
+@@ -36,6 +36,13 @@ MaybeError OpenGLFunctions::Initialize(GLGetProcProc getProc) {
+     if (mVersion.IsES()) {
+ #if defined(DAWN_ENABLE_BACKEND_OPENGLES)
+         DAWN_TRY(LoadOpenGLESProcs(getProc, mVersion.GetMajor(), mVersion.GetMinor()));
++        // Dusklight/Mali: the autogen loader only wires glBufferStorage on desktop GL 4.4, but
++        // EXT_buffer_storage exposes the same immutable + persistent-mapped storage on GLES. We use
++        // it to place per-frame CopyDst buffers in coherent write-combine memory and fill them via a
++        // persistent map, bypassing libmali's slow uncached device-memory copy worker.
++        if (BufferStorage == nullptr && IsGLExtensionSupported("GL_EXT_buffer_storage")) {
++            BufferStorage = reinterpret_cast<PFNGLBUFFERSTORAGEPROC>(getProc("glBufferStorageEXT"));
++        }
+ #else
+         return DAWN_INTERNAL_ERROR("The OpenGLES backend is not enabled");
+ #endif
+diff --git a/src/dawn/native/opengl/QueueGL.cpp b/src/dawn/native/opengl/QueueGL.cpp
+index 3857ee0f0..205bbbd29 100644
+--- a/src/dawn/native/opengl/QueueGL.cpp
++++ b/src/dawn/native/opengl/QueueGL.cpp
+@@ -27,6 +27,8 @@
+ 
+ #include "src/dawn/native/opengl/QueueGL.h"
+ 
++#include <cstdint>
++#include <cstring>
+ #include <vector>
+ 
+ #include "dawn/platform/DawnPlatform.h"
+@@ -96,6 +98,22 @@ MaybeError Queue::WriteBufferImpl(BufferBase* buffer,
+                                   size_t size) {
+     DAWN_TRY(ToBackend(buffer)->EnsureDataInitializedAsDestination(bufferOffset, size));
+     buffer->MarkUsedInPendingCommands();
++
++    // Dusklight/Mali fast path: a persistently-mapped target is filled with a CPU memcpy into its
++    // coherent (write-combine) mapping instead of glBufferSubData, which libmali otherwise services
++    // on a worker thread with a slow uncached device-memory store loop.
++    if (ToBackend(buffer)->GetPersistentMap() != nullptr) {
++        return ToBackend(GetDevice())
++            ->EnqueueGL(data, size,
++                        [buffer = Ref<Buffer>(ToBackend(buffer)), bufferOffset](
++                            const OpenGLFunctions& gl, const void* data, size_t size) -> MaybeError {
++                            void* map = buffer->GetPersistentMap();
++                            DAWN_UNSAFE_TODO(
++                                memcpy(static_cast<uint8_t*>(map) + bufferOffset, data, size));
++                            return {};
++                        });
++    }
++
+     return ToBackend(GetDevice())
+         ->EnqueueGL(data, size,
+                     [buffer = Ref<Buffer>(ToBackend(buffer)), bufferOffset](
