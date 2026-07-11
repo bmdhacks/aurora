@@ -1360,6 +1360,8 @@ PipelineRef pipeline_ref(const rmlui::PipelineConfig& config) {
 }
 #endif
 
+static bool ensure_native_geom_cache_buffers();
+
 void initialize() {
   g_frameIndex = 0;
   g_processEventsQueued.store(false, std::memory_order_release);
@@ -1371,7 +1373,17 @@ void initialize() {
     std::lock_guard lock{g_presentStatsMutex};
     g_presentTimes.clear();
   }
+  // The render worker runs on the SDL2-shim EFB path too. The game thread still makes Dawn calls
+  // mid-frame (vertex-cache uploads, texture creation), each taking Dawn's EGL-context mutex, but
+  // the worker can no longer park while holding it: the EFB slot's reverse-fence wait in
+  // sdl2shim_present::acquire() is a client-side wait taken with no context held, so every
+  // worker-side mutex hold is bounded by GPU progress alone and no game-thread call can close a
+  // deadlock cycle against it (the Mali-G31 hang this used to gate on).
   render_worker::initialize();
+  // Create the native geometry cache buffers before any frame traffic: on GLES, buffer
+  // creation makes Dawn's EGL context current, and doing that from the game thread while
+  // the render worker holds the context can deadlock libmali (Mali-G31).
+  ensure_native_geom_cache_buffers();
   // This appears to take a while and blocks the render thread for periods of time
   // render_worker::set_event_pump([] {
   //   if (g_instance) {
@@ -2333,20 +2345,21 @@ static bool ensure_native_geom_cache_buffers() {
 // queue write (ordered after prior submits, so it never races a prior frame's reads).
 static std::pair<Range, bool> push_native_cached(const wgpu::Buffer& buffer, uint32_t& cursor, uint64_t limit,
                                                  const uint8_t* data, size_t length) {
-  static ByteBuffer s_pad;
   const uint32_t offset = static_cast<uint32_t>(AURORA_ALIGN(cursor, 4));
   const size_t alignedSize = AURORA_ALIGN(length, 4); // WriteBuffer requires a 4-byte-aligned size
   if (static_cast<uint64_t>(offset) + alignedSize > limit) {
     return {{}, false};
   }
-  if (alignedSize == length) {
-    g_queue.WriteBuffer(buffer, offset, data, length);
-  } else {
-    s_pad.clear();
-    s_pad.append(data, length);
-    s_pad.append_zeroes(alignedSize - length);
-    g_queue.WriteBuffer(buffer, offset, s_pad.data(), s_pad.size());
-  }
+  // The queue write must run on the render worker: on GLES it makes Dawn's EGL context
+  // current, and grabbing that from the game thread while the worker holds it deadlocks
+  // libmali (Mali-G31). The worker queue is FIFO, so the write still lands before the
+  // encode pass that reads this range and after all prior submits. The copy (zero-padded
+  // to the aligned size) keeps the data alive until the worker executes it.
+  std::vector<uint8_t> copy(alignedSize);
+  memcpy(copy.data(), data, length);
+  render_worker::enqueue_work([buffer, offset, copy = std::move(copy)] {
+    g_queue.WriteBuffer(buffer, offset, copy.data(), copy.size());
+  });
   cursor = offset + static_cast<uint32_t>(alignedSize);
   return {Range{offset, static_cast<uint32_t>(length)}, true};
 }

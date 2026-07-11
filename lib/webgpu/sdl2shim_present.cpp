@@ -56,7 +56,14 @@ constexpr uint32_t EGL_GL_TEXTURE_2D_KHR = 0x30B1;
 constexpr uint32_t EGL_GL_TEXTURE_LEVEL_KHR = 0x30BC;
 constexpr uint32_t EGL_IMAGE_PRESERVED_KHR = 0x30D2;
 constexpr uint32_t EGL_SYNC_FENCE_KHR = 0x30F9;
+constexpr int32_t EGL_CONDITION_SATISFIED_KHR = 0x30F6;
 constexpr int32_t EGL_TRUE = 1;
+
+// Upper bound on the worker's wait for a slot's reverse fence (the main thread's blit of the
+// previous frame retiring on the GPU). In steady state the fence retired a frame ago and the
+// wait returns immediately; the bound only exists so a wedged fence produces one logged, torn
+// frame instead of a silent hang.
+constexpr uint64_t RevSyncWaitTimeoutNs = 2'000'000'000;
 
 using GlGenTexturesFn = void (*)(int32_t, uint32_t*);
 using GlBindTextureFn = void (*)(uint32_t, uint32_t);
@@ -79,6 +86,7 @@ using EglCreateImageKHRFn = void* (*)(void*, void*, uint32_t, void*, const int32
 using EglDestroyImageKHRFn = uint32_t (*)(void*, void*);
 using EglCreateSyncKHRFn = void* (*)(void*, uint32_t, const int32_t*);
 using EglWaitSyncKHRFn = uint32_t (*)(void*, void*, int32_t);
+using EglClientWaitSyncKHRFn = int32_t (*)(void*, void*, int32_t, uint64_t);
 using EglGetCurrentContextFn = void* (*)();
 
 // The firmware SDL2's own swap entry point, republished by the SDL3 shim. This is the exact call
@@ -108,13 +116,14 @@ struct GlFns {
   EglDestroyImageKHRFn DestroyImageKHR = nullptr;
   EglCreateSyncKHRFn CreateSyncKHR = nullptr;
   EglWaitSyncKHRFn WaitSyncKHR = nullptr;
+  EglClientWaitSyncKHRFn ClientWaitSyncKHR = nullptr;
   EglGetCurrentContextFn GetCurrentContext = nullptr;
 
   [[nodiscard]] bool complete() const {
     return GenTextures && BindTexture && TexImage2D && TexParameteri && DeleteTextures && GenFramebuffers &&
            BindFramebuffer && FramebufferTexture2D && CheckFramebufferStatus && DeleteFramebuffers &&
            BlitFramebuffer && Disable && Flush && GetError && CreateImageKHR && DestroyImageKHR &&
-           CreateSyncKHR && WaitSyncKHR && GetCurrentContext;
+           CreateSyncKHR && WaitSyncKHR && ClientWaitSyncKHR && GetCurrentContext;
   }
 };
 
@@ -199,6 +208,7 @@ bool load_procs(ProcAddressFn getProc) {
   LOAD("eglDestroyImageKHR", DestroyImageKHR)
   LOAD("eglCreateSyncKHR", CreateSyncKHR)
   LOAD("eglWaitSyncKHR", WaitSyncKHR)
+  LOAD("eglClientWaitSyncKHR", ClientWaitSyncKHR)
   LOAD("eglGetCurrentContext", GetCurrentContext)
 #undef LOAD
   return g_gl.complete();
@@ -475,9 +485,20 @@ std::optional<AcquiredFrame> acquire() {
 
   Slot& slot = g_slots[slotIndex];
 #ifdef WEBGPU_DAWN
-  // Make Dawn's context wait until the main thread's blit of this slot has retired on the GPU.
+  // Wait, on the CPU and with no EGL context held, until the main thread's blit of this slot has
+  // retired on the GPU. This must NOT be a server wait (eglWaitSync into Dawn's stream): that dams
+  // the worker's GL commands behind a fence that only signals after main-thread present activity,
+  // so the worker's next GL call blocks inside libmali while holding Dawn's EGL-context mutex, and
+  // any game-thread Dawn call (vertex-cache upload, texture creation) then closes a deadlock cycle
+  // against it — the gdb-verified Mali-G31 hang. eglClientWaitSyncKHR needs no current context, so
+  // the worker parks holding nothing Dawn can contend on. In steady state the fence retired a
+  // frame ago and this returns immediately; on timeout we render anyway (one torn frame, loudly).
   if (slot.revSync != nullptr) {
-    dawn::native::opengl::PortmasterServerWaitEGLSync(device_handle(), slot.revSync);
+    const int32_t waited = g_gl.ClientWaitSyncKHR(g_display, slot.revSync, 0, RevSyncWaitTimeoutNs);
+    if (waited != EGL_CONDITION_SATISFIED_KHR) {
+      Log.warn("[sdl2shim-efb] slot {} reverse-fence wait returned 0x{:x}; rendering into it anyway",
+               slotIndex, waited);
+    }
     destroy_sync(slot.revSync);
   }
 #endif
