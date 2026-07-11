@@ -232,9 +232,12 @@ bool begin_frame() noexcept {
     if (window::is_paused()) {
       return false;
     }
-    if (!g_surface) {
+    // The SDL2-shim EFB present path never configures a wgpu::Surface (g_surface stays null); the
+    // shared EFB textures are the render target instead. Treat EFB-active as ready, otherwise
+    // begin_frame spins forever recreating render targets waiting for a surface that never appears.
+    if (!g_surface && !webgpu::sdl2shim_present::active()) {
       webgpu::refresh_surface(true);
-      if (!g_surface) {
+      if (!g_surface && !webgpu::sdl2shim_present::active()) {
         return false;
       }
     }
