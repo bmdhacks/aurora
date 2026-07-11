@@ -28,6 +28,7 @@ extern "C" void Android_UnlockActivityMutex(void);
 #endif
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <vector>
 
@@ -264,6 +265,22 @@ bool create_window(AuroraBackend backend) {
   // eglMakeCurrent fail with EGL_BAD_ACCESS — keep upstream's no-GL-flag behaviour there.
   const char* videoDriver = SDL_GetCurrentVideoDriver();
   const bool sdl2ShimDriver = videoDriver != nullptr && SDL_strcmp(videoDriver, "sdl2") == 0;
+
+  // The shim exists to lend Dawn the firmware's EGL/GLES display; no other backend can present
+  // through it. On a fresh config (backend "auto") the backend loop would otherwise attempt
+  // Vulkan first, and that attempt's window create/destroy cycle leaves the firmware SDL2/EGL
+  // stack unable to keep a context current for the later GLES attempt's EFB present init
+  // (fresh-install crash in the field). Refuse non-GLES backends before touching the display so
+  // the loop falls straight through to OpenGLES. BACKEND_NULL stays allowed: it is the loop's
+  // final fallback and must reach webgpu::initialize to produce the loud EFB-or-bust fatal.
+  if (sdl2ShimDriver && backend != BACKEND_OPENGLES && backend != BACKEND_NULL) {
+    constexpr std::array kBackendNames{"Auto",     "D3D11",  "D3D12",  "Metal", "Vulkan",
+                                       "OpenGL", "OpenGLES", "WebGPU", "Null"};
+    const auto idx = static_cast<size_t>(backend);
+    Log.info("Skipping backend {} on the sdl2 shim driver (GLES-only display path)",
+             idx < kBackendNames.size() ? kBackendNames[idx] : "?");
+    return false;
+  }
 
   SDL_WindowFlags flags = 0;
   // The borrowed-EGL path presents at the shim's own drawable size; high-DPI scaling here would desync

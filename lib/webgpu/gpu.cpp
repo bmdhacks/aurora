@@ -83,6 +83,7 @@ constexpr const char* SDL2_SHIM_GL_GET_PROC_PROP = "SDL.window.sdl2_backend.gl_g
 constexpr const char* SDL2_SHIM_WINDOW_PROP = "SDL.window.sdl2_backend.window";
 
 static SDL_GLContext g_sdl2ShimBootstrapContext = nullptr;
+static SDL_Window* g_sdl2ShimBootstrapWindow = nullptr;
 
 static bool is_sdl2shim_driver() {
   const char* driver = SDL_GetCurrentVideoDriver();
@@ -102,6 +103,13 @@ static bool ensure_sdl2shim_egl_properties(SDL_Window* window) {
     return true;
   }
 
+  // A failed backend attempt destroys its window (aurora.cpp backend loop); a context
+  // bootstrapped on that dead window must not be reused for the replacement window.
+  if (g_sdl2ShimBootstrapContext != nullptr && g_sdl2ShimBootstrapWindow != window) {
+    SDL_GL_DestroyContext(g_sdl2ShimBootstrapContext);
+    g_sdl2ShimBootstrapContext = nullptr;
+    g_sdl2ShimBootstrapWindow = nullptr;
+  }
   if (g_sdl2ShimBootstrapContext == nullptr) {
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
@@ -112,6 +120,7 @@ static bool ensure_sdl2shim_egl_properties(SDL_Window* window) {
       Log.error("SDL2-shim EGL bootstrap context creation failed: {}", SDL_GetError());
       return false;
     }
+    g_sdl2ShimBootstrapWindow = window;
     SDL_GL_SetSwapInterval(0);
   }
 
@@ -1244,6 +1253,16 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
   // driver this is the *only* present path — if it can't come up we fail loudly rather than fall
   // back to a swapchain present the worker thread can't scan out on Mali's display-thread-bound flip.
   if (wantEfbPresent) {
+    // sdl2shim_present::initialize captures whatever EGL context is current on this thread as
+    // the main-thread present context. Dawn's adapter/device bring-up makes its own contexts
+    // current in between and does not guarantee the bootstrap context is restored — on a fresh
+    // config the preceding failed-backend window cycle reliably left NO context current (field
+    // crash on fresh installs). Re-bind the bootstrap context deterministically instead of
+    // inheriting whatever survived Dawn init.
+    if (g_sdl2ShimBootstrapContext != nullptr &&
+        !SDL_GL_MakeCurrent(window::get_sdl_window(), g_sdl2ShimBootstrapContext)) {
+      Log.warn("SDL2-shim: failed to re-bind the bootstrap GL context before EFB present init: {}", SDL_GetError());
+    }
     SDL_PropertiesID props = SDL_GetWindowProperties(window::get_sdl_window());
     void* eglDisplay = SDL_GetPointerProperty(props, SDL2_SHIM_EGL_DISPLAY_PROP, nullptr);
     sdl2shim_present::initialize(
