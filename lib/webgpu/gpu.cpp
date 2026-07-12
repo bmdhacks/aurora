@@ -12,6 +12,8 @@
 #include <aurora/aurora.h>
 #include <aurora/gfx.h>
 #include <magic_enum.hpp>
+#include <SDL3/SDL_loadso.h>
+#include <SDL3/SDL_video.h>
 #include <webgpu/webgpu_cpp.h>
 
 #include "../gfx/common.hpp"
@@ -24,6 +26,7 @@
 #include "../dawn/BackendBinding.hpp"
 #include "../dawn/TracyPlatform.hpp"
 #include <dawn/native/DawnNative.h>
+#include <dawn/native/OpenGLBackend.h>
 #endif
 
 namespace aurora::gx {
@@ -65,6 +68,147 @@ bool g_bcTexturesSupported = false;
 bool g_astcTexturesSupported = false;
 bool g_textureComponentSwizzleSupported = false;
 static std::atomic_bool g_initialized = false;
+
+// --- SDL2-shim borrowed-EGL surface glue (Mali display bringup) ---
+// On Mali handhelds the firmware SDL2 (a kmsdrm/gbm build via libMali, wrapped by
+// our SDL3 "sdl2" shim video driver) owns the EGL display/surface/context. The shim
+// publishes them as SDL window properties; we hand Dawn's GLES adapter a getProc
+// loader bound to that borrowed EGL display via the public RequestAdapterOptionsGetGLProc
+// API.
+constexpr const char* SDL2_SHIM_EGL_DISPLAY_PROP = "SDL.window.sdl2_backend.egl_display";
+constexpr const char* SDL2_SHIM_EGL_SURFACE_PROP = "SDL.window.sdl2_backend.egl_surface";
+constexpr const char* SDL2_SHIM_GL_GET_PROC_PROP = "SDL.window.sdl2_backend.gl_get_proc";
+constexpr const char* SDL2_SHIM_WINDOW_PROP = "SDL.window.sdl2_backend.window";
+
+static SDL_GLContext g_sdl2ShimBootstrapContext = nullptr;
+static SDL_Window* g_sdl2ShimBootstrapWindow = nullptr;
+
+static bool is_sdl2shim_driver() {
+  const char* driver = SDL_GetCurrentVideoDriver();
+  return driver != nullptr && SDL_strcmp(driver, "sdl2") == 0;
+}
+
+static bool ensure_sdl2shim_egl_properties(SDL_Window* window) {
+  if (window == nullptr || !is_sdl2shim_driver()) {
+    return false;
+  }
+
+  SDL_PropertiesID props = SDL_GetWindowProperties(window);
+  void* eglDisplay = SDL_GetPointerProperty(props, SDL2_SHIM_EGL_DISPLAY_PROP, nullptr);
+  void* eglSurface = SDL_GetPointerProperty(props, SDL2_SHIM_EGL_SURFACE_PROP, nullptr);
+  void* glGetProc = SDL_GetPointerProperty(props, SDL2_SHIM_GL_GET_PROC_PROP, nullptr);
+  if (eglDisplay != nullptr && eglSurface != nullptr && glGetProc != nullptr) {
+    return true;
+  }
+
+  // A failed backend attempt destroys its window (aurora.cpp backend loop); a context
+  // bootstrapped on that dead window must not be reused for the replacement window.
+  if (g_sdl2ShimBootstrapContext != nullptr && g_sdl2ShimBootstrapWindow != window) {
+    SDL_GL_DestroyContext(g_sdl2ShimBootstrapContext);
+    g_sdl2ShimBootstrapContext = nullptr;
+    g_sdl2ShimBootstrapWindow = nullptr;
+  }
+  if (g_sdl2ShimBootstrapContext == nullptr) {
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
+    SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
+    g_sdl2ShimBootstrapContext = SDL_GL_CreateContext(window);
+    if (g_sdl2ShimBootstrapContext == nullptr) {
+      Log.error("SDL2-shim EGL bootstrap context creation failed: {}", SDL_GetError());
+      return false;
+    }
+    g_sdl2ShimBootstrapWindow = window;
+    SDL_GL_SetSwapInterval(0);
+  }
+
+  props = SDL_GetWindowProperties(window);
+  eglDisplay = SDL_GetPointerProperty(props, SDL2_SHIM_EGL_DISPLAY_PROP, nullptr);
+  eglSurface = SDL_GetPointerProperty(props, SDL2_SHIM_EGL_SURFACE_PROP, nullptr);
+  glGetProc = SDL_GetPointerProperty(props, SDL2_SHIM_GL_GET_PROC_PROP, nullptr);
+  void* sdl2Window = SDL_GetPointerProperty(props, SDL2_SHIM_WINDOW_PROP, nullptr);
+  Log.info("SDL2-shim EGL properties: display={} surface={} getProc={} window={}", eglDisplay, eglSurface, glGetProc,
+           sdl2Window);
+  return eglDisplay != nullptr && eglSurface != nullptr && glGetProc != nullptr;
+}
+
+#ifdef WEBGPU_DAWN
+static SDL_SharedObject* g_sdl2shimEglLibrary = nullptr;
+static SDL_SharedObject* g_sdl2shimGlesLibrary = nullptr;
+using Sdl2ShimEglGetProcAddressFn = SDL_FunctionPointer (*)(const char*);
+static Sdl2ShimEglGetProcAddressFn g_sdl2shimEglGetProcAddress = nullptr;
+
+static dawn::native::opengl::EGLFunctionPointerType sdl2shim_egl_get_proc(const char* name) {
+  if (name == nullptr) {
+    return nullptr;
+  }
+
+  if (g_sdl2shimEglLibrary == nullptr) {
+    for (const char* libraryName : {"libEGL.so.1", "libEGL.so"}) {
+      g_sdl2shimEglLibrary = SDL_LoadObject(libraryName);
+      if (g_sdl2shimEglLibrary != nullptr) {
+        Log.info("SDL2-shim EGL proc loader opened {}", libraryName);
+        g_sdl2shimEglGetProcAddress = reinterpret_cast<Sdl2ShimEglGetProcAddressFn>(
+            SDL_LoadFunction(g_sdl2shimEglLibrary, "eglGetProcAddress"));
+        break;
+      }
+    }
+  }
+
+  if (g_sdl2shimEglLibrary != nullptr) {
+    if (SDL_FunctionPointer function = SDL_LoadFunction(g_sdl2shimEglLibrary, name)) {
+      return reinterpret_cast<dawn::native::opengl::EGLFunctionPointerType>(function);
+    }
+    if (g_sdl2shimEglGetProcAddress != nullptr) {
+      if (SDL_FunctionPointer function = g_sdl2shimEglGetProcAddress(name)) {
+        return reinterpret_cast<dawn::native::opengl::EGLFunctionPointerType>(function);
+      }
+    }
+  }
+
+  if (g_sdl2shimGlesLibrary == nullptr) {
+    for (const char* libraryName : {"libGLESv2.so.2", "libGLESv2.so"}) {
+      g_sdl2shimGlesLibrary = SDL_LoadObject(libraryName);
+      if (g_sdl2shimGlesLibrary != nullptr) {
+        Log.info("SDL2-shim GLES proc loader opened {}", libraryName);
+        break;
+      }
+    }
+  }
+
+  if (g_sdl2shimGlesLibrary != nullptr) {
+    if (SDL_FunctionPointer function = SDL_LoadFunction(g_sdl2shimGlesLibrary, name)) {
+      return reinterpret_cast<dawn::native::opengl::EGLFunctionPointerType>(function);
+    }
+  }
+
+  return reinterpret_cast<dawn::native::opengl::EGLFunctionPointerType>(SDL_GL_GetProcAddress(name));
+}
+
+static bool configure_sdl2shim_gl_proc(dawn::native::opengl::RequestAdapterOptionsGetGLProc& glProcOptions) {
+  SDL_Window* window = window::get_sdl_window();
+  if (!ensure_sdl2shim_egl_properties(window)) {
+    return false;
+  }
+
+  SDL_PropertiesID props = SDL_GetWindowProperties(window);
+  void* eglDisplay = SDL_GetPointerProperty(props, SDL2_SHIM_EGL_DISPLAY_PROP, nullptr);
+  void* glGetProc = SDL_GetPointerProperty(props, SDL2_SHIM_GL_GET_PROC_PROP, nullptr);
+  if (eglDisplay == nullptr || glGetProc == nullptr) {
+    return false;
+  }
+
+  auto sdlGetProc = reinterpret_cast<dawn::native::opengl::EGLGetProcProc>(glGetProc);
+  // If the shim's own getProc can't resolve core EGL, fall back to a direct libEGL loader.
+  const bool useSystemEglProc = sdlGetProc("eglChooseConfig") == nullptr;
+  glProcOptions.getProc = useSystemEglProc ? sdl2shim_egl_get_proc : sdlGetProc;
+  glProcOptions.display = eglDisplay;
+  Log.info("Requesting Dawn OpenGL adapter through SDL2-shim EGL display={} getProc={} loader={}", eglDisplay,
+           glGetProc, useSystemEglProc ? "libEGL" : "SDL_GL_GetProcAddress");
+  return true;
+}
+
+#endif
 
 namespace {
 
@@ -786,7 +930,19 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
     return false;
   }
   {
+    const wgpu::ChainedStruct* adapterNextInChain = nullptr;
+#ifdef WEBGPU_DAWN
+    // On the Mali SDL2-shim path, bind Dawn's GLES adapter to the shim's borrowed
+    // EGL display + proc loader so it renders into the firmware-owned surface.
+    // (Mali display bringup; no-op on desktop where the driver isn't the sdl2 shim.)
+    dawn::native::opengl::RequestAdapterOptionsGetGLProc glProcOptions;
+    if ((backend == wgpu::BackendType::OpenGLES || backend == wgpu::BackendType::OpenGL) &&
+        configure_sdl2shim_gl_proc(glProcOptions)) {
+      adapterNextInChain = &glProcOptions;
+    }
+#endif
     const wgpu::RequestAdapterOptions options{
+        .nextInChain = adapterNextInChain,
         .featureLevel = wgpu::FeatureLevel::Compatibility,
         .powerPreference = wgpu::PowerPreference::HighPerformance,
         .backendType = backend,
