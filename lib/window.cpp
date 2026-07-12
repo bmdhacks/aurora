@@ -257,13 +257,31 @@ const AuroraEvent* poll_events() {
 }
 
 bool create_window(AuroraBackend backend) {
-  SDL_WindowFlags flags = SDL_WINDOW_HIGH_PIXEL_DENSITY;
+  // The SDL2 shim is our custom SDL3 video driver wrapping the device's firmware SDL2 (kmsdrm/gbm via
+  // libMali). On that driver we let SDL create/own the GL context so it exposes the firmware's borrowed
+  // EGL display/surface/context, which Dawn then binds to via the adapter proc loader. On desktop
+  // (wayland/x11) Dawn owns EGL itself, so an SDL-owned context would make Dawn's worker-thread
+  // eglMakeCurrent fail with EGL_BAD_ACCESS — keep upstream's no-GL-flag behaviour there.
+  const char* videoDriver = SDL_GetCurrentVideoDriver();
+  const bool sdl2ShimDriver = videoDriver != nullptr && SDL_strcmp(videoDriver, "sdl2") == 0;
+
+  SDL_WindowFlags flags = 0;
+  // The borrowed-EGL path presents at the shim's own drawable size; high-DPI scaling here would desync
+  // the WebGPU swapchain extent from the borrowed surface. Skip it on the shim driver only.
+  if (!sdl2ShimDriver) {
+    flags |= SDL_WINDOW_HIGH_PIXEL_DENSITY;
+  }
 #if TARGET_OS_IOS || TARGET_OS_TV
   flags |= SDL_WINDOW_FULLSCREEN;
 #else
   flags |= SDL_WINDOW_HIDDEN | SDL_WINDOW_RESIZABLE;
   if (g_config.startFullscreen) {
     flags |= SDL_WINDOW_FULLSCREEN;
+  }
+#endif
+#if defined(AURORA_ENABLE_GX) && defined(DAWN_ENABLE_BACKEND_OPENGL)
+  if (sdl2ShimDriver && (backend == BACKEND_OPENGL || backend == BACKEND_OPENGLES)) {
+    flags |= SDL_WINDOW_OPENGL;
   }
 #endif
   auto width = static_cast<Sint32>(g_config.windowWidth);
