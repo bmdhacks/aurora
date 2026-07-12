@@ -1105,10 +1105,24 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
     }
     Log.info("Enabling features: {}", featureList);
 #ifdef WEBGPU_DAWN
+    // On a GL backend Dawn's blob cache round-trips program binaries through
+    // glGetProgramBinary/glProgramBinary. Mesa's program-binary deserializer segfaults
+    // rebuilding the program resource hash for our shaders (_mesa_program_get_resource_name;
+    // same defect class MESA_SHADER_CACHE_DISABLE=1 works around in Mesa's own disk cache,
+    // but that env var cannot gate explicit glProgramBinary calls) — a warm dawn_cache.db
+    // reliably crashed the next desktop boot inside create_copy_pipeline. Starve the cache
+    // on Mesa GL; every other driver keeps it (libmali warm boots are its whole point).
+    const std::string_view driverDesc{g_adapterInfo.description};
+    const bool backendIsGL =
+        g_backendType == wgpu::BackendType::OpenGL || g_backendType == wgpu::BackendType::OpenGLES;
+    const bool blobCacheSafe = !(backendIsGL && driverDesc.find("Mesa") != std::string_view::npos);
+    if (!blobCacheSafe) {
+      Log.info("Disabling Dawn blob cache: Mesa GL program-binary reload is unsafe");
+    }
     wgpu::DawnCacheDeviceDescriptor cacheDescriptor({
         .isolationKey = nullptr,
-        .loadDataFunction = load_from_cache,
-        .storeDataFunction = store_to_cache,
+        .loadDataFunction = blobCacheSafe ? load_from_cache : nullptr,
+        .storeDataFunction = blobCacheSafe ? store_to_cache : nullptr,
         .functionUserdata = nullptr,
     });
 
