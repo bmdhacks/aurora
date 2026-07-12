@@ -76,7 +76,9 @@ TextureHandle new_static_texture_2d(uint32_t width, uint32_t height, uint32_t mi
   }
 
   uint32_t offset = 0;
-  for (uint32_t mip = 0; mip < mips; ++mip) {
+  // Use ref.mipCount (already clamped in new_dynamic_texture_2d), not the raw mips
+  // argument — otherwise we'd write past the texture's actual mip levels.
+  for (uint32_t mip = 0; mip < ref.mipCount; ++mip) {
     const wgpu::Extent3D mipSize{
         .width = std::max(ref.size.width >> mip, 1u),
         .height = std::max(ref.size.height >> mip, 1u),
@@ -120,6 +122,23 @@ TextureHandle new_dynamic_texture_2d(uint32_t width, uint32_t height, uint32_t m
   // clamp to at least 1x1 — the texture is valid and the draw becomes an effective no-op.
   width = width < 1u ? 1u : width;
   height = height < 1u ? 1u : height;
+  // Mali's GLES rejects glTexStorage2D with GL_INVALID_VALUE when the requested mip
+  // count exceeds floor(log2(max(w,h)))+1. Some GX textures over-specify their mip
+  // chain (harmless on desktop Mesa, fatal on Mali), so clamp to the legal maximum.
+  {
+    uint32_t maxMips = 1;
+    for (uint32_t d = (width > height ? width : height); d > 1u; d >>= 1) {
+      ++maxMips;
+    }
+    if (mips > maxMips) {
+      Log.warn("Clamping texture '{}' mip levels {} -> {} for {}x{} (Mali glTexStorage2D limit)", label, mips, maxMips,
+               width, height);
+      mips = maxMips;
+    }
+    if (mips == 0) {
+      mips = 1;
+    }
+  }
   const auto wgpuFormat = to_wgpu(gxFormat);
   const wgpu::Extent3D size{
       .width = width,
