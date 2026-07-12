@@ -97,6 +97,35 @@ static u16 prepare_idx_buffer(ByteBuffer& buf, GXPrimitive prim, u16 vtxStart, u
   return numIndices;
 }
 
+// Emit index data that keeps a triangle strip AS a strip on the GPU (TriangleStrip
+// topology), rather than unrolling it into an independent triangle list. `restart`
+// prepends a 0xffff primitive-restart index so an earlier strip in the same index
+// buffer ends before this one begins. Returns the index count written (incl. restart).
+static u16 build_triangle_strip_topology_indices(ByteBuffer& buf, u16 vtxStart, u16 vtxCount, bool restart) {
+  const u16 numIndices = static_cast<u16>(vtxCount + (restart ? 1 : 0));
+  buf.reserve_extra(static_cast<size_t>(numIndices) * sizeof(u16));
+  if (restart) {
+    buf.append<u16>(0xffff);
+  }
+  for (u16 v = 0; v < vtxCount; ++v) {
+    buf.append(static_cast<u16>(vtxStart + v));
+  }
+  return numIndices;
+}
+
+// Concatenate several strips into one index buffer with 0xffff restart markers between
+// them, so a whole run of adjacent strip draws collapses into a single DrawIndexed.
+static u32 build_triangle_strip_batch_topology_indices(ByteBuffer& buf, const std::vector<u16>& stripCounts) {
+  u32 indexCount = 0;
+  u16 vtxStart = 0;
+  for (size_t i = 0; i < stripCounts.size(); ++i) {
+    const bool restart = i != 0;
+    indexCount += build_triangle_strip_topology_indices(buf, vtxStart, stripCounts[i], restart);
+    vtxStart = static_cast<u16>(vtxStart + stripCounts[i]);
+  }
+  return indexCount;
+}
+
 // GX FIFO opcodes - use CP_ prefix to avoid clashing with GXCommandList.h macros
 static constexpr u8 CP_CMD_NOP = GX_NOP;
 static constexpr u8 CP_CMD_LOAD_CP_REG = GX_LOAD_CP_REG;
@@ -1573,6 +1602,8 @@ static void push_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Rang
 static constexpr bool kSkipStorageVertexFetch = true;
 
 static bool try_native_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, const u8* data, u32& pos, u32 vtxSize);
+static bool try_native_draw_run(u8 cmd, GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, u32 vtxSize, const u8* data,
+                                u32& pos, u32 size, bool bigEndian);
 static bool try_native_draw_indexed(GXVtxFmt fmt, u16 vtxCount, const u8* vtxData, u32 vtxSize, const u8* idxData,
                                     u32 idxBytes, u32 indexCount);
 
@@ -1651,6 +1682,19 @@ static void handle_draw(u8 cmd, const u8* data, u32& pos, u32 size, bool bigEndi
   CHECK(pos + 2 <= size, "draw vtxCount read overrun");
   u16 vtxCount = read_u16(data + pos, bigEndian);
   pos += 2;
+
+  u32 vtxSize;
+  if (g_gxState.lastVtxFmt == fmt)
+    LIKELY { vtxSize = g_gxState.lastVtxSize; }
+  else
+    UNLIKELY { vtxSize = calculate_last_vtx_size(fmt); }
+
+  // Fold this draw plus any immediately-following identical draw commands into one native
+  // hardware draw (strip topology + primitive restart). Unsupported primitives/layouts fall
+  // through to draw_prim (single native, else the storage/software path).
+  if (try_native_draw_run(cmd, prim, fmt, vtxCount, vtxSize, data, pos, size, bigEndian)) {
+    return;
+  }
 
   draw_prim(prim, fmt, vtxCount, data, pos, size);
 }
@@ -2014,6 +2058,12 @@ static constexpr bool kNativeGeomCacheEnabled = true;
 // is the device CPU bottleneck.
 static constexpr size_t kNativeGeomCacheMinBytes = 64;
 
+// Keep triangle strips as strips on the GPU (TriangleStrip topology + primitive restart)
+// so a run of adjacent strip draws collapses to one DrawIndexed, instead of unrolling
+// each into an independent triangle list. This is the top CPU-side draw-submission lever:
+// far fewer draw commands and index bytes in strip-heavy world scenes.
+static constexpr bool kStripTopology = true;
+
 // Emit a periodic one-line cache/batching summary to confirm the geometry cache is
 // actually hitting on-device (and how effective run-batching is). Perf-tuning scaffolding;
 // off by default in shipped builds.
@@ -2208,13 +2258,14 @@ static void native_geom_resolve_ranges(const NativeGeomKey& key, const ByteBuffe
 
 static void push_native_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount,
                                 const std::array<AttrConfig, MaxVtxAttr>& nativeAttrs, u8 nativeStride,
-                                gfx::Range vertRange, gfx::Range idxRange, u32 numIndices,
-                                bool cachedGeometry = false) {
+                                gfx::Range vertRange, gfx::Range idxRange, u32 numIndices, bool cachedGeometry = false,
+                                bool stripTopology = false) {
   PipelineConfig config{};
   populate_pipeline_config(config, prim, fmt); // TEV/color/blend/etc; also fills storage attrs (overwritten below)
   config.shaderConfig.attrs = nativeAttrs;
   config.shaderConfig.vtxStride = nativeStride;
   config.shaderConfig.nativeVertexFetch = 1;
+  config.triangleStripTopology = stripTopology ? 1u : 0u;
 
   const auto info = build_shader_info(config.shaderConfig);
   resolve_sampled_textures(info);
@@ -2299,6 +2350,129 @@ static bool try_native_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, const 
   s_nativeIdxBuf.clear();
 
   push_native_gx_draw(prim, fmt, vtxCount, nativeAttrs, nativeStride, vertRange, idxRange, numIndices, cached);
+  return true;
+}
+
+// Batched native path for raw-FIFO draw commands. Display lists emit runs of back-to-back
+// identical draw commands (same VAT byte ⇒ same primitive + layout; no state change can
+// sit between adjacent draws), so this collapses a whole run into ONE hardware draw — the
+// biggest CPU-side win, since per-draw pipeline/bind-group/uniform submission dominates
+// strip-heavy scenes. Triangle strips keep strip topology with 0xffff primitive-restart
+// separators rather than being unrolled to a triangle list. `pos` enters at the first
+// draw's vertex data (cmd + vtxCount already consumed) and is advanced past the whole
+// consumed run on success. Serves steady-state geometry from the persistent content-hash
+// cache (no re-expand, no re-upload).
+static bool try_native_draw_run(u8 cmd, GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, u32 vtxSize, const u8* data,
+                                u32& pos, u32 size, bool bigEndian) {
+  if (prim != GX_TRIANGLES && prim != GX_TRIANGLESTRIP && prim != GX_TRIANGLEFAN && prim != GX_QUADS) {
+    return false;
+  }
+  if (vtxSize == 0 || vtxCount == 0) {
+    return false;
+  }
+  u8 nativeStride = 0;
+  std::array<AttrConfig, MaxVtxAttr> nativeAttrs{};
+  if (!build_native_layout(fmt, s_nativeDescs, nativeStride, nativeAttrs)) {
+    return false;
+  }
+
+  // Scan forward across back-to-back identical draw commands. FIFO layout per draw is
+  // [cmd][vtxCount:u16][vtxData]; require the same cmd byte and a whole vertex block.
+  static std::vector<u16> segCounts;
+  static std::vector<u32> segOffsets;
+  segCounts.clear();
+  segOffsets.clear();
+  segCounts.push_back(vtxCount);
+  segOffsets.push_back(pos);
+  u32 batchVtxCount = vtxCount;
+  u32 scan = pos + static_cast<u32>(vtxCount) * vtxSize;
+  const u16 minVtx = prim == GX_QUADS ? 4 : 3;
+  while (scan + 3 <= size && data[scan] == cmd) {
+    const u16 nextVtxCount = read_u16(data + scan + 1, bigEndian);
+    // Cap the batch below 0xffff verts so no index collides with the 0xffff restart marker.
+    if (nextVtxCount < minVtx || batchVtxCount + nextVtxCount >= 0xffffu) {
+      break;
+    }
+    const u32 nextVtxBytes = static_cast<u32>(nextVtxCount) * vtxSize;
+    if (scan + 3 + nextVtxBytes > size) {
+      break;
+    }
+    segCounts.push_back(nextVtxCount);
+    segOffsets.push_back(scan + 3);
+    batchVtxCount += nextVtxCount;
+    scan += 3 + nextVtxBytes;
+  }
+
+  ++s_geomRunsBatched;
+  s_geomSegmentsBatched += segCounts.size();
+  const bool stripTopology = prim == GX_TRIANGLESTRIP && kStripTopology;
+  const u32 srcBytes = batchVtxCount * vtxSize;
+
+  // Content-hash key: FIFO bytes of every segment + decode layout + the run's segment
+  // structure (+ indexed array contents). A hit replays cached GPU ranges with no CPU work.
+  NativeGeomKey key{};
+  if constexpr (kNativeGeomCacheEnabled) {
+    Hasher fifo;
+    for (size_t s = 0; s < segCounts.size(); ++s) {
+      fifo.update(data + segOffsets[s], static_cast<size_t>(segCounts[s]) * vtxSize);
+    }
+    Hasher meta;
+    meta.update(static_cast<u8>(prim));
+    meta.update(static_cast<u8>(fmt));
+    meta.update(vtxSize);
+    meta.update(batchVtxCount);
+    meta.update(segCounts.data(), segCounts.size() * sizeof(u16));
+    native_geom_hash_layout(meta, s_nativeDescs);
+    key = {fifo.digest(), meta.digest(), srcBytes};
+    native_geom_sync_generation();
+    if (const auto it = s_nativeGeomCache.find(key); it != s_nativeGeomCache.end()) {
+      ++s_geomCacheHits;
+      pos = scan;
+      push_native_gx_draw(prim, fmt, static_cast<u16>(batchVtxCount), nativeAttrs, nativeStride, it->second.vertRange,
+                          it->second.idxRange, it->second.indexCount, /*cachedGeometry=*/true, stripTopology);
+      return true;
+    }
+    ++s_geomCacheMisses;
+  }
+
+  // Miss — expand every segment into flat native attributes (contiguous in one buffer).
+  s_nativeVtxBuf.clear();
+  s_nativeVtxBuf.reserve_extra(batchVtxCount * nativeStride);
+  for (size_t s = 0; s < segCounts.size(); ++s) {
+    const u8* segData = data + segOffsets[s];
+    for (u16 v = 0; v < segCounts[s]; ++v) {
+      expand_native_vertex(s_nativeDescs, segData + static_cast<size_t>(v) * vtxSize, s_nativeVtxBuf);
+    }
+  }
+  pos = scan;
+
+  // Index topology for the run: strips stay strips (restart-separated); a plain triangle
+  // list draws non-indexed; fans/quads (and strips when strip topology is off) unroll to a
+  // per-segment triangle list.
+  s_nativeIdxBuf.clear();
+  u32 numIndices = 0;
+  bool indexed = true;
+  if (stripTopology) {
+    numIndices = build_triangle_strip_batch_topology_indices(s_nativeIdxBuf, segCounts);
+  } else if (prim == GX_TRIANGLES) {
+    indexed = false; // numIndices stays 0 -> non-indexed Draw(batchVtxCount)
+  } else {
+    u16 segStart = 0;
+    for (const u16 count : segCounts) {
+      numIndices += prepare_idx_buffer(s_nativeIdxBuf, prim, segStart, count);
+      segStart = static_cast<u16>(segStart + count);
+    }
+  }
+
+  gfx::Range vertRange{};
+  gfx::Range idxRange{};
+  bool cached = false;
+  native_geom_resolve_ranges(key, s_nativeVtxBuf, indexed ? s_nativeIdxBuf.data() : nullptr,
+                             indexed ? s_nativeIdxBuf.size() : 0, numIndices, vertRange, idxRange, cached);
+  s_nativeIdxBuf.clear();
+
+  push_native_gx_draw(prim, fmt, static_cast<u16>(batchVtxCount), nativeAttrs, nativeStride, vertRange, idxRange,
+                      numIndices, cached, stripTopology);
   return true;
 }
 

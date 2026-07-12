@@ -609,7 +609,7 @@ static inline wgpu::ColorWriteMask to_write_mask(bool colorUpdate, bool alphaUpd
   return writeMask;
 }
 
-static inline wgpu::PrimitiveState to_primitive_state(GXCullMode gx_cullMode) {
+static inline wgpu::PrimitiveState to_primitive_state(GXCullMode gx_cullMode, bool stripTopology) {
   auto cullMode = wgpu::CullMode::None;
   switch (gx_cullMode) {
     DEFAULT_FATAL("unsupported cull mode {}", underlying(gx_cullMode));
@@ -622,9 +622,11 @@ static inline wgpu::PrimitiveState to_primitive_state(GXCullMode gx_cullMode) {
   case GX_CULL_NONE:
     break;
   }
+  // TriangleStrip draws use implicit primitive restart: the max Uint16 index (0xffff)
+  // separates batched strips (WebGPU treats it as a restart when stripIndexFormat is set).
   return {
-      .topology = wgpu::PrimitiveTopology::TriangleList,
-      .stripIndexFormat = wgpu::IndexFormat::Undefined,
+      .topology = stripTopology ? wgpu::PrimitiveTopology::TriangleStrip : wgpu::PrimitiveTopology::TriangleList,
+      .stripIndexFormat = stripTopology ? wgpu::IndexFormat::Uint16 : wgpu::IndexFormat::Undefined,
       .frontFace = wgpu::FrontFace::CW,
       .cullMode = cullMode,
   };
@@ -669,7 +671,7 @@ wgpu::RenderPipeline build_pipeline(const PipelineConfig& config, ArrayRef<wgpu:
               .bufferCount = static_cast<uint32_t>(vtxBuffers.size()),
               .buffers = vtxBuffers.data(),
           },
-      .primitive = to_primitive_state(config.cullMode),
+      .primitive = to_primitive_state(config.cullMode, config.triangleStripTopology != 0),
       .depthStencil = &depthStencil,
       .multisample =
           wgpu::MultisampleState{

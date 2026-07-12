@@ -23,7 +23,7 @@ struct DrawData {
   bool cachedGeometry = false;
 };
 
-constexpr uint32_t GXPipelineConfigVersion = 14;
+constexpr uint32_t GXPipelineConfigVersion = 15;
 struct PipelineConfig {
   uint32_t version = GXPipelineConfigVersion;
   uint32_t msaaSamples = 1;
@@ -34,6 +34,10 @@ struct PipelineConfig {
   GXBlendFactor blendFacSrc, blendFacDst;
   GXLogicOp blendOp;
   uint32_t dstAlpha;
+  // Non-zero when this draw keeps GX triangle-strip topology on the GPU (TriangleStrip
+  // primitive + 0xffff primitive-restart separators) instead of being unrolled to a
+  // triangle list. Set by the native strip-batching path; drives to_primitive_state.
+  uint32_t triangleStripTopology;
   uint32_t polygonOffsetBits;
   uint32_t polygonOffsetScaleBits;
   uint32_t polygonOffsetClampBits;
