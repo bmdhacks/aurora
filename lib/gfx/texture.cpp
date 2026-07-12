@@ -114,6 +114,12 @@ TextureHandle new_static_texture_2d(uint32_t width, uint32_t height, uint32_t mi
 TextureHandle new_dynamic_texture_2d(uint32_t width, uint32_t height, uint32_t mips, u32 gxFormat,
                                      const char* label) noexcept {
   ZoneScopedS(3);
+  // A zero-sized texture makes Mali's glTexStorage2D fail with GL_INVALID_VALUE and lose
+  // the device (desktop Mesa tolerates it). GX can request 0-dim copies/targets when a
+  // subsystem is scaled to nothing (e.g. shadows under shadowResolutionMultiplier=0), so
+  // clamp to at least 1x1 — the texture is valid and the draw becomes an effective no-op.
+  width = width < 1u ? 1u : width;
+  height = height < 1u ? 1u : height;
   const auto wgpuFormat = to_wgpu(gxFormat);
   const wgpu::Extent3D size{
       .width = width,
@@ -149,6 +155,10 @@ TextureHandle new_dynamic_texture_2d(uint32_t width, uint32_t height, uint32_t m
 TextureHandle new_render_texture(uint32_t width, uint32_t height, u32 gxFormat, const char* label) noexcept {
   ZoneScoped;
 
+  // Clamp to at least 1x1 — a 0-sized target (e.g. a shadow EFB-resolve copy under
+  // shadowResolutionMultiplier=0) crashes Mali's glTexStorage2D with GL_INVALID_VALUE.
+  width = width < 1u ? 1u : width;
+  height = height < 1u ? 1u : height;
   const auto wgpuFormat = webgpu::g_graphicsConfig.surfaceConfiguration.format;
   const wgpu::Extent3D size{
       .width = width,
@@ -182,6 +192,9 @@ TextureHandle new_render_texture(uint32_t width, uint32_t height, u32 gxFormat, 
 TextureHandle new_conv_texture(uint32_t width, uint32_t height, u32 gxFormat, const char* label) noexcept {
   ZoneScoped;
 
+  // Clamp to at least 1x1 — a 0-sized copy-conv target crashes Mali's glTexStorage2D.
+  width = width < 1u ? 1u : width;
+  height = height < 1u ? 1u : height;
   const auto wgpuFormat = to_wgpu(gxFormat);
   const wgpu::Extent3D size{
       .width = width,

@@ -993,6 +993,12 @@ bool push_custom_draw(DrawTypeId type, const void* payload, size_t payloadSize) 
 }
 
 static OffscreenCacheEntry get_offscreen_textures(uint32_t width, uint32_t height) {
+  // A zero-sized offscreen (e.g. the shadow system under shadowResolutionMultiplier=0)
+  // makes glTexStorage2D fail with GL_INVALID_VALUE and lose the device on Mali. Clamp
+  // to at least 1x1: the render becomes an effective no-op (disabled shadow) but the
+  // texture is valid and the begin/end offscreen pass stays balanced.
+  width = width < 1u ? 1u : width;
+  height = height < 1u ? 1u : height;
   OffscreenCacheKey key{width, height};
   if (const auto it = g_offscreenCache.find(key); it != g_offscreenCache.end()) {
     return it->second;
