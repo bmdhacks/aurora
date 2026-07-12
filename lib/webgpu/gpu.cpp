@@ -853,10 +853,15 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
 
   {
     wgpu::Limits supportedLimits{};
+    wgpu::CompatibilityModeLimits supportedCompatibilityModeLimits{};
+    supportedLimits.nextInChain = &supportedCompatibilityModeLimits;
     g_adapter.GetLimits(&supportedLimits);
+    // Compatibility-mode GLES drivers report zero vertex-stage storage buffers (Mali: GL_MAX_VERTEX_
+    // SHADER_STORAGE_BLOCKS=0), so requiring a fixed count fails device creation outright. Require
+    // only what the adapter actually reports; the native vertex-fetch path needs none.
     wgpu::CompatibilityModeLimits compatibilityModeLimits{wgpu::CompatibilityModeLimits::Init{
-        .maxStorageBuffersInVertexStage = 2,
-        .maxStorageBuffersInFragmentStage = 2,
+        .maxStorageBuffersInVertexStage = supportedCompatibilityModeLimits.maxStorageBuffersInVertexStage,
+        .maxStorageBuffersInFragmentStage = supportedCompatibilityModeLimits.maxStorageBuffersInFragmentStage,
     }};
     const wgpu::Limits requiredLimits{
         .nextInChain = &compatibilityModeLimits,
@@ -869,7 +874,9 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
                                                                             : supportedLimits.maxTextureDimension3D,
         .maxTextureArrayLayers = supportedLimits.maxTextureArrayLayers == 0 ? WGPU_LIMIT_U32_UNDEFINED
                                                                             : supportedLimits.maxTextureArrayLayers,
-        .maxStorageBuffersPerShaderStage = 2,
+        .maxStorageBuffersPerShaderStage = supportedLimits.maxStorageBuffersPerShaderStage == 0
+                                               ? WGPU_LIMIT_U32_UNDEFINED
+                                               : supportedLimits.maxStorageBuffersPerShaderStage,
         .minUniformBufferOffsetAlignment =
             supportedLimits.minUniformBufferOffsetAlignment < 64 ? 64 : supportedLimits.minUniformBufferOffsetAlignment,
         .minStorageBufferOffsetAlignment =
@@ -882,11 +889,14 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
         "\n  maxTextureDimension3D: {}"
         "\n  maxTextureArrayLayers: {}"
         "\n  maxStorageBuffersPerShaderStage: {}"
+        "\n  maxStorageBuffersInVertexStage: {}"
+        "\n  maxStorageBuffersInFragmentStage: {}"
         "\n  minUniformBufferOffsetAlignment: {}"
         "\n  minStorageBufferOffsetAlignment: {}",
         requiredLimits.maxTextureDimension1D, requiredLimits.maxTextureDimension2D,
         requiredLimits.maxTextureDimension3D, requiredLimits.maxTextureArrayLayers,
-        requiredLimits.maxStorageBuffersPerShaderStage, requiredLimits.minUniformBufferOffsetAlignment,
+        requiredLimits.maxStorageBuffersPerShaderStage, compatibilityModeLimits.maxStorageBuffersInVertexStage,
+        compatibilityModeLimits.maxStorageBuffersInFragmentStage, requiredLimits.minUniformBufferOffsetAlignment,
         requiredLimits.minStorageBufferOffsetAlignment);
     std::vector<wgpu::FeatureName> requiredFeatures;
     g_hasCoreFeatures = false;
