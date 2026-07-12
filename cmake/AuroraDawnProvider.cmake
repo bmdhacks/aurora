@@ -104,6 +104,20 @@ if (_aurora_dawn_provider STREQUAL "auto")
   message(STATUS "aurora: Dawn auto-resolved provider: ${_aurora_dawn_provider}")
 endif ()
 
+# Dusklight (Mali port): our OpenGL-backend patches can only be applied to Dawn built from source.
+# A prebuilt ("package") or system Dawn is unpatched and will not render on Mali (no persistent-mapped
+# buffers, no GL state/FBO caches). Fail loudly rather than silently shipping the slow/broken path —
+# note that AURORA_DAWN_PROVIDER=auto resolves to "package" whenever a prebuilt is available.
+# Do NOT test DAWN_ENABLE_OPENGLES here: it only enters the cache later (from Dawn's own build or
+# _aurora_dawn_set_platform_backends), so in a fresh build dir it is unset when this guard runs and
+# auto→package sails through, failing much later on the patched-API compile. Infer the platform the
+# same way _aurora_dawn_set_platform_backends does: every non-Windows/non-Apple target builds GLES.
+if (NOT WIN32 AND NOT APPLE AND NOT _aurora_dawn_provider STREQUAL "vendor")
+  message(FATAL_ERROR
+    "aurora: the OpenGLES backend needs the Dawn GL patch stack (cmake/patches/dawn/), which can only "
+    "be applied to a from-source build. Set -DAURORA_DAWN_PROVIDER=vendor (got '${_aurora_dawn_provider}').")
+endif ()
+
 if (_aurora_dawn_provider STREQUAL "vendor")
   # ── Vendor: FetchContent build from source ──
   if (NOT TARGET webgpu_dawn)
@@ -133,9 +147,17 @@ if (_aurora_dawn_provider STREQUAL "vendor")
     endif ()
 
     include(FetchContent)
+    # Dusklight (Mali port): apply our OpenGL-backend patch stack (persistent-mapped buffers, GL
+    # draw-state + FBO caches, EGL-image interop fences) to the fetched Dawn source at configure time,
+    # mirroring how AuroraSDL3Provider patches SDL. The patches live in cmake/patches/dawn/ and target
+    # this exact AURORA_DAWN_REF; apply-dawn-patches.cmake is idempotent and guards against a stale
+    # source tree. Vendor (from-source) is the only provider that can be patched — see the guard below.
     FetchContent_Declare(dawn
       URL "https://github.com/encounter/dawn/archive/${AURORA_DAWN_REF}.tar.gz"
       DOWNLOAD_EXTRACT_TIMESTAMP FALSE
+      PATCH_COMMAND ${CMAKE_COMMAND}
+        -DDAWN_SOURCE_DIR=<SOURCE_DIR>
+        -P "${CMAKE_CURRENT_LIST_DIR}/patches/apply-dawn-patches.cmake"
       EXCLUDE_FROM_ALL
     )
     FetchContent_MakeAvailable(dawn)

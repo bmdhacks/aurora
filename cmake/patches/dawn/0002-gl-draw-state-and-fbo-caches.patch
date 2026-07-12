@@ -1,0 +1,910 @@
+diff --git a/src/dawn/native/opengl/CommandBufferGL.cpp b/src/dawn/native/opengl/CommandBufferGL.cpp
+index 65f1af1ea..53d8909c9 100644
+--- a/src/dawn/native/opengl/CommandBufferGL.cpp
++++ b/src/dawn/native/opengl/CommandBufferGL.cpp
+@@ -1319,10 +1319,39 @@ MaybeError CommandBuffer::ExecuteRenderPass(BeginRenderPassCmd* renderPass,
+                                             const OpenGLFunctions& gl,
+                                             PassIndex renderPassIndex) {
+     GLuint fbo = 0;
++    Device* device = ToBackend(GetDevice());
+ 
+     const IndirectDrawMetadata& metadata = GetIndirectDrawMetadata()[renderPassIndex];
+     IndirectDrawIndex indirectDrawIndex{0u};
+ 
++    // Dusklight (P1d): identify this pass's attachment set so the FBO can be pulled from the
++    // device-side cache instead of gen/attach/deleting one every pass (~21 passes/frame on Mali,
++    // each a full FBO rebuild in the driver). The attachment set is stable across frames, so this
++    // hits ~every pass after warmup. The resolved identity here must match what BindToFramebuffer
++    // attaches on a miss below — both go through TextureView::GetFramebufferAttachment.
++    FramebufferCacheKey fbKey;
++    for (auto i : renderPass->attachmentState->GetColorAttachmentsMask()) {
++        TextureView* textureView = ToBackend(renderPass->colorAttachments[i].view.Get());
++        GLFramebufferAttachment fa =
++            textureView->GetFramebufferAttachment(renderPass->colorAttachments[i].depthSlice);
++        auto& slot = fbKey.slots[static_cast<uint8_t>(i)];
++        slot.handle = fa.handle;
++        slot.target = fa.textarget;
++        slot.level = fa.mipLevel;
++        slot.layer = fa.arrayLayer;
++        fbKey.colorMask |= (1u << static_cast<uint8_t>(i));
++    }
++    if (renderPass->attachmentState->HasDepthStencilAttachment()) {
++        TextureView* textureView = ToBackend(renderPass->depthStencilAttachment.view.Get());
++        GLFramebufferAttachment fa = textureView->GetFramebufferAttachment(0);
++        auto& slot = fbKey.slots[kMaxColorAttachments];
++        slot.handle = fa.handle;
++        slot.target = fa.textarget;
++        slot.level = fa.mipLevel;
++        slot.layer = fa.arrayLayer;
++        fbKey.hasDepth = true;
++    }
++
+     // Create the framebuffer used for this render pass and calls the correct glDrawBuffers
+     {
+         // TODO(kainino@chromium.org): This is added to possibly work around an issue seen on
+@@ -1330,48 +1359,57 @@ MaybeError CommandBuffer::ExecuteRenderPass(BeginRenderPassCmd* renderPass,
+         // shouldn't be any negative effects from this. Investigate whether it's actually
+         // needed.
+         DAWN_GL_TRY(gl, BindFramebuffer(GL_READ_FRAMEBUFFER, 0));
+-        // TODO(kainino@chromium.org): possible future optimization: create these framebuffers
+-        // at Framebuffer build time (or maybe CommandBuffer build time) so they don't have to
+-        // be created and destroyed at draw time.
+-        DAWN_GL_TRY(gl, GenFramebuffers(1, &fbo));
+-        DAWN_GL_TRY(gl, BindFramebuffer(GL_DRAW_FRAMEBUFFER, fbo));
+-
+-        // Mapping from attachmentSlot to GL framebuffer attachment points. Defaults to zero
+-        // (GL_NONE).
+-        PerColorAttachment<GLenum> drawBuffers = {};
+-
+-        // Construct GL framebuffer
+-
+-        ColorAttachmentIndex attachmentCount{};
+-        for (auto i : renderPass->attachmentState->GetColorAttachmentsMask()) {
+-            TextureView* textureView = ToBackend(renderPass->colorAttachments[i].view.Get());
+-            GLenum glAttachment = GL_COLOR_ATTACHMENT0 + static_cast<uint8_t>(i);
+-
+-            // Attach color buffers.
+-            DAWN_TRY(textureView->BindToFramebuffer(gl, GL_DRAW_FRAMEBUFFER, glAttachment,
+-                                                    renderPass->colorAttachments[i].depthSlice));
+-            drawBuffers[i] = glAttachment;
+-            attachmentCount = i + ColorAttachmentIndex{uint8_t{1}};
+-        }
+-        DAWN_GL_TRY(gl, DrawBuffers(static_cast<uint8_t>(attachmentCount), drawBuffers.data()));
+ 
+-        if (renderPass->attachmentState->HasDepthStencilAttachment()) {
+-            TextureView* textureView = ToBackend(renderPass->depthStencilAttachment.view.Get());
+-            const Format& format = textureView->GetTexture()->GetFormat();
+-
+-            // Attach depth/stencil buffer.
+-            GLenum glAttachment = 0;
+-            if (format.aspects == (Aspect::Depth | Aspect::Stencil)) {
+-                glAttachment = GL_DEPTH_STENCIL_ATTACHMENT;
+-            } else if (format.aspects == Aspect::Depth) {
+-                glAttachment = GL_DEPTH_ATTACHMENT;
+-            } else if (format.aspects == Aspect::Stencil) {
+-                glAttachment = GL_STENCIL_ATTACHMENT;
+-            } else {
+-                DAWN_UNREACHABLE();
++        fbo = device->LookupFramebuffer(fbKey);
++        if (fbo != 0) {
++            // Cache hit: the FBO already carries these attachments and its glDrawBuffers config, so
++            // just bind it — no gen, no per-attachment glFramebufferTexture, no glDrawBuffers.
++            DAWN_GL_TRY(gl, BindFramebuffer(GL_DRAW_FRAMEBUFFER, fbo));
++        } else {
++            DAWN_GL_TRY(gl, GenFramebuffers(1, &fbo));
++            DAWN_GL_TRY(gl, BindFramebuffer(GL_DRAW_FRAMEBUFFER, fbo));
++
++            // Mapping from attachmentSlot to GL framebuffer attachment points. Defaults to zero
++            // (GL_NONE).
++            PerColorAttachment<GLenum> drawBuffers = {};
++
++            // Construct GL framebuffer
++
++            ColorAttachmentIndex attachmentCount{};
++            for (auto i : renderPass->attachmentState->GetColorAttachmentsMask()) {
++                TextureView* textureView = ToBackend(renderPass->colorAttachments[i].view.Get());
++                GLenum glAttachment = GL_COLOR_ATTACHMENT0 + static_cast<uint8_t>(i);
++
++                // Attach color buffers.
++                DAWN_TRY(textureView->BindToFramebuffer(
++                    gl, GL_DRAW_FRAMEBUFFER, glAttachment,
++                    renderPass->colorAttachments[i].depthSlice));
++                drawBuffers[i] = glAttachment;
++                attachmentCount = i + ColorAttachmentIndex{uint8_t{1}};
++            }
++            DAWN_GL_TRY(gl, DrawBuffers(static_cast<uint8_t>(attachmentCount), drawBuffers.data()));
++
++            if (renderPass->attachmentState->HasDepthStencilAttachment()) {
++                TextureView* textureView =
++                    ToBackend(renderPass->depthStencilAttachment.view.Get());
++                const Format& format = textureView->GetTexture()->GetFormat();
++
++                // Attach depth/stencil buffer.
++                GLenum glAttachment = 0;
++                if (format.aspects == (Aspect::Depth | Aspect::Stencil)) {
++                    glAttachment = GL_DEPTH_STENCIL_ATTACHMENT;
++                } else if (format.aspects == Aspect::Depth) {
++                    glAttachment = GL_DEPTH_ATTACHMENT;
++                } else if (format.aspects == Aspect::Stencil) {
++                    glAttachment = GL_STENCIL_ATTACHMENT;
++                } else {
++                    DAWN_UNREACHABLE();
++                }
++
++                DAWN_TRY(textureView->BindToFramebuffer(gl, GL_DRAW_FRAMEBUFFER, glAttachment));
+             }
+ 
+-            DAWN_TRY(textureView->BindToFramebuffer(gl, GL_DRAW_FRAMEBUFFER, glAttachment));
++            device->StoreFramebuffer(fbKey, fbo);
+         }
+     }
+ 
+@@ -1476,9 +1514,16 @@ MaybeError CommandBuffer::ExecuteRenderPass(BeginRenderPassCmd* renderPass,
+                 immediates.SetFirstVertex(0);
+                 immediates.SetFirstInstance(draw->firstInstance);
+                 DAWN_TRY(immediates.Apply(gl));
+-                DAWN_GL_TRY(gl, DrawArraysInstanced(lastPipeline->GetGLPrimitiveTopology(),
+-                                                    draw->firstVertex, draw->vertexCount,
+-                                                    draw->instanceCount));
++                // Dusklight: the single-instance, zero-base case is the overwhelming majority of
++                // GX draws. Plain glDrawArrays avoids the instanced job-setup path in the driver.
++                if (draw->instanceCount == 1 && draw->firstInstance == 0) {
++                    DAWN_GL_TRY(gl, DrawArrays(lastPipeline->GetGLPrimitiveTopology(),
++                                               draw->firstVertex, draw->vertexCount));
++                } else {
++                    DAWN_GL_TRY(gl, DrawArraysInstanced(lastPipeline->GetGLPrimitiveTopology(),
++                                                        draw->firstVertex, draw->vertexCount,
++                                                        draw->instanceCount));
++                }
+                 break;
+             }
+ 
+@@ -1498,11 +1543,19 @@ MaybeError CommandBuffer::ExecuteRenderPass(BeginRenderPassCmd* renderPass,
+                 immediates.SetFirstVertex(draw->baseVertex);
+                 immediates.SetFirstInstance(draw->firstInstance);
+                 DAWN_TRY(immediates.Apply(gl));
+-                DAWN_GL_TRY(gl, DrawElementsInstanced(
+-                                    topology, draw->indexCount, indexBufferFormat,
+-                                    reinterpret_cast<void*>(draw->firstIndex * indexFormatSize +
+-                                                            indexBufferBaseOffset),
+-                                    draw->instanceCount));
++                // Dusklight: baseVertex is already folded into the bound attrib-pointer offsets by
++                // vertexStateBufferBindingTracker.Apply() above, so plain glDrawElements is exact
++                // for the single-instance, zero-base-instance case (the common GX draw).
++                void* indexOffset = reinterpret_cast<void*>(draw->firstIndex * indexFormatSize +
++                                                            indexBufferBaseOffset);
++                if (draw->instanceCount == 1 && draw->firstInstance == 0) {
++                    DAWN_GL_TRY(gl, DrawElements(topology, draw->indexCount, indexBufferFormat,
++                                                 indexOffset));
++                } else {
++                    DAWN_GL_TRY(gl, DrawElementsInstanced(topology, draw->indexCount,
++                                                          indexBufferFormat, indexOffset,
++                                                          draw->instanceCount));
++                }
+                 break;
+             }
+ 
+@@ -1632,7 +1685,8 @@ MaybeError CommandBuffer::ExecuteRenderPass(BeginRenderPassCmd* renderPass,
+                 if (renderPass->attachmentState->GetSampleCount() > 1) {
+                     DAWN_TRY(ResolveMultisampledRenderTargets(gl, renderPass));
+                 }
+-                DAWN_GL_TRY(gl, DeleteFramebuffers(1, &fbo));
++                // Dusklight (P1d): the FBO is owned by the device-side cache now (evicted when an
++                // attached texture is destroyed), so it is not deleted per pass.
+                 return {};
+             }
+ 
+diff --git a/src/dawn/native/opengl/DeviceGL.cpp b/src/dawn/native/opengl/DeviceGL.cpp
+index fe463452f..f5d4d708e 100644
+--- a/src/dawn/native/opengl/DeviceGL.cpp
++++ b/src/dawn/native/opengl/DeviceGL.cpp
+@@ -256,6 +256,36 @@ const GLFormat& Device::GetGLFormat(const Format& format) {
+     return result;
+ }
+ 
++// Dusklight (P1d): render-pass FBO cache. See FramebufferCacheKey / DeviceGL.h for the ordering
++// argument that makes handle-keyed caching safe.
++GLuint Device::LookupFramebuffer(const FramebufferCacheKey& key) const {
++    auto it = mFramebufferCache.find(key);
++    return it == mFramebufferCache.end() ? 0 : it->second;
++}
++
++void Device::StoreFramebuffer(const FramebufferCacheKey& key, GLuint fbo) {
++    mFramebufferCache.emplace(key, fbo);
++}
++
++void Device::EvictFramebuffersReferencing(const OpenGLFunctions& gl, GLuint textureHandle) {
++    // Delete matching FBOs while scanning, collect their keys, then erase (this abseil's
++    // flat_hash_map::erase returns void, so we can't erase-and-advance in one step).
++    std::vector<FramebufferCacheKey> toErase;
++    for (const auto& [key, fbo] : mFramebufferCache) {
++        for (const auto& slot : key.slots) {
++            if (slot.handle == textureHandle) {
++                GLuint f = fbo;
++                DAWN_GL_TRY_IGNORE_ERRORS(gl, DeleteFramebuffers(1, &f));
++                toErase.push_back(key);
++                break;
++            }
++        }
++    }
++    for (const auto& key : toErase) {
++        mFramebufferCache.erase(key);
++    }
++}
++
+ ResultOrError<Ref<BindGroupBase>> Device::CreateBindGroupImpl(
+     const UnpackedPtr<BindGroupDescriptor>& descriptor) {
+     return BindGroup::Create(this, descriptor);
+diff --git a/src/dawn/native/opengl/DeviceGL.h b/src/dawn/native/opengl/DeviceGL.h
+index 5d08c0ab9..ceb344b04 100644
+--- a/src/dawn/native/opengl/DeviceGL.h
++++ b/src/dawn/native/opengl/DeviceGL.h
+@@ -28,13 +28,16 @@
+ #ifndef SRC_DAWN_NATIVE_OPENGL_DEVICEGL_H_
+ #define SRC_DAWN_NATIVE_OPENGL_DEVICEGL_H_
+
++#include <array>
+ #include <functional>
+ #include <memory>
+ #include <type_traits>
+ #include <utility>
+ #include <vector>
+
++#include "absl/container/flat_hash_map.h"
++#include "src/dawn/common/Constants.h"
+ #include "src/dawn/common/MutexProtected.h"
+ #include "src/dawn/native/Device.h"
+ #include "src/dawn/native/ExecutionQueue.h"
+ #include "src/dawn/native/QuerySet.h"
+@@ -53,6 +57,38 @@ class AHBFunctions;
+ 
+ namespace dawn::native::opengl {
+ 
++// Dusklight (P1d): render-pass FBO cache key. Aurora issues ~21 render passes/frame and Dawn's GL
++// backend otherwise gen/attach/DeleteFramebuffers on every one — a large per-frame driver cost on
++// Mali. The attachment set (which texture images, at which subresource, in which slot) fully
++// determines the FBO, and it is stable frame-to-frame, so keying on it lets a pass reuse one FBO.
++// Entries are evicted when any attached texture handle is destroyed
++// (Device::EvictFramebuffersReferencing); because texture deletes and render-pass execution run on
++// the one serialized GL work list, that eviction is ordered before the handle can be recycled, so
++// no stale FBO can ever be handed back for a reused handle.
++struct FramebufferCacheKey {
++    struct Slot {
++        GLuint handle = 0;   // GL texture name attached at this slot (0 = slot unused)
++        GLenum target = 0;   // GL texture target used for the attach
++        GLuint level = 0;    // mip level
++        GLuint layer = 0;    // array layer (+ depthSlice for 3D RTVs)
++        bool operator==(const Slot&) const = default;
++    };
++    // slots[0 .. kMaxColorAttachments-1] = color attachments by index;
++    // slots[kMaxColorAttachments]        = depth/stencil attachment.
++    std::array<Slot, kMaxColorAttachments + 1> slots{};
++    uint32_t colorMask = 0;   // which color slots are attached (drives glDrawBuffers config)
++    bool hasDepth = false;
++    bool operator==(const FramebufferCacheKey&) const = default;
++
++    template <typename H>
++    friend H AbslHashValue(H h, const FramebufferCacheKey& k) {
++        for (const auto& s : k.slots) {
++            h = H::combine(std::move(h), s.handle, s.target, s.level, s.layer);
++        }
++        return H::combine(std::move(h), k.colorMask, k.hasDepth);
++    }
++};
++
+ class Device final : public DeviceBase {
+   public:
+     using GLWorkFunc = std::function<MaybeError(const OpenGLFunctions&)>;
+@@ -240,6 +276,17 @@ class Device final : public DeviceBase {
+ 
+     const GLFormat& GetGLFormat(const Format& format);
+ 
++    // Dusklight (P1d): render-pass FBO cache. All three are only ever called from GL-executing
++    // work (ExecuteRenderPass / the texture-destroy lambda), which is serialized on the single
++    // context-current thread, so the map needs no additional locking.
++    // Returns the cached FBO for this attachment set, or 0 if none is cached.
++    GLuint LookupFramebuffer(const FramebufferCacheKey& key) const;
++    // Records a freshly built FBO for this attachment set.
++    void StoreFramebuffer(const FramebufferCacheKey& key, GLuint fbo);
++    // Deletes and drops every cached FBO that attaches the given texture handle. Called from the
++    // deferred texture-destroy work, before the GL name is freed.
++    void EvictFramebuffersReferencing(const OpenGLFunctions& gl, GLuint textureHandle);
++
+     int GetMaxTextureMaxAnisotropy() const;
+ 
+     MaybeError ValidateTextureCanBeWrapped(const UnpackedPtr<TextureDescriptor>& descriptor);
+@@ -335,6 +382,9 @@ class Device final : public DeviceBase {
+ 
+     MutexProtected<std::vector<GLWorkFunc>> mPendingGLWorkList;
+ 
++    // Dusklight (P1d): render-pass FBO cache. GL-thread-only (see the Lookup/Store/Evict comment).
++    absl::flat_hash_map<FramebufferCacheKey, GLuint> mFramebufferCache;
++
+     GLFormatTable mFormatTable;
+     std::unique_ptr<ContextEGL> mContext;
+     std::unique_ptr<ContextEGL> mPipelineContext;
+diff --git a/src/dawn/native/opengl/PersistentPipelineStateGL.cpp b/src/dawn/native/opengl/PersistentPipelineStateGL.cpp
+index 1a3e282b1..58e195858 100644
+--- a/src/dawn/native/opengl/PersistentPipelineStateGL.cpp
++++ b/src/dawn/native/opengl/PersistentPipelineStateGL.cpp
+@@ -70,4 +70,169 @@ MaybeError PersistentPipelineState::CallGLStencilFunc(const OpenGLFunctions& gl)
+     return {};
+ }
+ 
++// Dusklight fixed-function shadow setters. Each emits only when the value changed (or the shadow
++// is not yet valid for this pass). See PersistentPipelineStateGL.h for correctness rationale.
++
++MaybeError PersistentPipelineState::SetFrontFaceAndCulling(const OpenGLFunctions& gl,
++                                                           GLenum frontFace,
++                                                           bool cullEnabled,
++                                                           GLenum cullFace) {
++    if (!mDynamicStateValid || mFrontFace != frontFace) {
++        DAWN_GL_TRY(gl, FrontFace(frontFace));
++        mFrontFace = frontFace;
++    }
++    if (!mDynamicStateValid || mCullEnabled != cullEnabled) {
++        if (cullEnabled) {
++            DAWN_GL_TRY(gl, Enable(GL_CULL_FACE));
++        } else {
++            DAWN_GL_TRY(gl, Disable(GL_CULL_FACE));
++        }
++        mCullEnabled = cullEnabled;
++    }
++    if (cullEnabled && (!mDynamicStateValid || mCullFace != cullFace)) {
++        DAWN_GL_TRY(gl, CullFace(cullFace));
++        mCullFace = cullFace;
++    }
++    return {};
++}
++
++MaybeError PersistentPipelineState::SetDepthState(const OpenGLFunctions& gl,
++                                                  bool depthTestEnabled,
++                                                  GLboolean depthMask,
++                                                  GLenum depthFunc) {
++    if (!mDynamicStateValid || mDepthTestEnabled != depthTestEnabled) {
++        if (depthTestEnabled) {
++            DAWN_GL_TRY(gl, Enable(GL_DEPTH_TEST));
++        } else {
++            DAWN_GL_TRY(gl, Disable(GL_DEPTH_TEST));
++        }
++        mDepthTestEnabled = depthTestEnabled;
++    }
++    if (!mDynamicStateValid || mDepthMask != depthMask) {
++        DAWN_GL_TRY(gl, DepthMask(depthMask));
++        mDepthMask = depthMask;
++    }
++    if (!mDynamicStateValid || mDepthFunc != depthFunc) {
++        DAWN_GL_TRY(gl, DepthFunc(depthFunc));
++        mDepthFunc = depthFunc;
++    }
++    return {};
++}
++
++MaybeError PersistentPipelineState::SetStencilTestEnabled(const OpenGLFunctions& gl, bool enabled) {
++    if (!mDynamicStateValid || mStencilTestEnabled != enabled) {
++        if (enabled) {
++            DAWN_GL_TRY(gl, Enable(GL_STENCIL_TEST));
++        } else {
++            DAWN_GL_TRY(gl, Disable(GL_STENCIL_TEST));
++        }
++        mStencilTestEnabled = enabled;
++    }
++    return {};
++}
++
++MaybeError PersistentPipelineState::SetSampleMask(const OpenGLFunctions& gl, GLbitfield mask) {
++    if (!mDynamicStateValid || mSampleMask != mask) {
++        DAWN_GL_TRY(gl, SampleMaski(0, mask));
++        mSampleMask = mask;
++    }
++    return {};
++}
++
++MaybeError PersistentPipelineState::SetAlphaToCoverage(const OpenGLFunctions& gl, bool enabled) {
++    if (!mDynamicStateValid || mAlphaToCoverage != enabled) {
++        if (enabled) {
++            DAWN_GL_TRY(gl, Enable(GL_SAMPLE_ALPHA_TO_COVERAGE));
++        } else {
++            DAWN_GL_TRY(gl, Disable(GL_SAMPLE_ALPHA_TO_COVERAGE));
++        }
++        mAlphaToCoverage = enabled;
++    }
++    return {};
++}
++
++MaybeError PersistentPipelineState::SetPolygonOffset(const OpenGLFunctions& gl,
++                                                     bool enabled,
++                                                     float factor,
++                                                     float units,
++                                                     float clamp,
++                                                     bool hasClamp) {
++    if (!mDynamicStateValid || mPolygonOffsetEnabled != enabled) {
++        if (enabled) {
++            DAWN_GL_TRY(gl, Enable(GL_POLYGON_OFFSET_FILL));
++        } else {
++            DAWN_GL_TRY(gl, Disable(GL_POLYGON_OFFSET_FILL));
++        }
++        mPolygonOffsetEnabled = enabled;
++    }
++    if (enabled && (!mDynamicStateValid || mPolygonOffsetFactor != factor ||
++                    mPolygonOffsetUnits != units || mPolygonOffsetClamp != clamp)) {
++        if (hasClamp) {
++            DAWN_GL_TRY(gl, PolygonOffsetClamp(factor, units, clamp));
++        } else {
++            DAWN_GL_TRY(gl, PolygonOffset(factor, units));
++        }
++        mPolygonOffsetFactor = factor;
++        mPolygonOffsetUnits = units;
++        mPolygonOffsetClamp = clamp;
++    }
++    return {};
++}
++
++MaybeError PersistentPipelineState::SetBlendState(const OpenGLFunctions& gl,
++                                                  GLuint target,
++                                                  bool enabled,
++                                                  GLenum colorEquation,
++                                                  GLenum alphaEquation,
++                                                  GLenum srcColorFactor,
++                                                  GLenum dstColorFactor,
++                                                  GLenum srcAlphaFactor,
++                                                  GLenum dstAlphaFactor) {
++    DAWN_ASSERT(target < kMaxShadowColorTargets);
++    BlendShadow& s = mBlend[target];
++    if (!mDynamicStateValid || s.enabled != enabled) {
++        if (enabled) {
++            DAWN_GL_TRY(gl, Enablei(GL_BLEND, target));
++        } else {
++            DAWN_GL_TRY(gl, Disablei(GL_BLEND, target));
++        }
++        s.enabled = enabled;
++    }
++    if (enabled) {
++        if (!mDynamicStateValid || s.colorEquation != colorEquation ||
++            s.alphaEquation != alphaEquation) {
++            DAWN_GL_TRY(gl, BlendEquationSeparatei(target, colorEquation, alphaEquation));
++            s.colorEquation = colorEquation;
++            s.alphaEquation = alphaEquation;
++        }
++        if (!mDynamicStateValid || s.srcColorFactor != srcColorFactor ||
++            s.dstColorFactor != dstColorFactor || s.srcAlphaFactor != srcAlphaFactor ||
++            s.dstAlphaFactor != dstAlphaFactor) {
++            DAWN_GL_TRY(gl, BlendFuncSeparatei(target, srcColorFactor, dstColorFactor,
++                                               srcAlphaFactor, dstAlphaFactor));
++            s.srcColorFactor = srcColorFactor;
++            s.dstColorFactor = dstColorFactor;
++            s.srcAlphaFactor = srcAlphaFactor;
++            s.dstAlphaFactor = dstAlphaFactor;
++        }
++    }
++    return {};
++}
++
++MaybeError PersistentPipelineState::SetColorMask(const OpenGLFunctions& gl,
++                                                 GLuint target,
++                                                 bool red,
++                                                 bool green,
++                                                 bool blue,
++                                                 bool alpha) {
++    DAWN_ASSERT(target < kMaxShadowColorTargets);
++    ColorMaskShadow& m = mColorMask[target];
++    if (!mDynamicStateValid || m.red != red || m.green != green || m.blue != blue ||
++        m.alpha != alpha) {
++        DAWN_GL_TRY(gl, ColorMaski(target, red, green, blue, alpha));
++        m = {red, green, blue, alpha};
++    }
++    return {};
++}
++
+ }  // namespace dawn::native::opengl
+diff --git a/src/dawn/native/opengl/PersistentPipelineStateGL.h b/src/dawn/native/opengl/PersistentPipelineStateGL.h
+index 4107fe538..9c40a6837 100644
+--- a/src/dawn/native/opengl/PersistentPipelineStateGL.h
++++ b/src/dawn/native/opengl/PersistentPipelineStateGL.h
+@@ -45,6 +45,53 @@ class PersistentPipelineState {
+                                       uint32_t stencilReadMask);
+     MaybeError SetStencilReference(const OpenGLFunctions& gl, uint32_t stencilReference);
+ 
++    // Dusklight: pass-scoped fixed-function GL state shadow.
++    //
++    // RenderPipeline::ApplyNow re-applies the *entire* fixed-function state on every pipeline
++    // change. On a tile-based/deferred driver (Mali) each redundant state set marks a driver
++    // descriptor dirty, which is then rebuilt at the next draw — so deduplicating these across
++    // pipeline changes within a render pass is a direct CPU win in the driver. Each setter emits
++    // its GL calls only when the value differs from the last applied one (or the shadow is not yet
++    // valid). The shadow is per render pass (this object is constructed per ExecuteRenderPass) and
++    // starts invalid, so the first ApplyNow of the pass unconditionally emits everything and syncs
++    // the shadow to the real GL state — which is correct even though clears (run before any draw)
++    // touch the depth/stencil write masks, and correct because ApplyNow is the only writer of
++    // these states inside the draw loop.
++    MaybeError SetFrontFaceAndCulling(const OpenGLFunctions& gl,
++                                      GLenum frontFace,
++                                      bool cullEnabled,
++                                      GLenum cullFace);
++    MaybeError SetDepthState(const OpenGLFunctions& gl,
++                             bool depthTestEnabled,
++                             GLboolean depthMask,
++                             GLenum depthFunc);
++    MaybeError SetStencilTestEnabled(const OpenGLFunctions& gl, bool enabled);
++    MaybeError SetSampleMask(const OpenGLFunctions& gl, GLbitfield mask);
++    MaybeError SetAlphaToCoverage(const OpenGLFunctions& gl, bool enabled);
++    MaybeError SetPolygonOffset(const OpenGLFunctions& gl,
++                                bool enabled,
++                                float factor,
++                                float units,
++                                float clamp,
++                                bool hasClamp);
++    MaybeError SetBlendState(const OpenGLFunctions& gl,
++                             GLuint target,
++                             bool enabled,
++                             GLenum colorEquation,
++                             GLenum alphaEquation,
++                             GLenum srcColorFactor,
++                             GLenum dstColorFactor,
++                             GLenum srcAlphaFactor,
++                             GLenum dstAlphaFactor);
++    MaybeError SetColorMask(const OpenGLFunctions& gl,
++                            GLuint target,
++                            bool red,
++                            bool green,
++                            bool blue,
++                            bool alpha);
++    // Called at the end of the first full ApplyNow so subsequent applies can dedup.
++    void MarkDynamicStateValid() { mDynamicStateValid = true; }
++
+   private:
+     MaybeError CallGLStencilFunc(const OpenGLFunctions& gl);
+ 
+@@ -52,6 +99,47 @@ class PersistentPipelineState {
+     GLenum mStencilFrontCompareFunction = GL_ALWAYS;
+     GLuint mStencilReadMask = 0xffffffff;
+     GLuint mStencilReference = 0;
++
++    // Fixed-function shadow (see SetFrontFaceAndCulling above). Only trusted when
++    // mDynamicStateValid is true.
++    static constexpr uint32_t kMaxShadowColorTargets = 8;
++    bool mDynamicStateValid = false;
++
++    GLenum mFrontFace = 0;
++    bool mCullEnabled = false;
++    GLenum mCullFace = 0;
++
++    bool mDepthTestEnabled = false;
++    GLboolean mDepthMask = GL_TRUE;
++    GLenum mDepthFunc = 0;
++
++    bool mStencilTestEnabled = false;
++
++    GLbitfield mSampleMask = 0;
++    bool mAlphaToCoverage = false;
++
++    bool mPolygonOffsetEnabled = false;
++    float mPolygonOffsetFactor = 0.f;
++    float mPolygonOffsetUnits = 0.f;
++    float mPolygonOffsetClamp = 0.f;
++
++    struct BlendShadow {
++        bool enabled = false;
++        GLenum colorEquation = 0;
++        GLenum alphaEquation = 0;
++        GLenum srcColorFactor = 0;
++        GLenum dstColorFactor = 0;
++        GLenum srcAlphaFactor = 0;
++        GLenum dstAlphaFactor = 0;
++    };
++    BlendShadow mBlend[kMaxShadowColorTargets] = {};
++    struct ColorMaskShadow {
++        bool red = true;
++        bool green = true;
++        bool blue = true;
++        bool alpha = true;
++    };
++    ColorMaskShadow mColorMask[kMaxShadowColorTargets] = {};
+ };
+ 
+ }  // namespace dawn::native::opengl
+diff --git a/src/dawn/native/opengl/RenderPipelineGL.cpp b/src/dawn/native/opengl/RenderPipelineGL.cpp
+index d166c5601..c239256d7 100644
+--- a/src/dawn/native/opengl/RenderPipelineGL.cpp
++++ b/src/dawn/native/opengl/RenderPipelineGL.cpp
+@@ -56,23 +56,16 @@ GLenum GLPrimitiveTopology(wgpu::PrimitiveTopology primitiveTopology) {
+ }
+ 
+ MaybeError ApplyFrontFaceAndCulling(const OpenGLFunctions& gl,
++                                    PersistentPipelineState& persistentPipelineState,
+                                     wgpu::FrontFace face,
+                                     wgpu::CullMode mode) {
+     // Note that we invert winding direction in OpenGL. Because Y axis is up in OpenGL,
+     // which is different from WebGPU and other backends (Y axis is down).
+     GLenum direction = (face == wgpu::FrontFace::CCW) ? GL_CW : GL_CCW;
+-    DAWN_GL_TRY(gl, FrontFace(direction));
+-
+-    if (mode == wgpu::CullMode::None) {
+-        DAWN_GL_TRY(gl, Disable(GL_CULL_FACE));
+-    } else {
+-        DAWN_GL_TRY(gl, Enable(GL_CULL_FACE));
+-
+-        GLenum cullMode = (mode == wgpu::CullMode::Front) ? GL_FRONT : GL_BACK;
+-        DAWN_GL_TRY(gl, CullFace(cullMode));
+-    }
+-
+-    return {};
++    bool cullEnabled = (mode != wgpu::CullMode::None);
++    GLenum cullMode = (mode == wgpu::CullMode::Front) ? GL_FRONT : GL_BACK;
++    // Dusklight: dedup against the pass-scoped shadow instead of always re-emitting.
++    return persistentPipelineState.SetFrontFaceAndCulling(gl, direction, cullEnabled, cullMode);
+ }
+ 
+ GLenum GLBlendFactor(wgpu::BlendFactor factor, bool alpha) {
+@@ -136,26 +129,29 @@ GLenum GLBlendMode(wgpu::BlendOperation operation) {
+ }
+ 
+ MaybeError ApplyColorState(const OpenGLFunctions& gl,
++                           PersistentPipelineState& persistentPipelineState,
+                            ColorAttachmentIndex attachment,
+                            const ColorTargetState* state) {
+     GLuint colorBuffer = static_cast<GLuint>(static_cast<uint8_t>(attachment));
++    // Dusklight: route blend + color-mask through the pass-scoped shadow so unchanged state is
++    // not re-emitted across pipeline changes.
+     if (state->blend != nullptr) {
+-        DAWN_GL_TRY(gl, Enablei(GL_BLEND, colorBuffer));
+-        DAWN_GL_TRY(gl,
+-                    BlendEquationSeparatei(colorBuffer, GLBlendMode(state->blend->color.operation),
+-                                           GLBlendMode(state->blend->alpha.operation)));
+-        DAWN_GL_TRY(
+-            gl, BlendFuncSeparatei(colorBuffer, GLBlendFactor(state->blend->color.srcFactor, false),
+-                                   GLBlendFactor(state->blend->color.dstFactor, false),
+-                                   GLBlendFactor(state->blend->alpha.srcFactor, true),
+-                                   GLBlendFactor(state->blend->alpha.dstFactor, true)));
++        DAWN_TRY(persistentPipelineState.SetBlendState(
++            gl, colorBuffer, /*enabled=*/true, GLBlendMode(state->blend->color.operation),
++            GLBlendMode(state->blend->alpha.operation),
++            GLBlendFactor(state->blend->color.srcFactor, false),
++            GLBlendFactor(state->blend->color.dstFactor, false),
++            GLBlendFactor(state->blend->alpha.srcFactor, true),
++            GLBlendFactor(state->blend->alpha.dstFactor, true)));
+     } else {
+-        DAWN_GL_TRY(gl, Disablei(GL_BLEND, colorBuffer));
++        DAWN_TRY(persistentPipelineState.SetBlendState(gl, colorBuffer, /*enabled=*/false, 0, 0, 0,
++                                                       0, 0, 0));
+     }
+-    DAWN_GL_TRY(gl, ColorMaski(colorBuffer, state->writeMask & wgpu::ColorWriteMask::Red,
+-                               state->writeMask & wgpu::ColorWriteMask::Green,
+-                               state->writeMask & wgpu::ColorWriteMask::Blue,
+-                               state->writeMask & wgpu::ColorWriteMask::Alpha));
++    DAWN_TRY(persistentPipelineState.SetColorMask(
++        gl, colorBuffer, static_cast<bool>(state->writeMask & wgpu::ColorWriteMask::Red),
++        static_cast<bool>(state->writeMask & wgpu::ColorWriteMask::Green),
++        static_cast<bool>(state->writeMask & wgpu::ColorWriteMask::Blue),
++        static_cast<bool>(state->writeMask & wgpu::ColorWriteMask::Alpha)));
+     return {};
+ }
+ 
+@@ -331,19 +327,14 @@ MaybeError RenderPipeline::ApplyNow(const OpenGLFunctions& gl,
+     DAWN_ASSERT(mVertexArrayObject);
+     DAWN_GL_TRY(gl, BindVertexArray(mVertexArrayObject));
+ 
+-    DAWN_TRY(ApplyFrontFaceAndCulling(gl, GetFrontFace(), GetCullMode()));
++    DAWN_TRY(ApplyFrontFaceAndCulling(gl, persistentPipelineState, GetFrontFace(), GetCullMode()));
+ 
+     DAWN_TRY(ApplyDepthStencilState(gl, &persistentPipelineState));
+ 
+-    DAWN_GL_TRY(gl, SampleMaski(0, GetSampleMask()));
+-    if (IsAlphaToCoverageEnabled()) {
+-        DAWN_GL_TRY(gl, Enable(GL_SAMPLE_ALPHA_TO_COVERAGE));
+-    } else {
+-        DAWN_GL_TRY(gl, Disable(GL_SAMPLE_ALPHA_TO_COVERAGE));
+-    }
++    DAWN_TRY(persistentPipelineState.SetSampleMask(gl, GetSampleMask()));
++    DAWN_TRY(persistentPipelineState.SetAlphaToCoverage(gl, IsAlphaToCoverageEnabled()));
+ 
+     if (IsDepthBiasEnabled()) {
+-        DAWN_GL_TRY(gl, Enable(GL_POLYGON_OFFSET_FILL));
+         float depthBias = GetDepthBias();
+         if (GetDevice()->IsToggleEnabled(Toggle::GLDepthBiasModifier)) {
+             // There is an ambiguity in the GL and Vulkan specs with respect to
+@@ -356,18 +347,18 @@ MaybeError RenderPipeline::ApplyNow(const OpenGLFunctions& gl,
+             depthBias *= 0.5f;
+         }
+         float slopeScale = GetDepthBiasSlopeScale();
+-        if (gl.PolygonOffsetClamp != nullptr) {
+-            DAWN_GL_TRY(gl, PolygonOffsetClamp(slopeScale, depthBias, GetDepthBiasClamp()));
+-        } else {
+-            DAWN_GL_TRY(gl, PolygonOffset(slopeScale, depthBias));
+-        }
++        DAWN_TRY(persistentPipelineState.SetPolygonOffset(gl, /*enabled=*/true, slopeScale,
++                                                          depthBias, GetDepthBiasClamp(),
++                                                          gl.PolygonOffsetClamp != nullptr));
+     } else {
+-        DAWN_GL_TRY(gl, Disable(GL_POLYGON_OFFSET_FILL));
++        DAWN_TRY(persistentPipelineState.SetPolygonOffset(gl, /*enabled=*/false, 0.f, 0.f, 0.f,
++                                                          gl.PolygonOffsetClamp != nullptr));
+     }
+ 
+     if (!GetDevice()->IsToggleEnabled(Toggle::DisableIndexedDrawBuffers)) {
+         for (auto attachmentSlot : GetColorAttachmentsMask()) {
+-            DAWN_TRY(ApplyColorState(gl, attachmentSlot, GetColorTargetState(attachmentSlot)));
++            DAWN_TRY(ApplyColorState(gl, persistentPipelineState, attachmentSlot,
++                                     GetColorTargetState(attachmentSlot)));
+         }
+     } else {
+         const ColorTargetState* prevDescriptor = nullptr;
+@@ -391,6 +382,10 @@ MaybeError RenderPipeline::ApplyNow(const OpenGLFunctions& gl,
+         }
+     }
+ 
++    // Dusklight: the shadow now reflects a full apply of this pipeline's fixed-function state, so
++    // subsequent ApplyNow calls in this pass can dedup against it.
++    persistentPipelineState.MarkDynamicStateValid();
++
+     return {};
+ }
+ 
+@@ -399,27 +394,16 @@ MaybeError RenderPipeline::ApplyDepthStencilState(
+     PersistentPipelineState* persistentPipelineState) {
+     const DepthStencilState* descriptor = GetDepthStencilState();
+ 
+-    // Depth writes only occur if depth is enabled
+-    if (descriptor->depthCompare == wgpu::CompareFunction::Always &&
+-        descriptor->depthWriteEnabled != wgpu::OptionalBool::True) {
+-        DAWN_GL_TRY(gl, Disable(GL_DEPTH_TEST));
+-    } else {
+-        DAWN_GL_TRY(gl, Enable(GL_DEPTH_TEST));
+-    }
++    // Dusklight: dedup depth test/mask/func through the pass-scoped shadow.
++    // Depth writes only occur if depth is enabled.
++    bool depthTestEnabled = !(descriptor->depthCompare == wgpu::CompareFunction::Always &&
++                              descriptor->depthWriteEnabled != wgpu::OptionalBool::True);
++    GLboolean depthMask =
++        (descriptor->depthWriteEnabled == wgpu::OptionalBool::True) ? GL_TRUE : GL_FALSE;
++    DAWN_TRY(persistentPipelineState->SetDepthState(
++        gl, depthTestEnabled, depthMask, ToOpenGLCompareFunction(descriptor->depthCompare)));
+ 
+-    if (descriptor->depthWriteEnabled == wgpu::OptionalBool::True) {
+-        DAWN_GL_TRY(gl, DepthMask(GL_TRUE));
+-    } else {
+-        DAWN_GL_TRY(gl, DepthMask(GL_FALSE));
+-    }
+-
+-    DAWN_GL_TRY(gl, DepthFunc(ToOpenGLCompareFunction(descriptor->depthCompare)));
+-
+-    if (UsesStencil()) {
+-        DAWN_GL_TRY(gl, Enable(GL_STENCIL_TEST));
+-    } else {
+-        DAWN_GL_TRY(gl, Disable(GL_STENCIL_TEST));
+-    }
++    DAWN_TRY(persistentPipelineState->SetStencilTestEnabled(gl, UsesStencil()));
+ 
+     GLenum backCompareFunction = ToOpenGLCompareFunction(descriptor->stencilBack.compare);
+     GLenum frontCompareFunction = ToOpenGLCompareFunction(descriptor->stencilFront.compare);
+diff --git a/src/dawn/native/opengl/TextureGL.cpp b/src/dawn/native/opengl/TextureGL.cpp
+index 4e46ad5e0..4aec44ee5 100644
+--- a/src/dawn/native/opengl/TextureGL.cpp
++++ b/src/dawn/native/opengl/TextureGL.cpp
+@@ -318,13 +318,19 @@ Texture::~Texture() {}
+ void Texture::DestroyImpl(DestroyReason reason) {
+     TextureBase::DestroyImpl(reason);
+     if (mOwnsHandle == OwnsHandle::Yes) {
+-        IgnoreErrors(
+-            ToBackend(GetDevice())
+-                ->EnqueueDestroyGL(this, &Texture::GetHandle, reason,
+-                                   [](const OpenGLFunctions& gl, GLuint handle) -> MaybeError {
+-                                       DAWN_GL_TRY_IGNORE_ERRORS(gl, DeleteTextures(1, &handle));
+-                                       return {};
+-                                   }));
++        // Dusklight (P1d): the device holds a render-pass FBO cache keyed on texture handles. Drop
++        // any cached FBO attaching this handle before the name is freed — this runs on the same
++        // serialized GL work list as render-pass FBO creation, so the eviction is ordered ahead of
++        // any glGenTextures that could recycle the name. Capturing the raw Device* is safe: the
++        // device outlives its textures and owns the queue that runs this work.
++        Device* device = ToBackend(GetDevice());
++        IgnoreErrors(device->EnqueueDestroyGL(
++            this, &Texture::GetHandle, reason,
++            [device](const OpenGLFunctions& gl, GLuint handle) -> MaybeError {
++                device->EvictFramebuffersReferencing(gl, handle);
++                DAWN_GL_TRY_IGNORE_ERRORS(gl, DeleteTextures(1, &handle));
++                return {};
++            }));
+     }
+ }
+ 
+@@ -694,43 +700,49 @@ GLenum TextureView::GetGLTarget() const {
+     return mTarget;
+ }
+ 
+-MaybeError TextureView::BindToFramebuffer(const OpenGLFunctions& gl,
+-                                          GLenum target,
+-                                          GLenum attachment,
+-                                          GLuint depthSlice) {
+-    DAWN_ASSERT(depthSlice <
+-                static_cast<GLuint>(GetSingleSubresourceVirtualSize().depthOrArrayLayers));
++GLFramebufferAttachment TextureView::GetFramebufferAttachment(GLuint depthSlice) const {
++    GLFramebufferAttachment fa;
+ 
+     // Use the base texture where possible to minimize the amount of copying required on GLES.
+     bool useOwnView = GetFormat().format != GetTexture()->GetFormat().format &&
+                       !GetTexture()->GetFormat().HasDepthOrStencil();
+ 
+-    GLenum textarget;
+-    GLuint textureHandle, mipLevel, arrayLayer;
+     if (useOwnView) {
+         // Use our own texture handle and target which points to a subset of the texture's
+         // subresources.
+-        textureHandle = GetHandle();
+-        textarget = GetGLTarget();
+-        mipLevel = 0;
+-        arrayLayer = 0;
++        fa.handle = GetHandle();
++        fa.textarget = GetGLTarget();
++        fa.mipLevel = 0;
++        fa.arrayLayer = 0;
+     } else {
+         // Use the texture's handle and target, with the view's base mip level and base array
+ 
+-        textureHandle = ToBackend(GetTexture())->GetHandle();
+-        textarget = ToBackend(GetTexture())->GetGLTarget();
+-        mipLevel = GetBaseMipLevel();
++        fa.handle = ToBackend(GetTexture())->GetHandle();
++        fa.textarget = ToBackend(GetTexture())->GetGLTarget();
++        fa.mipLevel = GetBaseMipLevel();
+         // We have validated that the depthSlice in render pass's colorAttachments must be undefined
+         // for 2d RTVs, which value is set to 0. For 3d RTVs, the baseArrayLayer must be 0. So here
+         // we can simply use baseArrayLayer + depthSlice to specify the slice in RTVs without
+         // checking the view's dimension.
+-        arrayLayer = GetBaseArrayLayer() + depthSlice;
++        fa.arrayLayer = GetBaseArrayLayer() + depthSlice;
+     }
+ 
+-    DAWN_ASSERT(textureHandle != 0);
++    return fa;
++}
++
++MaybeError TextureView::BindToFramebuffer(const OpenGLFunctions& gl,
++                                          GLenum target,
++                                          GLenum attachment,
++                                          GLuint depthSlice) {
++    DAWN_ASSERT(depthSlice <
++                static_cast<GLuint>(GetSingleSubresourceVirtualSize().depthOrArrayLayers));
++
++    GLFramebufferAttachment fa = GetFramebufferAttachment(depthSlice);
++
++    DAWN_ASSERT(fa.handle != 0);
+ 
+-    return FramebufferTextureHelper(gl, textarget, target, attachment, textureHandle, mipLevel,
+-                                    arrayLayer);
++    return FramebufferTextureHelper(gl, fa.textarget, target, attachment, fa.handle, fa.mipLevel,
++                                    fa.arrayLayer);
+ }
+ 
+ GLenum TextureView::GetInternalFormat() const {
+diff --git a/src/dawn/native/opengl/TextureGL.h b/src/dawn/native/opengl/TextureGL.h
+index 3fd3604bf..0d74256e1 100644
+--- a/src/dawn/native/opengl/TextureGL.h
++++ b/src/dawn/native/opengl/TextureGL.h
+@@ -43,6 +43,16 @@ enum class OwnsHandle : uint8_t {
+     No,
+ };
+ 
++// Dusklight (P1d): the specific GL image (texture name + subresource + target) a view attaches to
++// an FBO. Returned by TextureView::GetFramebufferAttachment so the render-pass FBO cache can key on
++// the exact attach identity, and reused to perform the attach in BindToFramebuffer.
++struct GLFramebufferAttachment {
++    GLuint handle = 0;
++    GLenum textarget = 0;
++    GLuint mipLevel = 0;
++    GLuint arrayLayer = 0;
++};
++
+ class Texture final : public TextureBase {
+   public:
+     static ResultOrError<Ref<Texture>> Create(Device* device,
+@@ -86,6 +96,9 @@ class TextureView final : public TextureViewBase {
+ 
+     GLuint GetHandle() const;
+     GLenum GetGLTarget() const;
++    // Resolves the view (applying the useOwnView / base-mip / base-layer logic) to the exact GL
++    // image it would attach. Same resolution BindToFramebuffer performs, exposed for FBO-cache keys.
++    GLFramebufferAttachment GetFramebufferAttachment(GLuint depthSlice) const;
+     MaybeError BindToFramebuffer(const OpenGLFunctions& gl,
+                                  GLenum target,
+                                  GLenum attachment,
