@@ -1557,6 +1557,15 @@ static u32 calculate_last_vtx_size(GXVtxFmt fmt) {
 static void handle_draw_unmerged(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Range vertRange);
 static void push_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Range vertRange, gfx::Range idxRange,
                          u32 numIndices);
+// Mali fork: storage vertex fetch is impossible on the target
+// (GL_MAX_VERTEX_SHADER_STORAGE_BLOCKS=0), so a draw that native fetch declines —
+// instanced lines/points (e.g. GX_LINESTRIP minimap draws), NBT normals, exotic
+// component types — is dropped instead of building a storage pipeline that can't
+// link and aborts the device. If any dropped geometry turns out to matter, extend
+// native fetch to cover it (e.g. instanced lines); texture-vertex fetch is NOT an
+// option — it's unusably slow on Mali. Flip to false only to exercise storage on desktop.
+static constexpr bool kSkipStorageVertexFetch = true;
+
 static bool try_native_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, const u8* data, u32& pos, u32 vtxSize);
 static bool try_native_draw_indexed(GXVtxFmt fmt, u16 vtxCount, const u8* vtxData, u32 vtxSize, const u8* idxData,
                                     u32 idxBytes, u32 indexCount);
@@ -1660,6 +1669,18 @@ static void handle_draw_unmerged(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, g
 
 static void push_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Range vertRange, gfx::Range idxRange,
                          u32 numIndices) {
+  if constexpr (kSkipStorageVertexFetch) {
+    // Native fetch declined this layout; the storage fallback would bind vertex SSBOs
+    // and can't link on Mali. The caller already consumed the FIFO vertices, so just
+    // drop the draw. Warn a few times so we know what geometry is being skipped.
+    static Module Log("aurora::gx");
+    static int warned = 0;
+    if (warned++ < 8) {
+      Log.warn("Dropping non-native draw (prim={} fmt={} verts={}) — storage vertex fetch unavailable on Mali",
+               static_cast<int>(prim), static_cast<int>(fmt), vtxCount);
+    }
+    return;
+  }
   // Build pipeline, bind groups, and push draw command
   BindGroupRanges ranges{};
   for (int i = GX_VA_POS; i <= GX_VA_TEX7; ++i) {
@@ -1830,7 +1851,10 @@ struct NativeAttrDesc {
 // NBT normals, exotic component types, missing position, >16 attributes, or an
 // indexed attr whose source array is not resident.
 // Diagnostic: flip kLogNativeDecline to true to log (rate-limited) why a layout
-// declined native fetch and fell back to storage. Compile-time so there's no env cruft.
+// declined native fetch and fell back to storage. Storage is impossible on Mali
+// (GL_MAX_VERTEX_SHADER_STORAGE_BLOCKS=0), so every decline logged here is a draw
+// that gets dropped on Mali (see kSkipStorageVertexFetch) — the fix, if it matters,
+// is to widen native fetch, not texture fetch. Compile-time so there's no env cruft.
 static constexpr bool kLogNativeDecline = false;
 static bool native_decline(int reason, GXVtxFmt fmt, int attr) {
   if constexpr (kLogNativeDecline) {
