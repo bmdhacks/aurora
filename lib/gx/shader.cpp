@@ -1592,7 +1592,11 @@ std::string build_shader_source(const ShaderConfig& config) noexcept {
     fragmentFn += "\n    prev = vec4f(in.nrm, prev.a);";
   }
 
-  const auto shaderSource = fmt::format(R"""(
+  // Storage/texture vertex fetch needs the byte-loader prelude and the vbuf/abuf
+  // storage bindings; native fetch omits both. Mali counts even an unused
+  // vertex-stage storage block against its zero limit, and the loaders are dead code
+  // in native mode (all attrs arrive as hardware @location inputs).
+  const std::string storageFetchPrelude = config.nativeVertexFetch ? std::string() : fmt::format(R"""(
 fn bswap32(v: u32, le: bool) -> u32 {{
   if (le) {{
     return v;
@@ -1903,6 +1907,17 @@ fn fetch_rgba8(p: ptr<storage, array<u32>>, byte_off: u32, le: bool) -> vec4f {{
   let v = raw_fetch_u8_4(p, byte_off);
   return vec4f(v) / 255.0;
 }}
+)""");
+
+  const std::string staticVtxBindings = config.nativeVertexFetch ? std::string() : R"""(
+@group(0) @binding(0)
+var<storage, read> vbuf: array<u32>;
+@group(0) @binding(1)
+var<storage, read> abuf: array<u32>;)""";
+
+  // tev_overflow_* are fragment/TEV helpers (not vertex fetch) — always emitted.
+  const auto shaderSource = fmt::format(R"""(
+{9}
 
 fn tev_overflow_f32(in: f32) -> f32 {{
   let byte_space = in * 255.0;
@@ -1928,11 +1943,7 @@ struct Uniform {{
     logical_viewport_size: vec2f,
     pad: vec2u,
     array_start: array<u32, 12>,{0}
-}};
-@group(0) @binding(0)
-var<storage, read> vbuf: array<u32>;
-@group(0) @binding(1)
-var<storage, read> abuf: array<u32>;
+}};{10}
 @group(1) @binding(0)
 var<uniform> ubuf: Uniform;{1}
 
@@ -1954,7 +1965,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4f {{{6}{5}
 }}
 )""",
                                         uniBufAttrs, texBindings, vtxOutAttrs, vtxInAttrs, vtxXfrAttrs, fragmentFn,
-                                        fragmentFnPre, vtxXfrAttrsPre, uniformPre);
+                                        fragmentFnPre, vtxXfrAttrsPre, uniformPre, storageFetchPrelude, staticVtxBindings);
   if (EnableDebugPrints) {
     Log.info("Generated shader (hash {:x}): {}", hash, shaderSource);
   }
