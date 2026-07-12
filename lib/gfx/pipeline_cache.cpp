@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <deque>
 #include <filesystem>
@@ -327,10 +328,22 @@ struct AtomicStatRef {
     __atomic_store_n(&ref, val, __ATOMIC_RELAXED);
     return val;
   }
+  operator uint32_t() const { return __atomic_load_n(&ref, __ATOMIC_RELAXED); }
 };
 static AtomicStatRef queuedPipelines{g_stats.queuedPipelines};
 static AtomicStatRef createdPipelines{g_stats.createdPipelines};
 #endif
+
+// Which pipeline the worker is currently inside create() for, and since when (steady_clock ms).
+// 0 = idle. Lets a stalled blocking waiter name the build that is wedging the worker — a create()
+// parked inside the driver can't log from its own thread.
+static std::atomic<PipelineRef> g_inFlightPipeline{0};
+static std::atomic<int64_t> g_inFlightPipelineSinceMs{0};
+
+static int64_t steady_now_ms() {
+  return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
 
 template <typename PipelineConfig>
 static PipelineCacheWrite make_pipeline_cache_write(ShaderType type, PipelineRef hash, const PipelineConfig& config,
@@ -537,8 +550,27 @@ static PipelineRef find_pipeline_impl(ShaderType type, const PipelineConfig& con
   }
 
   if (blocking && !pipelineReady) {
+    // Bounded, never infinite: this wait runs on the game thread, and on Mali-G31 a pipeline
+    // build can wedge inside libmali — an unbounded wait here turns that into a silent black
+    // screen (game loop parked before its first [clock] line). If the build doesn't land in
+    // time, name the culprit and return; bind_pipeline() skips draws whose pipeline isn't
+    // ready, so the cost of bailing is a missing UI element for a few frames, not a hang.
     std::unique_lock lock{g_pipelineMutex};
-    g_pipelineReadyCv.wait(lock, [=] { return g_pipelines.contains(hash) || g_pipelineThreadEnd; });
+    int stalls = 0;
+    while (!g_pipelineReadyCv.wait_for(lock, std::chrono::seconds{5},
+                                       [=] { return g_pipelines.contains(hash) || g_pipelineThreadEnd; })) {
+      const PipelineRef inFlight = g_inFlightPipeline.load(std::memory_order_relaxed);
+      const int64_t inFlightMs =
+          inFlight != 0 ? steady_now_ms() - g_inFlightPipelineSinceMs.load(std::memory_order_relaxed) : 0;
+      Log.warn("[pipeline-cache] blocking wait for {:016x} stalled {}s (worker in-flight {:016x} for {} ms, "
+               "priority={} background={} counter={})",
+               hash, (stalls + 1) * 5, inFlight, inFlightMs, g_pipelineQueue.size(), g_backgroundPipelineQueue.size(),
+               static_cast<uint32_t>(queuedPipelines));
+      if (++stalls >= 2) {
+        Log.error("[pipeline-cache] giving up blocking wait for {:016x}; draws will be skipped until it builds", hash);
+        break;
+      }
+    }
     auto pipelineIt = g_pipelines.find(hash);
     if (pipelineIt != g_pipelines.end() && persist && firstFrameUsed < pipelineIt->second.firstFrameUsed) {
       pipelineIt->second.firstFrameUsed = firstFrameUsed;
@@ -966,6 +998,14 @@ static void pipeline_worker() {
   tracy::SetThreadName("Pipeline compilation thread");
 #endif
 
+  // DIAGNOSTIC (queuedPipelines stuck >0 with idle thread, observed G31 2026-07-10): announce
+  // this thread's lifetime, dump the accounting whenever we sleep >10s with a nonzero counter,
+  // and time each build. Remove once the leak is root-caused. (Lifetime logs are gated on
+  // g_hasPipelineThread: in threadless mode this function runs once per frame.)
+  if (g_hasPipelineThread) {
+    Log.info("[pipeline-cache] compilation thread started");
+  }
+
   bool hasMore = false;
   while (g_hasPipelineThread || g_pipelinesPerFrame < BuildPipelinesPerFrame) {
     PendingPipeline pending;
@@ -973,9 +1013,21 @@ static void pipeline_worker() {
       std::unique_lock lock{g_pipelineMutex};
       if (g_hasPipelineThread) {
         if (!hasMore) {
-          g_pipelineQueueCv.wait(lock, [] {
+          while (!g_pipelineQueueCv.wait_for(lock, std::chrono::seconds{10}, [] {
             return !g_pipelineQueue.empty() || !g_backgroundPipelineQueue.empty() || g_pipelineThreadEnd;
-          });
+          })) {
+            const uint32_t counted = queuedPipelines;
+            if (counted != 0) {
+              std::string pendingHashes;
+              for (const auto hash : g_pendingPipelines) {
+                fmt::format_to(std::back_inserter(pendingHashes), " {:016x}", hash);
+              }
+              Log.warn("[pipeline-cache] counter says {} queued but queues are empty "
+                       "(priority={} background={} pendingSet={}:{}) — accounting leak",
+                       counted, g_pipelineQueue.size(), g_backgroundPipelineQueue.size(),
+                       g_pendingPipelines.size(), pendingHashes);
+            }
+          }
         }
       } else if (g_pipelineQueue.empty() && g_backgroundPipelineQueue.empty()) {
         return;
@@ -983,11 +1035,28 @@ static void pipeline_worker() {
       if (g_pipelineThreadEnd) {
         break;
       }
+      // hasMore was computed under a previous hold of the mutex; re-validate rather than call
+      // front() on an empty deque if the state moved underneath us.
+      if (g_pipelineQueue.empty() && g_backgroundPipelineQueue.empty()) {
+        Log.warn("[pipeline-cache] hasMore was stale: both queues empty after skip-wait (counter {})",
+                 static_cast<uint32_t>(queuedPipelines));
+        hasMore = false;
+        continue;
+      }
       auto& source = !g_pipelineQueue.empty() ? g_pipelineQueue : g_backgroundPipelineQueue;
       pending = std::move(source.front());
       source.pop_front();
     }
+    const auto buildStart = std::chrono::steady_clock::now();
+    g_inFlightPipelineSinceMs.store(steady_now_ms(), std::memory_order_relaxed);
+    g_inFlightPipeline.store(pending.hash, std::memory_order_relaxed);
     auto result = pending.create();
+    g_inFlightPipeline.store(0, std::memory_order_relaxed);
+    const auto buildMs =
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - buildStart).count();
+    if (buildMs > 500) {
+      Log.warn("[pipeline-cache] pipeline {:016x} took {} ms to build", pending.hash, buildMs);
+    }
     {
       std::lock_guard lock{g_pipelineMutex};
       g_pipelines.try_emplace(pending.hash, CachedPipeline{
@@ -1001,6 +1070,10 @@ static void pipeline_worker() {
       ++g_pipelinesPerFrame;
     }
     notify_pipeline_ready(true);
+  }
+  if (g_hasPipelineThread) {
+    Log.info("[pipeline-cache] compilation thread exiting (end={} queued={})",
+             g_pipelineThreadEnd.load(), static_cast<uint32_t>(queuedPipelines));
   }
 }
 
