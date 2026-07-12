@@ -73,10 +73,14 @@ void render(const DrawData& data, const wgpu::RenderPassEncoder& pass) {
     pass.SetBindGroup(2, gfx::find_bind_group(data.bindGroups.textureBindGroup));
   }
   if (data.nativeVertexFetch) {
-    // Native draws read from a real vertex buffer instead of the group-0 SSBOs.
-    pass.SetVertexBuffer(0, gfx::g_vertexBuffer, data.vertRange.offset, data.vertRange.size);
+    // Native draws read from a real vertex buffer instead of the group-0 SSBOs. Cached
+    // geometry lives in the persistent cross-frame cache buffer; everything else in the
+    // shared per-frame vertex ring.
+    const wgpu::Buffer& vtxBuffer = data.cachedGeometry ? gfx::g_nativeVertexCacheBuffer : gfx::g_vertexBuffer;
+    pass.SetVertexBuffer(0, vtxBuffer, data.vertRange.offset, data.vertRange.size);
   }
-  pass.SetIndexBuffer(gfx::g_indexBuffer, wgpu::IndexFormat::Uint16, data.idxRange.offset, data.idxRange.size);
+  const wgpu::Buffer& idxBuffer = data.cachedGeometry ? gfx::g_nativeIndexCacheBuffer : gfx::g_indexBuffer;
+  pass.SetIndexBuffer(idxBuffer, wgpu::IndexFormat::Uint16, data.idxRange.offset, data.idxRange.size);
   if (data.dstAlpha != UINT32_MAX) {
     const wgpu::Color color{0.f, 0.f, 0.f, data.dstAlpha / 255.f};
     pass.SetBlendConstant(&color);

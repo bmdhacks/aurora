@@ -17,6 +17,10 @@ struct DrawData {
   // When true, bind vertRange as a hardware vertex buffer (slot 0) instead of
   // relying on the group-0 storage buffers. Set by the native-fetch draw path.
   bool nativeVertexFetch = false;
+  // When true, vertRange/idxRange address the persistent native geometry cache buffers
+  // (g_nativeVertexCacheBuffer / g_nativeIndexCacheBuffer) rather than the per-frame
+  // rings. Implies nativeVertexFetch. Set by the native geometry cache on a hit/promote.
+  bool cachedGeometry = false;
 };
 
 constexpr uint32_t GXPipelineConfigVersion = 14;

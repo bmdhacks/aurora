@@ -23,6 +23,10 @@
 namespace aurora::gx::fifo {
 static Module Log("aurora::gx::fifo");
 
+// Bumped by GX_CMD_INVL_VC (GXInvalidateVtxCache); invalidates the memoized attribute
+// array content hashes the native geometry cache keys indexed draws by.
+static u32 s_gxArrayInvalidateGen = 0;
+
 static u16 prepare_idx_buffer(ByteBuffer& buf, GXPrimitive prim, u16 vtxStart, u16 vtxCount) {
   u16 numIndices = 0;
   if (prim == GX_QUADS) {
@@ -445,7 +449,9 @@ void process(const u8* data, u32 size, bool bigEndian) {
     }
 
     case CP_CMD_INVAL_VTX: {
-      // Invalidate vertex cache
+      // Invalidate vertex cache: the game may have rewritten attribute array contents in
+      // place (e.g. particle systems), so drop memoized array content hashes.
+      ++s_gxArrayInvalidateGen;
       break;
     }
 
@@ -1986,9 +1992,224 @@ static ByteBuffer s_nativeVtxBuf;
 static ByteBuffer s_nativeIdxBuf;
 static std::vector<NativeAttrDesc> s_nativeDescs;
 
+// ---------------------------------------------------------------------------
+// Native geometry cache (M2)
+//
+// CPU-expanded native vertex/index data is uploaded once into persistent GPU buffers and
+// replayed on later frames by content hash. Because skinning stays on the GPU (bone
+// matrices are per-draw uniforms, not baked into the verts), a mesh's expanded bytes are
+// byte-identical every frame — so steady-state world and character geometry expands +
+// uploads exactly once, and every subsequent frame is just a hash lookup plus a draw that
+// references the cached range. This is the fix for the "M1: no cache" per-frame re-expand
+// + re-upload cost. Keyed by the source FIFO bytes plus the decode layout (and, for
+// indexed attributes, the referenced arrays' contents) so two draws collide in the cache
+// only when they truly expand to identical geometry.
+static constexpr bool kNativeGeomCacheEnabled = true;
+// Byte floor below which caching isn't worth the hash/bookkeeping. NOTE: the 2-frame
+// recurrence gate in native_geom_resolve_ranges (not this size gate) is what actually keeps
+// transient one-shot draws out of the persistent cache, so this only needs to skip trivially
+// tiny draws. Lowered 1024 -> 64 so the shadow pre-pass (16B/vert x 4-21 verts = 64-336B) and
+// small static props become cacheable and stop re-uploading into the per-frame vertex ring
+// every frame -- that ring was ~440KB/frame, ~38% of the per-frame libmali upload volume that
+// is the device CPU bottleneck.
+static constexpr size_t kNativeGeomCacheMinBytes = 64;
+
+// Emit a periodic one-line cache/batching summary to confirm the geometry cache is
+// actually hitting on-device (and how effective run-batching is). Perf-tuning scaffolding;
+// off by default in shipped builds.
+static constexpr bool kLogNativeGeomCacheStats = false;
+static constexpr u32 kNativeGeomStatsLogInterval = 300; // frames between summaries
+// Per-window counters (reset each log interval).
+static u64 s_geomCacheHits = 0;       // draws served from the persistent cache (no expand/upload)
+static u64 s_geomCacheMisses = 0;     // draws that had to expand this frame
+static u64 s_geomCachePromotes = 0;   // expansions promoted into the persistent cache
+static u64 s_geomCacheRingPushes = 0; // expansions that went to the per-frame ring
+static u64 s_geomCacheFull = 0;       // promotions that failed (cache exhausted -> reset)
+static u64 s_geomRunsBatched = 0;     // native strip/prim runs emitted (raw-FIFO handle_draw)
+static u64 s_geomSegmentsBatched = 0; // draw commands folded into those runs
+static u64 s_geomDrawsIndexed = 0;    // draws via GX_AURORA_DRAW_INDEXED (dl::optimize output)
+static u64 s_geomDrawsSingle = 0;     // draws via GX_AURORA_DRAW_SIZED (single native)
+static u32 s_geomStatsLastFrame = 0;
+
+struct NativeGeomKey {
+  u64 fifoHash = 0;
+  u64 metaHash = 0;
+  u32 srcBytes = 0;
+  bool operator==(const NativeGeomKey& o) const noexcept {
+    return fifoHash == o.fifoHash && metaHash == o.metaHash && srcBytes == o.srcBytes;
+  }
+};
+struct NativeGeomKeyHash {
+  size_t operator()(const NativeGeomKey& k) const noexcept {
+    return static_cast<size_t>(k.fifoHash ^ (k.metaHash * 0x9e3779b97f4a7c15ull) ^ k.srcBytes);
+  }
+};
+struct NativeGeomEntry {
+  gfx::Range vertRange;
+  gfx::Range idxRange;
+  u32 indexCount = 0;
+};
+static absl::flat_hash_map<NativeGeomKey, NativeGeomEntry, NativeGeomKeyHash> s_nativeGeomCache;
+// Keys seen but not yet promoted, mapped to the frame they were last seen in. Content is
+// promoted to the persistent cache only once it recurs across frames, which keeps
+// single-shot and per-frame-animated geometry from ever entering the cache.
+static absl::flat_hash_map<NativeGeomKey, u32, NativeGeomKeyHash> s_nativeGeomSeen;
+static u32 s_nativeGeomCacheGen = 0;
+
+// Emit a cache/batching summary every kNativeGeomStatsLogInterval frames. Called once
+// per native draw attempt; the frame-delta guard keeps it to one line per interval.
+static void native_geom_cache_maybe_log_stats() {
+  if constexpr (!kLogNativeGeomCacheStats) {
+    return;
+  }
+  const u32 frame = gfx::current_frame();
+  if (frame == UINT32_MAX || frame - s_geomStatsLastFrame < kNativeGeomStatsLogInterval) {
+    return;
+  }
+  const u32 frames = frame - s_geomStatsLastFrame;
+  s_geomStatsLastFrame = frame;
+  const u64 draws = s_geomCacheHits + s_geomCacheMisses;
+  Log.info(
+      "[geom-cache] {}f: {} draws, {}/{} hit ({:.1f}%), {} promote, {} ring, {} full; "
+      "src {} run/{} indexed/{} sized, batched {}<-{} segs ({:.2f}/run); {} entries",
+      frames, draws, s_geomCacheHits, draws, draws != 0 ? 100.0 * static_cast<double>(s_geomCacheHits) / draws : 0.0,
+      s_geomCachePromotes, s_geomCacheRingPushes, s_geomCacheFull, s_geomRunsBatched, s_geomDrawsIndexed,
+      s_geomDrawsSingle, s_geomRunsBatched, s_geomSegmentsBatched,
+      s_geomRunsBatched != 0 ? static_cast<double>(s_geomSegmentsBatched) / s_geomRunsBatched : 0.0,
+      s_nativeGeomCache.size());
+  // Per-frame staging->GPU upload volume (last completed frame). This is what feeds the libmali
+  // copy worker: ring verts/indices (cache misses), uniforms (every draw, no dedup), and texture
+  // uploads. Cached geometry lives in a persistent buffer and does NOT appear in lastVertSize.
+  const double kib = 1.0 / 1024.0;
+  const u64 uploadTotal = static_cast<u64>(gfx::g_stats.lastVertSize) + gfx::g_stats.lastIndexSize +
+                          gfx::g_stats.lastUniformSize + gfx::g_stats.lastTextureUploadSize +
+                          gfx::g_stats.lastStorageSize;
+  Log.info("[upload] last-frame: vert {:.1f}K, idx {:.1f}K, uni {:.1f}K, tex {:.1f}K, storage {:.1f}K -> total {:.1f}K",
+           gfx::g_stats.lastVertSize * kib, gfx::g_stats.lastIndexSize * kib,
+           gfx::g_stats.lastUniformSize * kib, gfx::g_stats.lastTextureUploadSize * kib,
+           gfx::g_stats.lastStorageSize * kib, static_cast<double>(uploadTotal) * kib);
+  s_geomCacheHits = 0;
+  s_geomCacheMisses = 0;
+  s_geomCachePromotes = 0;
+  s_geomCacheRingPushes = 0;
+  s_geomCacheFull = 0;
+  s_geomRunsBatched = 0;
+  s_geomSegmentsBatched = 0;
+  s_geomDrawsIndexed = 0;
+  s_geomDrawsSingle = 0;
+}
+
+// The persistent cache byte regions are recycled on reset (generation bump), which
+// invalidates every cached (key -> range) mapping. Drop both maps when that happens.
+static void native_geom_sync_generation() {
+  native_geom_cache_maybe_log_stats();
+  const u32 gen = gfx::native_geom_cache_generation();
+  if (gen != s_nativeGeomCacheGen) {
+    s_nativeGeomCacheGen = gen;
+    s_nativeGeomCache.clear();
+    s_nativeGeomSeen.clear();
+  }
+}
+
+// Content hash of an indexed attribute's source array, memoized per (pointer, frame,
+// invalidate gen). Frame-scoped so arrays the game rewrites in place between frames (CPU
+// envelope skinning deforms positions into the same buffers) are re-hashed each frame;
+// GXInvalidateVtxCache handles rewrites within a frame.
+struct ArrayHashMemo {
+  u32 frame = UINT32_MAX;
+  u32 invalGen = UINT32_MAX;
+  u32 size = 0;
+  u64 hash = 0;
+};
+static absl::flat_hash_map<const void*, ArrayHashMemo> s_arrayHashMemo;
+
+static u64 native_array_content_hash(const AttrArray& array) {
+  if (s_arrayHashMemo.size() > 1024) {
+    s_arrayHashMemo.clear();
+  }
+  const u32 frame = gfx::current_frame();
+  auto [it, inserted] = s_arrayHashMemo.try_emplace(array.data);
+  auto& memo = it->second;
+  if (inserted || memo.frame != frame || memo.invalGen != s_gxArrayInvalidateGen || memo.size != array.size) {
+    memo.frame = frame;
+    memo.invalGen = s_gxArrayInvalidateGen;
+    memo.size = array.size;
+    memo.hash = xxh3_hash_s(array.data, array.size);
+  }
+  return memo.hash;
+}
+
+// Fold the decode-relevant layout into the meta hasher: which attrs are present, their
+// formats, and for indexed attrs the referenced array's per-frame content hash. Two draws
+// with equal FIFO bytes and equal meta hash expand to identical native vertices.
+static void native_geom_hash_layout(Hasher& h, const std::vector<NativeAttrDesc>& descs) {
+  for (const auto& d : descs) {
+    h.update(static_cast<u8>(d.attr));
+    h.update(d.attrType);
+    h.update(d.compType);
+    h.update(d.cnt);
+    h.update(d.compSize);
+    h.update(d.frac);
+    h.update(d.arrayStride);
+    h.update(static_cast<u8>(d.le ? 1 : 0));
+    if (d.attrType == GX_INDEX8 || d.attrType == GX_INDEX16) {
+      h.update(native_array_content_hash(g_gxState.arrays[d.attr]));
+    }
+  }
+}
+
+// Resolve the GPU ranges for a freshly expanded batch. On the first cross-frame recurrence
+// of identical content the batch is promoted into the persistent cache; otherwise it goes
+// to the per-frame ring. `cached` reports which buffers the returned ranges address.
+// `idxData`/`idxBytes` may be null/0 for non-indexed (triangle-list) draws.
+static void native_geom_resolve_ranges(const NativeGeomKey& key, const ByteBuffer& vtxBytes, const u8* idxData,
+                                       size_t idxBytes, u32 numIndices, gfx::Range& vertRange, gfx::Range& idxRange,
+                                       bool& cached) {
+  cached = false;
+  if (kNativeGeomCacheEnabled && vtxBytes.size() >= kNativeGeomCacheMinBytes) {
+    const u32 frame = gfx::current_frame();
+    auto [seenIt, inserted] = s_nativeGeomSeen.emplace(key, frame);
+    if (!inserted && seenIt->second != frame) {
+      // Content recurred across frames — promote into the persistent cache.
+      auto [cv, vok] = gfx::push_native_cached_verts(vtxBytes.data(), vtxBytes.size());
+      gfx::Range ci{};
+      bool iok = true;
+      if (idxData != nullptr && idxBytes > 0) {
+        const auto pushed = gfx::push_native_cached_indices(idxData, idxBytes);
+        ci = pushed.first;
+        iok = pushed.second;
+      }
+      if (vok && iok) {
+        vertRange = cv;
+        idxRange = ci;
+        cached = true;
+        s_nativeGeomCache.emplace(key, NativeGeomEntry{.vertRange = cv, .idxRange = ci, .indexCount = numIndices});
+        s_nativeGeomSeen.erase(seenIt);
+        ++s_geomCachePromotes;
+        return;
+      }
+      // Cache exhausted — recycle it at the next frame boundary and use the ring now.
+      ++s_geomCacheFull;
+      gfx::request_native_geometry_cache_reset();
+    } else if (!inserted) {
+      seenIt->second = frame;
+    }
+    if (s_nativeGeomSeen.size() > 16384) {
+      s_nativeGeomSeen.clear();
+    }
+  }
+  // Per-frame ring fallback.
+  ++s_geomCacheRingPushes;
+  vertRange = gfx::push_verts(vtxBytes.data(), vtxBytes.size(), 4);
+  if (idxData != nullptr && idxBytes > 0) {
+    idxRange = gfx::push_indices(idxData, idxBytes, 4);
+  }
+}
+
 static void push_native_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount,
                                 const std::array<AttrConfig, MaxVtxAttr>& nativeAttrs, u8 nativeStride,
-                                gfx::Range vertRange, gfx::Range idxRange, u32 numIndices) {
+                                gfx::Range vertRange, gfx::Range idxRange, u32 numIndices,
+                                bool cachedGeometry = false) {
   PipelineConfig config{};
   populate_pipeline_config(config, prim, fmt); // TEV/color/blend/etc; also fills storage attrs (overwritten below)
   config.shaderConfig.attrs = nativeAttrs;
@@ -2012,10 +2233,12 @@ static void push_native_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount,
       .bindGroups = bindGroups,
       .dstAlpha = g_gxState.dstAlpha,
       .nativeVertexFetch = true,
+      .cachedGeometry = cachedGeometry,
   });
 }
 
-// Expand `vtxCount` raw FIFO vertices and push a native draw.
+// Expand `vtxCount` raw FIFO vertices and push a native draw, serving steady-state
+// geometry from the persistent content-hash cache (no re-expand, no re-upload).
 static bool try_native_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, const u8* data, u32& pos, u32 vtxSize) {
   if (prim != GX_TRIANGLES && prim != GX_TRIANGLESTRIP && prim != GX_TRIANGLEFAN && prim != GX_QUADS) {
     return false;
@@ -2025,9 +2248,34 @@ static bool try_native_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, const 
   if (!build_native_layout(fmt, s_nativeDescs, nativeStride, nativeAttrs)) {
     return false;
   }
+  ++s_geomDrawsSingle;
   const u32 srcBytes = static_cast<u32>(vtxCount) * vtxSize;
 
-  // Expand the vertices into flat native attributes.
+  // Content-hash key: source FIFO bytes + decode layout (+ indexed array contents). A hit
+  // replays the cached GPU ranges without touching the CPU-side vertex data at all.
+  NativeGeomKey key{};
+  if constexpr (kNativeGeomCacheEnabled) {
+    Hasher fifo;
+    fifo.update(data + pos, srcBytes);
+    Hasher meta;
+    meta.update(static_cast<u8>(prim));
+    meta.update(static_cast<u8>(fmt));
+    meta.update(vtxSize);
+    meta.update(vtxCount);
+    native_geom_hash_layout(meta, s_nativeDescs);
+    key = {fifo.digest(), meta.digest(), srcBytes};
+    native_geom_sync_generation();
+    if (const auto it = s_nativeGeomCache.find(key); it != s_nativeGeomCache.end()) {
+      ++s_geomCacheHits;
+      pos += srcBytes;
+      push_native_gx_draw(prim, fmt, vtxCount, nativeAttrs, nativeStride, it->second.vertRange, it->second.idxRange,
+                          it->second.indexCount, /*cachedGeometry=*/true);
+      return true;
+    }
+    ++s_geomCacheMisses;
+  }
+
+  // Miss — expand the run into flat native attributes.
   s_nativeVtxBuf.clear();
   s_nativeVtxBuf.reserve_extra(static_cast<u32>(vtxCount) * nativeStride);
   for (u32 v = 0; v < vtxCount; ++v) {
@@ -2043,25 +2291,50 @@ static bool try_native_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, const 
     numIndices = prepare_idx_buffer(s_nativeIdxBuf, prim, 0, vtxCount);
   }
 
-  const gfx::Range vertRange = gfx::push_verts(s_nativeVtxBuf.data(), s_nativeVtxBuf.size(), 4);
+  gfx::Range vertRange{};
   gfx::Range idxRange{};
-  if (indexed) {
-    idxRange = gfx::push_indices(s_nativeIdxBuf.data(), s_nativeIdxBuf.size(), 4);
-  }
+  bool cached = false;
+  native_geom_resolve_ranges(key, s_nativeVtxBuf, indexed ? s_nativeIdxBuf.data() : nullptr,
+                             indexed ? s_nativeIdxBuf.size() : 0, numIndices, vertRange, idxRange, cached);
   s_nativeIdxBuf.clear();
 
-  push_native_gx_draw(prim, fmt, vtxCount, nativeAttrs, nativeStride, vertRange, idxRange, numIndices);
+  push_native_gx_draw(prim, fmt, vtxCount, nativeAttrs, nativeStride, vertRange, idxRange, numIndices, cached);
   return true;
 }
 
 // Emit ONE GX_AURORA_DRAW_INDEXED normally (no merge): expand the (already deduped) vertices and use
-// the supplied triangle-list indices.
+// the supplied triangle-list indices, both served from the content-hash cache on recurrence.
 static bool native_emit_indexed(GXVtxFmt fmt, u16 vtxCount, const u8* vtxData, u32 vtxSize, const u8* idxData,
                                 u32 idxBytes, u32 indexCount) {
   u8 nativeStride = 0;
   std::array<AttrConfig, MaxVtxAttr> nativeAttrs{};
   if (!build_native_layout(fmt, s_nativeDescs, nativeStride, nativeAttrs)) {
     return false;
+  }
+  const u32 srcBytes = static_cast<u32>(vtxCount) * vtxSize;
+
+  NativeGeomKey key{};
+  if constexpr (kNativeGeomCacheEnabled) {
+    Hasher fifo;
+    fifo.update(vtxData, srcBytes);
+    Hasher meta;
+    meta.update(static_cast<u8>(GX_TRIANGLES));
+    meta.update(static_cast<u8>(fmt));
+    meta.update(vtxSize);
+    meta.update(vtxCount);
+    native_geom_hash_layout(meta, s_nativeDescs);
+    if (idxData != nullptr && idxBytes > 0) {
+      meta.update(idxData, idxBytes); // index buffer is part of the geometry identity
+    }
+    key = {fifo.digest(), meta.digest(), srcBytes};
+    native_geom_sync_generation();
+    if (const auto it = s_nativeGeomCache.find(key); it != s_nativeGeomCache.end()) {
+      ++s_geomCacheHits;
+      push_native_gx_draw(GX_TRIANGLES, fmt, vtxCount, nativeAttrs, nativeStride, it->second.vertRange,
+                          it->second.idxRange, it->second.indexCount, /*cachedGeometry=*/true);
+      return true;
+    }
+    ++s_geomCacheMisses;
   }
 
   s_nativeVtxBuf.clear();
@@ -2070,20 +2343,20 @@ static bool native_emit_indexed(GXVtxFmt fmt, u16 vtxCount, const u8* vtxData, u
     expand_native_vertex(s_nativeDescs, vtxData + static_cast<size_t>(v) * vtxSize, s_nativeVtxBuf);
   }
 
-  const gfx::Range vertRange = gfx::push_verts(s_nativeVtxBuf.data(), s_nativeVtxBuf.size(), 4);
+  gfx::Range vertRange{};
   gfx::Range idxRange{};
-  if (idxData != nullptr && idxBytes > 0) {
-    idxRange = gfx::push_indices(idxData, idxBytes, 4);
-  }
+  bool cached = false;
+  native_geom_resolve_ranges(key, s_nativeVtxBuf, idxData, idxBytes, indexCount, vertRange, idxRange, cached);
 
-  push_native_gx_draw(GX_TRIANGLES, fmt, vtxCount, nativeAttrs, nativeStride, vertRange, idxRange, indexCount);
+  push_native_gx_draw(GX_TRIANGLES, fmt, vtxCount, nativeAttrs, nativeStride, vertRange, idxRange, indexCount, cached);
   return true;
 }
 
 // Native path for GX_AURORA_DRAW_INDEXED: expand the marker's vertices into hardware attributes and
-// emit one native draw.
+// emit one native draw (served from the content-hash cache on recurrence).
 static bool try_native_draw_indexed(GXVtxFmt fmt, u16 vtxCount, const u8* vtxData, u32 vtxSize, const u8* idxData,
                                     u32 idxBytes, u32 indexCount) {
+  ++s_geomDrawsIndexed;
   return native_emit_indexed(fmt, vtxCount, vtxData, vtxSize, idxData, idxBytes, indexCount);
 }
 
@@ -2311,8 +2584,8 @@ void handle_aurora(const u8* data, u32& pos, u32 size, bool bigEndian) {
            static_cast<u32>(prim));
     const u32 idxBytes = indexCount * static_cast<u32>(sizeof(u16));
     CHECK(pos + idxBytes <= size, "GX_AURORA_DRAW_INDEXED index data overrun");
-    // Index data is always host-endian. The native path pushes it itself; the storage
-    // fallback pushes it to the ring below.
+    // Index data is always host-endian. The native path pushes it (to the geometry cache
+    // or the per-frame ring) itself; the storage fallback pushes it to the ring below.
     const u8* idxData = data + pos;
     pos += idxBytes;
     u32 vtxSize;

@@ -186,6 +186,10 @@ extern wgpu::Buffer g_vertexBuffer;
 extern wgpu::Buffer g_uniformBuffer;
 extern wgpu::Buffer g_indexBuffer;
 extern wgpu::Buffer g_storageBuffer;
+// Persistent cache for CPU-expanded native-fetch geometry; survives across frames
+// (unlike the per-frame staging rings above). Created lazily on first use.
+extern wgpu::Buffer g_nativeVertexCacheBuffer;
+extern wgpu::Buffer g_nativeIndexCacheBuffer;
 extern wgpu::BindGroupLayout g_staticBindGroupLayout;
 extern wgpu::BindGroup g_staticBindGroup;
 extern wgpu::BindGroupLayout g_uniformBindGroupLayout;
@@ -278,6 +282,17 @@ template <typename T>
 static Range push_indices(ArrayRef<T> data, size_t alignment) {
   return push_indices(reinterpret_cast<const uint8_t*>(data.data()), data.size() * sizeof(T), alignment);
 }
+// Upload into the persistent native geometry cache buffers. Returns {range, true} on
+// success; {_, false} when the cache is exhausted (caller should fall back to the
+// per-frame ring and request a reset). Ranges are consumed by native-fetch draws with
+// DrawData::cachedGeometry set, which bind these buffers instead of the per-frame rings.
+std::pair<Range, bool> push_native_cached_verts(const uint8_t* data, size_t length);
+std::pair<Range, bool> push_native_cached_indices(const uint8_t* data, size_t length);
+// Deferred reset of the native geometry cache; takes effect at the next begin_frame
+// (safe point: all prior frames referencing cached ranges have been submitted). Bumps
+// the generation counter so CPU-side content maps can drop their now-stale entries.
+void request_native_geometry_cache_reset() noexcept;
+uint32_t native_geom_cache_generation() noexcept;
 Range push_uniform(const uint8_t* data, size_t length);
 template <typename T>
 static Range push_uniform(const T& data) {

@@ -196,6 +196,20 @@ wgpu::Buffer g_vertexBuffer;
 wgpu::Buffer g_uniformBuffer;
 wgpu::Buffer g_indexBuffer;
 wgpu::Buffer g_storageBuffer;
+// Persistent caches for CPU-expanded native-fetch geometry. Separate from the per-frame
+// staging rings so cached ranges can never be clobbered by ring uploads. Filled once per
+// unique mesh (by content hash) and referenced every subsequent frame.
+wgpu::Buffer g_nativeVertexCacheBuffer;
+wgpu::Buffer g_nativeIndexCacheBuffer;
+static constexpr uint64_t NativeGeomVertexCacheSize = 24ull * 1024 * 1024;
+static constexpr uint64_t NativeGeomIndexCacheSize = 4ull * 1024 * 1024;
+// Bump-allocator cursors; on exhaustion the whole cache is reset (deferred to a frame
+// boundary). The generation counter bumps on each reset so CPU-side content maps can
+// drop entries that point at now-recycled ranges.
+static uint32_t s_nativeVertexCacheOffset = 0;
+static uint32_t s_nativeIndexCacheOffset = 0;
+static uint32_t s_nativeGeomCacheGeneration = 0;
+static bool s_nativeGeomCacheResetPending = false;
 enum class BufferMapState {
   Unmapped,
   Mapping,
@@ -1341,6 +1355,8 @@ PipelineRef pipeline_ref(const rmlui::PipelineConfig& config) {
 }
 #endif
 
+static bool ensure_native_geom_cache_buffers();
+
 void initialize() {
   g_frameIndex = 0;
   g_processEventsQueued.store(false, std::memory_order_release);
@@ -1353,6 +1369,10 @@ void initialize() {
     g_presentTimes.clear();
   }
   render_worker::initialize();
+  // Create the native geometry cache buffers before any frame traffic: on GLES, buffer
+  // creation makes Dawn's EGL context current, and doing that from the game thread while
+  // the render worker holds the context can deadlock libmali (Mali-G31).
+  ensure_native_geom_cache_buffers();
   // This appears to take a while and blocks the render thread for periods of time
   // render_worker::set_event_pump([] {
   //   if (g_instance) {
@@ -1528,6 +1548,12 @@ void shutdown() {
   g_uniformBuffer = {};
   g_indexBuffer = {};
   g_storageBuffer = {};
+  g_nativeVertexCacheBuffer = {};
+  g_nativeIndexCacheBuffer = {};
+  s_nativeVertexCacheOffset = 0;
+  s_nativeIndexCacheOffset = 0;
+  s_nativeGeomCacheResetPending = false;
+  ++s_nativeGeomCacheGeneration;
   g_stagingBuffers.fill({});
   for (auto& packet : g_framePackets) {
     packet = {};
@@ -1611,6 +1637,17 @@ bool begin_frame() {
   g_recordingFrame = &frame;
   g_recordingFrameSlot = frameSlot;
   g_passSnapshotPools[frameSlot].used = 0;
+
+  if (s_nativeGeomCacheResetPending) {
+    // Deferred cache reset: every frame that referenced the old cached ranges has already
+    // been submitted, and queue.WriteBuffer is ordered after those submits, so recycling
+    // the cache regions from offset 0 cannot race the GPU's reads of the old contents.
+    // Bump the generation so the CPU-side content maps drop their now-stale entries.
+    s_nativeGeomCacheResetPending = false;
+    s_nativeVertexCacheOffset = 0;
+    s_nativeIndexCacheOffset = 0;
+    ++s_nativeGeomCacheGeneration;
+  }
 
   size_t bufferOffset = 0;
   const auto& stagingBuf = g_stagingBuffers[*stagingSlot];
@@ -2238,6 +2275,69 @@ Range push_indices(const uint8_t* data, size_t length, size_t alignment) {
   }
   return push(current_frame_packet().indices, data, length, alignment);
 }
+
+static bool ensure_native_geom_cache_buffers() {
+  if (g_nativeVertexCacheBuffer && g_nativeIndexCacheBuffer) {
+    return true;
+  }
+  if (!g_device) {
+    return false;
+  }
+  const wgpu::BufferDescriptor vtxDescriptor{
+      .label = "Native Geometry Vertex Cache",
+      .usage = wgpu::BufferUsage::Vertex | wgpu::BufferUsage::CopyDst,
+      .size = NativeGeomVertexCacheSize,
+  };
+  g_nativeVertexCacheBuffer = g_device.CreateBuffer(&vtxDescriptor);
+  const wgpu::BufferDescriptor idxDescriptor{
+      .label = "Native Geometry Index Cache",
+      .usage = wgpu::BufferUsage::Index | wgpu::BufferUsage::CopyDst,
+      .size = NativeGeomIndexCacheSize,
+  };
+  g_nativeIndexCacheBuffer = g_device.CreateBuffer(&idxDescriptor);
+  return g_nativeVertexCacheBuffer && g_nativeIndexCacheBuffer;
+}
+
+// Bump-allocate `length` bytes from a persistent cache buffer and upload the data with a
+// queue write (ordered after prior submits, so it never races a prior frame's reads).
+static std::pair<Range, bool> push_native_cached(const wgpu::Buffer& buffer, uint32_t& cursor, uint64_t limit,
+                                                 const uint8_t* data, size_t length) {
+  const uint32_t offset = static_cast<uint32_t>(AURORA_ALIGN(cursor, 4));
+  const size_t alignedSize = AURORA_ALIGN(length, 4); // WriteBuffer requires a 4-byte-aligned size
+  if (static_cast<uint64_t>(offset) + alignedSize > limit) {
+    return {{}, false};
+  }
+  // The queue write must run on the render worker: on GLES it makes Dawn's EGL context
+  // current, and grabbing that from the game thread while the worker holds it deadlocks
+  // libmali (Mali-G31). The worker queue is FIFO, so the write still lands before the
+  // encode pass that reads this range and after all prior submits. The copy (zero-padded
+  // to the aligned size) keeps the data alive until the worker executes it.
+  std::vector<uint8_t> copy(alignedSize);
+  memcpy(copy.data(), data, length);
+  render_worker::enqueue_work([buffer, offset, copy = std::move(copy)] {
+    g_queue.WriteBuffer(buffer, offset, copy.data(), copy.size());
+  });
+  cursor = offset + static_cast<uint32_t>(alignedSize);
+  return {Range{offset, static_cast<uint32_t>(length)}, true};
+}
+
+std::pair<Range, bool> push_native_cached_verts(const uint8_t* data, size_t length) {
+  if (!ensure_native_geom_cache_buffers()) {
+    return {{}, false};
+  }
+  return push_native_cached(g_nativeVertexCacheBuffer, s_nativeVertexCacheOffset, NativeGeomVertexCacheSize, data,
+                            length);
+}
+
+std::pair<Range, bool> push_native_cached_indices(const uint8_t* data, size_t length) {
+  if (!ensure_native_geom_cache_buffers()) {
+    return {{}, false};
+  }
+  return push_native_cached(g_nativeIndexCacheBuffer, s_nativeIndexCacheOffset, NativeGeomIndexCacheSize, data, length);
+}
+
+void request_native_geometry_cache_reset() noexcept { s_nativeGeomCacheResetPending = true; }
+uint32_t native_geom_cache_generation() noexcept { return s_nativeGeomCacheGeneration; }
 
 Range push_uniform(const uint8_t* data, size_t length) {
   ZoneScoped;
