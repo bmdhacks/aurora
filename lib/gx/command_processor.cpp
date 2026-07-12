@@ -414,13 +414,14 @@ void process(const u8* data, u32 size, bool bigEndian) {
     case CP_CMD_LOAD_INDX_C:
     case CP_CMD_LOAD_INDX_D: {
       ZoneScopedN("LOAD_INDX");
-      // Indexed XF load: 4 bytes of data
+      // Indexed XF load: 4 bytes of data (u16 array index + u16 len/addr), see GDWriteXFIndxACmd.
       CHECK(pos + 4 <= size, "indexed XF read overrun");
-      u32 arrayType = GX_POS_MTX_ARRAY + (opcode - (CP_CMD_LOAD_INDX_A / 0x08));
-      u8 srcArrayIdx = data[pos++];
+      // Opcodes are 0x20/0x28/0x30/0x38 -> POS/NRM/TEX/LIGHT matrix arrays.
+      u32 arrayType = GX_POS_MTX_ARRAY + (opcode - CP_CMD_LOAD_INDX_A) / 0x08;
+      u16 srcArrayIdx = read_u16(data + pos, bigEndian);
       auto const& array = g_gxState.arrays[arrayType];
       u8* srcData = ((u8*)array.data) + srcArrayIdx * array.stride;
-      u16 addrLen = read_u16(data + pos, bigEndian);
+      u16 addrLen = read_u16(data + pos + 2, bigEndian);
       u16 len = (addrLen >> 12) + 1;
       u16 dstAddr = addrLen & 0x0FFF;
       if (!copy_xf_data(dstAddr, srcData, len, bigEndian)) {
