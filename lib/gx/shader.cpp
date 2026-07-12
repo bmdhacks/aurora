@@ -988,9 +988,9 @@ std::string build_shader_source(const ShaderConfig& config) noexcept {
 
   if (config.lineMode == 0) {
     vtxXfrAttrsPre += fmt::format(
-        "\n    let mv_pos = vec4f({}, 1.0) * ubuf.postex_mtx[in_pnmtxidx];"
+        "\n    let mv_pos = vec4f({}, 1.0) * ubuf.{}[in_pnmtxidx];"
         "\n    out.pos = vec4f(mv_pos, 1.0) * ubuf.proj;",
-        vtx_attr(config, GX_VA_POS));
+        vtx_attr(config, GX_VA_POS), "postex_mtx");
   } else if (config.lineMode == 3) {
     // GX_POINTS: expand single vertex to axis-aligned screen-space square
     vtxXfrAttrsPre +=
@@ -1019,10 +1019,12 @@ std::string build_shader_source(const ShaderConfig& config) noexcept {
         "\n    let clip_base = select(clip_a, clip_b, use_b);"
         "\n    out.pos = vec4f(clip_base.xy + offset_ndc * clip_base.w, clip_base.zw);";
   }
-  vtxXfrAttrsPre += fmt::format(
-      "\n    let nrm_tmp = vec4f({}, 0.0) * ubuf.nrm_mtx[in_pnmtxidx];"
-      "\n    let mv_nrm = select(nrm_tmp, normalize(nrm_tmp), dot(nrm_tmp, nrm_tmp) > 1e-10);",
-      vtx_attr(config, GX_VA_NRM));
+  if (info.usesNormals) {
+    vtxXfrAttrsPre += fmt::format(
+        "\n    let nrm_tmp = vec4f({}, 0.0) * ubuf.{}[in_pnmtxidx];"
+        "\n    let mv_nrm = select(nrm_tmp, normalize(nrm_tmp), dot(nrm_tmp, nrm_tmp) > 1e-10);",
+        vtx_attr(config, GX_VA_NRM), "nrm_mtx");
+  }
   if constexpr (EnableNormalVisualization) {
     vtxOutAttrs += fmt::format("\n    @location({}) nrm: vec3f,", vtxOutIdx++);
     vtxXfrAttrsPre += "\n    out.nrm = mv_nrm;";
@@ -1030,7 +1032,9 @@ std::string build_shader_source(const ShaderConfig& config) noexcept {
 
   uniBufAttrs += "\n    proj: mat4x4f,";
   uniBufAttrs += fmt::format("\n    postex_mtx: array<mat3x4f, {}>,", MaxPnMtx + MaxTexMtx);
-  uniBufAttrs += fmt::format("\n    nrm_mtx: array<mat3x4f, {}>,", MaxPnMtx);
+  if (info.usesNormals) {
+    uniBufAttrs += fmt::format("\n    nrm_mtx: array<mat3x4f, {}>,", MaxPnMtx);
+  }
   std::string fragmentFnPre;
   std::string fragmentFn;
 

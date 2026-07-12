@@ -487,6 +487,9 @@ struct ShaderInfo {
   u32 uniformSize = 0;
   bool usesFog : 1 = false;
   bool lightingEnabled : 1 = false;
+  // True iff the shader reads the normal-matrix palette (nrm_mtx): any lit channel, emboss bump,
+  // or the normal-visualization debug path. Gates the 480B nrm_mtx upload for unlit draws.
+  bool usesNormals : 1 = false;
   u8 lineMode : 2 = 0;
 };
 struct BindGroupRanges {
