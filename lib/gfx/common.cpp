@@ -5,6 +5,7 @@
 #include "../internal.hpp"
 #include "../webgpu/gpu.hpp"
 #include "../webgpu/gpu_prof.hpp"
+#include "../webgpu/sdl2shim_present.hpp"
 #include "../gx/pipeline.hpp"
 #ifdef AURORA_ENABLE_RMLUI
 #include "../rmlui/pipeline.hpp"
@@ -1368,6 +1369,12 @@ void initialize() {
     std::lock_guard lock{g_presentStatsMutex};
     g_presentTimes.clear();
   }
+  // The render worker runs on the SDL2-shim EFB path too. The game thread still makes Dawn calls
+  // mid-frame (vertex-cache uploads, texture creation), each taking Dawn's EGL-context mutex, but
+  // the worker can no longer park while holding it: the EFB slot's reverse-fence wait in
+  // sdl2shim_present::acquire() is a client-side wait taken with no context held, so every
+  // worker-side mutex hold is bounded by GPU progress alone and no game-thread call can close a
+  // deadlock cycle against it (the Mali-G31 hang this used to gate on).
   render_worker::initialize();
   // Create the native geometry cache buffers before any frame traffic: on GLES, buffer
   // creation makes Dawn's EGL context current, and doing that from the game thread while
@@ -1507,6 +1514,7 @@ void initialize() {
 }
 
 void shutdown() {
+  webgpu::sdl2shim_present::recycle_pending();
   render_worker::synchronize();
   render_worker::shutdown();
   g_processEventsQueued.store(false, std::memory_order_release);
@@ -1712,6 +1720,10 @@ void end_frame(EndFrameCallback callback) {
   ZoneScoped;
   ASSERT(!g_inOffscreen, "end_frame called while offscreen rendering is active");
   ASSERT(g_currentRenderPass == UINT32_MAX, "end_frame called before finish finalized the current render pass");
+  // Dusklight (P4): present the frame the worker finished while we were decoding this one. Doing it
+  // here rather than at the top of the frame is what preserves the overlap: by now the worker has
+  // had our whole decode to run its Submit, so the wait below is usually near-zero.
+  webgpu::sdl2shim_present::flush_present();
   if (g_cpuFrameStart.time_since_epoch().count() != 0) {
     const auto cpuFrameTime = PresentClock::now() - g_cpuFrameStart;
     update_ema(g_cpuFrameTimeNs, duration_ns(cpuFrameTime));
@@ -1751,6 +1763,9 @@ void end_frame(EndFrameCallback callback) {
 #endif
 
   const size_t stagingSlot = frame.stagingBuffer;
+  // Dusklight (P4): tell the present module a frame is on its way, so the next flush_present()
+  // knows to wait for it. Must precede the enqueue, which is what produces that frame.
+  webgpu::sdl2shim_present::note_frame_enqueued();
   render_worker::enqueue_end_frame(frameId, [frameSlot, stagingSlot, callback = std::move(callback)]() mutable {
     auto& packet = g_framePackets[frameSlot];
     g_stagingBuffers[stagingSlot].Unmap();
@@ -2009,7 +2024,12 @@ static void render(wgpu::CommandEncoder& cmd, FramePacket& frame, RenderPass& pa
 
 void after_submit() noexcept { depth_peek::after_submit(); }
 
-void gpu_synchronize() { render_worker::synchronize(); }
+void gpu_synchronize() {
+  // The worker can be parked waiting for the main thread to release an EFB slot. Nothing else will
+  // release it while we block here, so drop whatever it is holding out to us first.
+  webgpu::sdl2shim_present::recycle_pending();
+  render_worker::synchronize();
+}
 
 void synchronize() { render_worker::synchronize(); }
 

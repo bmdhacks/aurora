@@ -265,6 +265,8 @@ void synchronize() {
 
 bool is_worker_thread() noexcept { return g_workerThreadId == std::this_thread::get_id(); }
 
+bool is_running() noexcept { return g_running.load(std::memory_order_acquire); }
+
 bool is_idle() noexcept { return g_pendingItems.load(std::memory_order_acquire) == 0; }
 
 } // namespace aurora::gfx::render_worker

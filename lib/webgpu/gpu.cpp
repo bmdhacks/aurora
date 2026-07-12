@@ -21,6 +21,7 @@
 #include "../internal.hpp"
 #include "../window.hpp"
 #include "gpu_prof.hpp"
+#include "sdl2shim_present.hpp"
 
 #ifdef WEBGPU_DAWN
 #include "../dawn/BackendBinding.hpp"
@@ -74,9 +75,11 @@ static std::atomic_bool g_initialized = false;
 // our SDL3 "sdl2" shim video driver) owns the EGL display/surface/context. The shim
 // publishes them as SDL window properties; we hand Dawn's GLES adapter a getProc
 // loader bound to that borrowed EGL display via the public RequestAdapterOptionsGetGLProc
-// API.
+// API. Presentation does not go through Dawn: the finished frame is shared as an EFB
+// texture and the main thread blits + swaps it (see sdl2shim_present.cpp).
 constexpr const char* SDL2_SHIM_EGL_DISPLAY_PROP = "SDL.window.sdl2_backend.egl_display";
 constexpr const char* SDL2_SHIM_EGL_SURFACE_PROP = "SDL.window.sdl2_backend.egl_surface";
+constexpr const char* SDL2_SHIM_EGL_CONTEXT_PROP = "SDL.window.sdl2_backend.egl_context";
 constexpr const char* SDL2_SHIM_GL_GET_PROC_PROP = "SDL.window.sdl2_backend.gl_get_proc";
 constexpr const char* SDL2_SHIM_WINDOW_PROP = "SDL.window.sdl2_backend.window";
 
@@ -793,7 +796,8 @@ const TextureWithSampler& resample_present_source(const wgpu::CommandEncoder& en
       .frameWidth = static_cast<float>(width),
       .frameHeight = static_cast<float>(height),
   };
-  ASSERT(gfx::render_worker::is_worker_thread(), "Present resample queue write must run on the render worker");
+  ASSERT(gfx::render_worker::is_worker_thread() || !gfx::render_worker::is_running(),
+         "Present resample queue write must run on the render worker");
   g_queue.WriteBuffer(g_ResampleUniformBuffer, 0, &uniform, sizeof(uniform));
 
   const std::array bindGroupEntries{
@@ -876,6 +880,17 @@ static bool create_surface() {
     return false;
   }
   window::SurfaceLock surfaceLock;
+  if (is_sdl2shim_driver()) {
+    // Borrowed-EGL path: the firmware SDL2 owns the display/surface/context. Dawn binds to the
+    // borrowed EGL display via the adapter proc loader and presents through the EFB path, so we
+    // never create a wgpu::Surface here — g_surface stays null. Bootstrap the shim's GL context so
+    // those handles exist for the adapter and the EFB present module.
+    if (!ensure_sdl2shim_egl_properties(window)) {
+      Log.error("SDL2-shim did not expose EGL display/surface/getProc handles");
+      return false;
+    }
+    return true;
+  }
   const auto chainedDescriptor = utils::SetupWindowAndGetSurfaceDescriptor(window);
   if (!chainedDescriptor) {
     Log.error("Failed to create surface descriptor for current window");
@@ -1173,21 +1188,33 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
   }
   g_queue = g_device.GetQueue();
 
-  const wgpu::Status status = g_surface.GetCapabilities(g_adapter, &g_surfaceCapabilities);
-  if (status != wgpu::Status::Success) {
-    Log.error("Failed to get surface capabilities: {}", magic_enum::enum_name(status));
-    return false;
+  // On the SDL2-shim device path the render worker owns Dawn's context while the main thread presents
+  // (Mali's kmsdrm page-flip is display-thread-bound). The two threads use different EGL contexts and
+  // share the finished frame as an EGLImage allocated as GL_RGBA8, so there is no wgpu::Surface and no
+  // format to negotiate — pin the format the present pass renders.
+  const bool wantEfbPresent = is_sdl2shim_driver();
+  wgpu::TextureFormat surfaceFormat;
+  wgpu::PresentMode presentMode;
+  if (wantEfbPresent) {
+    surfaceFormat = wgpu::TextureFormat::RGBA8Unorm;
+    presentMode = wgpu::PresentMode::Fifo;
+  } else {
+    const wgpu::Status status = g_surface.GetCapabilities(g_adapter, &g_surfaceCapabilities);
+    if (status != wgpu::Status::Success) {
+      Log.error("Failed to get surface capabilities: {}", magic_enum::enum_name(status));
+      return false;
+    }
+    if (g_surfaceCapabilities.formatCount == 0) {
+      Log.error("Surface has no formats");
+      return false;
+    }
+    if (g_surfaceCapabilities.presentModeCount == 0) {
+      Log.error("Surface has no present modes");
+      return false;
+    }
+    surfaceFormat = best_surface_format();
+    presentMode = best_present_mode(g_config.vsync);
   }
-  if (g_surfaceCapabilities.formatCount == 0) {
-    Log.error("Surface has no formats");
-    return false;
-  }
-  if (g_surfaceCapabilities.presentModeCount == 0) {
-    Log.error("Surface has no present modes");
-    return false;
-  }
-  auto surfaceFormat = best_surface_format();
-  auto presentMode = best_present_mode(g_config.vsync);
   Log.info("Using surface format {}, present mode {}", magic_enum::enum_name(surfaceFormat),
            magic_enum::enum_name(presentMode));
   const auto size = window::get_window_size();
@@ -1207,6 +1234,47 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
   create_copy_pipeline();
   create_resample_pipeline();
   gpu_prof::initialize();
+#ifdef WEBGPU_DAWN
+  // Must happen before resize_swapchain: the EFB path never configures Dawn's swapchain, so
+  // SwapChainEGL is never constructed and never touches the borrowed window surface. On the shim
+  // driver this is the *only* present path — if it can't come up we fail loudly rather than fall
+  // back to a swapchain present the worker thread can't scan out on Mali's display-thread-bound flip.
+  if (wantEfbPresent) {
+    // sdl2shim_present::initialize captures whatever EGL context is current on this thread as
+    // the main-thread present context, and Dawn's adapter/device bring-up rebinds EGL on this
+    // thread in between. Re-binding through SDL_GL_MakeCurrent is NOT reliable for this:
+    // SDL short-circuits ("already current") off its own TLS bookkeeping, which Dawn's raw
+    // eglMakeCurrent calls bypass — SDL can believe the bootstrap context is current while the
+    // thread really holds EGL_NO_CONTEXT (G31 first-boot abort, 2026-07-12). Ask EGL, bind
+    // through EGL, and bind the SHIM's published context specifically so we never capture a
+    // Dawn context that happened to be current.
+    SDL_PropertiesID props = SDL_GetWindowProperties(window::get_sdl_window());
+    void* eglDisplay = SDL_GetPointerProperty(props, SDL2_SHIM_EGL_DISPLAY_PROP, nullptr);
+    void* eglSurface = SDL_GetPointerProperty(props, SDL2_SHIM_EGL_SURFACE_PROP, nullptr);
+    void* eglContext = SDL_GetPointerProperty(props, SDL2_SHIM_EGL_CONTEXT_PROP, nullptr);
+    using EglGetCurrentContextFn = void* (*)();
+    using EglMakeCurrentFn = unsigned int (*)(void*, void*, void*, void*);
+    const auto eglGetCurrentContextFn =
+        reinterpret_cast<EglGetCurrentContextFn>(sdl2shim_egl_get_proc("eglGetCurrentContext"));
+    const auto eglMakeCurrentFn = reinterpret_cast<EglMakeCurrentFn>(sdl2shim_egl_get_proc("eglMakeCurrent"));
+    if (eglGetCurrentContextFn != nullptr && eglMakeCurrentFn != nullptr && eglDisplay != nullptr &&
+        eglSurface != nullptr && eglContext != nullptr && eglGetCurrentContextFn() != eglContext) {
+      if (eglMakeCurrentFn(eglDisplay, eglSurface, eglSurface, eglContext) != 0u) {
+        Log.info("SDL2-shim: bound the shim EGL context on the main thread for EFB present init");
+      } else {
+        Log.warn("SDL2-shim: failed to bind the shim EGL context before EFB present init");
+      }
+    }
+    sdl2shim_present::initialize(
+        [](const char* name) -> void* { return reinterpret_cast<void*>(sdl2shim_egl_get_proc(name)); }, eglDisplay,
+        size.native_fb_width, size.native_fb_height, surfaceFormat);
+    if (!sdl2shim_present::active()) {
+      Log.error("SDL2-shim EFB present unavailable; cannot present on this driver. See the preceding "
+                "[sdl2shim-efb] log for the missing EGL/GLES entry point.");
+      return false;
+    }
+  }
+#endif
   resize_swapchain(size.fb_width, size.fb_height, size.native_fb_width, size.native_fb_height, true);
   g_initialized = true;
   return true;
@@ -1215,6 +1283,10 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
 void shutdown() {
   g_initialized = false;
   gfx::gpu_synchronize();
+#ifdef WEBGPU_DAWN
+  // Releases the shared EGLImages and their fences; needs g_device, so it must precede its reset.
+  sdl2shim_present::shutdown();
+#endif
   gpu_prof::shutdown();
   g_CopyBindGroupLayout = {};
   g_CopyPipeline = {};
@@ -1245,7 +1317,14 @@ void release_surface() noexcept {
 
 static void resize_swapchain_internal(uint32_t width, uint32_t height, uint32_t nativeWidth, uint32_t nativeHeight,
                                       bool force) {
-  if (!g_surface || !g_device || width == 0 || height == 0 || nativeHeight == 0 || nativeWidth == 0) {
+#ifdef WEBGPU_DAWN
+  const bool efbPresent = sdl2shim_present::active();
+#else
+  const bool efbPresent = false;
+#endif
+  // On the EFB path there is no wgpu::Surface (g_surface is null), but the device and sizes must
+  // still be valid before we resize the shared present textures.
+  if ((!g_surface && !efbPresent) || !g_device || width == 0 || height == 0 || nativeHeight == 0 || nativeWidth == 0) {
     return;
   }
   const bool sizeChanged = g_graphicsConfig.surfaceConfiguration.width != nativeWidth ||
@@ -1260,9 +1339,16 @@ static void resize_swapchain_internal(uint32_t width, uint32_t height, uint32_t 
   }
   g_graphicsConfig.surfaceConfiguration.width = nativeWidth;
   g_graphicsConfig.surfaceConfiguration.height = nativeHeight;
-  auto surfaceConfiguration = g_graphicsConfig.surfaceConfiguration;
-  surfaceConfiguration.device = g_device;
+#ifdef WEBGPU_DAWN
+  if (efbPresent) {
+    // The EFB path never presents through Dawn, so the surface stays unconfigured (which also keeps
+    // SwapChainEGL, and its thread-affine eglSwapBuffers, out of the picture entirely).
+    sdl2shim_present::resize(nativeWidth, nativeHeight, g_graphicsConfig.surfaceConfiguration.format);
+  } else
+#endif
   {
+    auto surfaceConfiguration = g_graphicsConfig.surfaceConfiguration;
+    surfaceConfiguration.device = g_device;
     window::SurfaceLock surfaceLock;
     g_surface.Configure(&surfaceConfiguration);
   }
