@@ -79,6 +79,7 @@ static std::atomic_bool g_initialized = false;
 // texture and the main thread blits + swaps it (see sdl2shim_present.cpp).
 constexpr const char* SDL2_SHIM_EGL_DISPLAY_PROP = "SDL.window.sdl2_backend.egl_display";
 constexpr const char* SDL2_SHIM_EGL_SURFACE_PROP = "SDL.window.sdl2_backend.egl_surface";
+constexpr const char* SDL2_SHIM_EGL_CONTEXT_PROP = "SDL.window.sdl2_backend.egl_context";
 constexpr const char* SDL2_SHIM_GL_GET_PROC_PROP = "SDL.window.sdl2_backend.gl_get_proc";
 constexpr const char* SDL2_SHIM_WINDOW_PROP = "SDL.window.sdl2_backend.window";
 
@@ -1254,17 +1255,30 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
   // back to a swapchain present the worker thread can't scan out on Mali's display-thread-bound flip.
   if (wantEfbPresent) {
     // sdl2shim_present::initialize captures whatever EGL context is current on this thread as
-    // the main-thread present context. Dawn's adapter/device bring-up makes its own contexts
-    // current in between and does not guarantee the bootstrap context is restored — on a fresh
-    // config the preceding failed-backend window cycle reliably left NO context current (field
-    // crash on fresh installs). Re-bind the bootstrap context deterministically instead of
-    // inheriting whatever survived Dawn init.
-    if (g_sdl2ShimBootstrapContext != nullptr &&
-        !SDL_GL_MakeCurrent(window::get_sdl_window(), g_sdl2ShimBootstrapContext)) {
-      Log.warn("SDL2-shim: failed to re-bind the bootstrap GL context before EFB present init: {}", SDL_GetError());
-    }
+    // the main-thread present context, and Dawn's adapter/device bring-up rebinds EGL on this
+    // thread in between. Re-binding through SDL_GL_MakeCurrent is NOT reliable for this:
+    // SDL short-circuits ("already current") off its own TLS bookkeeping, which Dawn's raw
+    // eglMakeCurrent calls bypass — SDL can believe the bootstrap context is current while the
+    // thread really holds EGL_NO_CONTEXT (G31 first-boot abort, 2026-07-12). Ask EGL, bind
+    // through EGL, and bind the SHIM's published context specifically so we never capture a
+    // Dawn context that happened to be current.
     SDL_PropertiesID props = SDL_GetWindowProperties(window::get_sdl_window());
     void* eglDisplay = SDL_GetPointerProperty(props, SDL2_SHIM_EGL_DISPLAY_PROP, nullptr);
+    void* eglSurface = SDL_GetPointerProperty(props, SDL2_SHIM_EGL_SURFACE_PROP, nullptr);
+    void* eglContext = SDL_GetPointerProperty(props, SDL2_SHIM_EGL_CONTEXT_PROP, nullptr);
+    using EglGetCurrentContextFn = void* (*)();
+    using EglMakeCurrentFn = unsigned int (*)(void*, void*, void*, void*);
+    const auto eglGetCurrentContextFn =
+        reinterpret_cast<EglGetCurrentContextFn>(sdl2shim_egl_get_proc("eglGetCurrentContext"));
+    const auto eglMakeCurrentFn = reinterpret_cast<EglMakeCurrentFn>(sdl2shim_egl_get_proc("eglMakeCurrent"));
+    if (eglGetCurrentContextFn != nullptr && eglMakeCurrentFn != nullptr && eglDisplay != nullptr &&
+        eglSurface != nullptr && eglContext != nullptr && eglGetCurrentContextFn() != eglContext) {
+      if (eglMakeCurrentFn(eglDisplay, eglSurface, eglSurface, eglContext) != 0u) {
+        Log.info("SDL2-shim: bound the shim EGL context on the main thread for EFB present init");
+      } else {
+        Log.warn("SDL2-shim: failed to bind the shim EGL context before EFB present init");
+      }
+    }
     sdl2shim_present::initialize(
         [](const char* name) -> void* { return reinterpret_cast<void*>(sdl2shim_egl_get_proc(name)); }, eglDisplay,
         size.native_fb_width, size.native_fb_height, surfaceFormat);
