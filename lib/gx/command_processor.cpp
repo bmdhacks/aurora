@@ -12,10 +12,13 @@
 #include <absl/container/flat_hash_map.h>
 #include <tracy/Tracy.hpp>
 
+#include <bit>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <optional>
+#include <vector>
 
 namespace aurora::gx::fifo {
 static Module Log("aurora::gx::fifo");
@@ -1554,6 +1557,9 @@ static u32 calculate_last_vtx_size(GXVtxFmt fmt) {
 static void handle_draw_unmerged(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Range vertRange);
 static void push_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Range vertRange, gfx::Range idxRange,
                          u32 numIndices);
+static bool try_native_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, const u8* data, u32& pos, u32 vtxSize);
+static bool try_native_draw_indexed(GXVtxFmt fmt, u16 vtxCount, const u8* vtxData, u32 vtxSize, const u8* idxData,
+                                    u32 idxBytes, u32 indexCount);
 
 // Draw command handler - parses vertices inline and caches results
 static ByteBuffer handle_draw_idx_buf;
@@ -1570,9 +1576,16 @@ static void draw_prim(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, const u8* da
   if (pos + totalVtxBytes > size)
     UNLIKELY { handle_draw_overrun(totalVtxBytes, data, pos, size); }
 
+  // Native vertex fetch expands supported layouts to hardware attributes on the CPU
+  // (advancing pos itself). Unsupported layouts fall through to the storage path.
+  if (try_native_draw(prim, fmt, vtxCount, data, pos, vtxSize)) {
+    return;
+  }
+
   auto* lastDraw = !g_gxState.stateDirty ? gfx::get_last_draw_command<DrawData>() : nullptr;
+  // A storage draw must never merge into a native draw's range (incompatible buffer layout).
   const bool canMerge = lastDraw != nullptr && prim != GX_LINES && prim != GX_LINESTRIP && prim != GX_POINTS &&
-                        lastDraw->instanceCount == 1;
+                        lastDraw->instanceCount == 1 && !lastDraw->nativeVertexFetch;
 
   // Push raw vertex data to buffer. Merged draws must remain byte-contiguous with the previous range.
   gfx::Range vertRange = gfx::push_verts(data + pos, totalVtxBytes, canMerge ? 0 : 4);
@@ -1689,6 +1702,365 @@ static void push_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Rang
       .bindGroups = bindGroups,
       .dstAlpha = g_gxState.dstAlpha,
   });
+}
+
+// ---------------------------------------------------------------------------
+// Native vertex fetch.
+//
+// The storage path software-fetches GX vertices from SSBOs, which (a) miscompiles
+// the per-vertex matrix-palette index into slot 0 on AGX/Mali (the "porcupine")
+// and (b) cannot link on Mali (0 vertex-stage SSBOs). Here we expand each GX vertex
+// on the CPU into real hardware vertex attributes — most importantly pnmtxidx
+// becomes a plain Uint32 attribute, so it never flows through the miscompiled
+// byte-load — and let the fixed-function vertex input path feed the shader.
+// Skinning/projection stay on the GPU. Layouts native fetch can't express fall
+// through to the storage path per-draw (try_native_draw* return false).
+// ---------------------------------------------------------------------------
+
+// Canonical hardware-attribute byte width per GX attr (must match native_vertex_layout).
+static u8 canonical_attr_size(GXAttr attr) noexcept {
+  if (attr == GX_VA_PNMTXIDX || (attr >= GX_VA_TEX0MTXIDX && attr <= GX_VA_TEX7MTXIDX)) {
+    return 4; // Uint32
+  }
+  if (attr == GX_VA_POS || attr == GX_VA_NRM) {
+    return 12; // Float32x3
+  }
+  if (attr == GX_VA_CLR0 || attr == GX_VA_CLR1) {
+    return 4; // Unorm8x4
+  }
+  return 8; // TEXn: Float32x2
+}
+
+static bool native_component_decodable(GXCompType type) noexcept {
+  switch (type) {
+  case GX_U8:
+  case GX_S8:
+  case GX_U16:
+  case GX_S16:
+  case GX_F32:
+    return true;
+  default:
+    return false;
+  }
+}
+
+static bool native_color_decodable(GXCompType type) noexcept {
+  switch (type) {
+  case GX_RGB565:
+  case GX_RGB8:
+  case GX_RGBX8:
+  case GX_RGBA4:
+  case GX_RGBA6:
+  case GX_RGBA8:
+    return true;
+  default:
+    return false;
+  }
+}
+
+static f32 read_component_as_float(const u8* p, GXCompType type, u8 frac, bool bigEndian) noexcept {
+  const f32 scale = 1.0f / static_cast<f32>(1u << frac);
+  switch (type) {
+  case GX_U8:
+    return static_cast<f32>(*p) * scale;
+  case GX_S8:
+    return static_cast<f32>(static_cast<int8_t>(*p)) * scale;
+  case GX_U16:
+    return static_cast<f32>(read_u16(p, bigEndian)) * scale;
+  case GX_S16:
+    return static_cast<f32>(static_cast<int16_t>(read_u16(p, bigEndian))) * scale;
+  case GX_F32:
+    return std::bit_cast<f32>(read_u32(p, bigEndian));
+  default:
+    return 0.0f;
+  }
+}
+
+static u32 expand_bits_to_8(u32 v, u32 bits) noexcept {
+  const u32 shifted = v << (8u - bits);
+  return shifted | (shifted >> bits);
+}
+
+// Decode a GX color to a packed u32 (byte 0 = R, byte 3 = A) for a Unorm8x4 attribute.
+static u32 read_color_as_rgba8(const u8* p, GXCompType type, bool bigEndian) noexcept {
+  const auto pack = [](u32 r, u32 g, u32 b, u32 a) { return r | (g << 8) | (b << 16) | (a << 24); };
+  switch (type) {
+  case GX_RGB8:
+  case GX_RGBX8:
+    return pack(p[0], p[1], p[2], 0xFFu);
+  case GX_RGBA8:
+    return pack(p[0], p[1], p[2], p[3]);
+  case GX_RGB565: {
+    const u16 v = read_u16(p, bigEndian);
+    return pack(expand_bits_to_8((v >> 11) & 0x1Fu, 5), expand_bits_to_8((v >> 5) & 0x3Fu, 6),
+                expand_bits_to_8(v & 0x1Fu, 5), 0xFFu);
+  }
+  case GX_RGBA4: {
+    const u16 v = read_u16(p, bigEndian);
+    return pack(expand_bits_to_8((v >> 12) & 0xFu, 4), expand_bits_to_8((v >> 8) & 0xFu, 4),
+                expand_bits_to_8((v >> 4) & 0xFu, 4), expand_bits_to_8(v & 0xFu, 4));
+  }
+  case GX_RGBA6: {
+    const u32 v = bigEndian ? (u32(p[0]) << 16) | (u32(p[1]) << 8) | u32(p[2])
+                            : (u32(p[2]) << 16) | (u32(p[1]) << 8) | u32(p[0]);
+    return pack(expand_bits_to_8((v >> 18) & 0x3Fu, 6), expand_bits_to_8((v >> 12) & 0x3Fu, 6),
+                expand_bits_to_8((v >> 6) & 0x3Fu, 6), expand_bits_to_8(v & 0x3Fu, 6));
+  }
+  default:
+    return 0xFFFFFFFFu;
+  }
+}
+
+// One present GX attr in a native-expanded vertex: how to read it from the FIFO
+// record / indexed array, and (via canonical order) where it lands in the output.
+struct NativeAttrDesc {
+  GXAttr attr;
+  u8 attrType;  // GX_DIRECT / GX_INDEX8 / GX_INDEX16
+  u8 srcOffset; // byte offset of this attr (direct) or its index (indexed) in the FIFO record
+  u8 compType;  // GXCompType of the source component(s)
+  u8 cnt;       // source component count
+  u8 compSize;  // bytes per source component
+  u8 frac;      // fixed-point fraction bits
+  u8 arrayStride;
+  bool le; // source endianness (direct FIFO = false = big-endian)
+};
+
+// Build the native attribute layout for the current vertex format. Returns false
+// (declines to the storage path) for anything native cannot faithfully express:
+// NBT normals, exotic component types, missing position, >16 attributes, or an
+// indexed attr whose source array is not resident.
+// Diagnostic: flip kLogNativeDecline to true to log (rate-limited) why a layout
+// declined native fetch and fell back to storage. Compile-time so there's no env cruft.
+static constexpr bool kLogNativeDecline = false;
+static bool native_decline(int reason, GXVtxFmt fmt, int attr) {
+  if constexpr (kLogNativeDecline) {
+    static Module Log("aurora::gx");
+    static int counts[8] = {};
+    static const char* const reasons[8] = {"NBT-normal",     "undecodable-type", "nonresident-index-array",
+                                            "non-direct-type", ">16-attrs",       "no-position",
+                                            "?",              "?"};
+    if (reason >= 0 && reason < 8 && counts[reason]++ < 6) {
+      Log.warn("native fetch DECLINED reason={} fmt={} attr={} -> storage fallback (breaks on Mali)",
+               reasons[reason], static_cast<int>(fmt), attr);
+    }
+  }
+  return false;
+}
+
+static bool build_native_layout(GXVtxFmt fmt, std::vector<NativeAttrDesc>& descs, u8& nativeStride,
+                                std::array<AttrConfig, MaxVtxAttr>& nativeAttrs) {
+  const auto& vtxFmt = g_gxState.vtxFmts[fmt];
+  descs.clear();
+  nativeAttrs = {};
+  u8 srcOffset = 0;
+  u8 outOffset = 0;
+  bool hasPos = false;
+  int count = 0;
+  for (int i = GX_VA_PNMTXIDX; i <= GX_VA_TEX7; ++i) {
+    const auto attr = static_cast<GXAttr>(i);
+    const auto type = g_gxState.vtxDesc[i];
+    if (type == GX_NONE) {
+      continue;
+    }
+    const auto& attrFmt = vtxFmt.attrs[i];
+    const auto cnt = comp_cnt_count(attr, attrFmt.cnt);
+    const bool isMtxIdx = attr == GX_VA_PNMTXIDX || (attr >= GX_VA_TEX0MTXIDX && attr <= GX_VA_TEX7MTXIDX);
+    const bool isColor = attr == GX_VA_CLR0 || attr == GX_VA_CLR1;
+    // Native provides only a 3-component normal; NBT/NBT3 (cnt 9) falls back to storage.
+    if (attr == GX_VA_NRM && cnt > 3) {
+      return native_decline(0, fmt, i);
+    }
+    if (!isMtxIdx) {
+      const auto compType = static_cast<GXCompType>(attrFmt.type);
+      if (isColor ? !native_color_decodable(compType) : !native_component_decodable(compType)) {
+        return native_decline(1, fmt, i);
+      }
+    }
+
+    NativeAttrDesc d{};
+    d.attr = attr;
+    d.attrType = static_cast<u8>(type);
+    d.srcOffset = srcOffset;
+    d.compType = static_cast<u8>(attrFmt.type);
+    d.cnt = cnt;
+    d.frac = attrFmt.frac;
+    if (type == GX_DIRECT) {
+      d.le = false;
+      d.compSize = isMtxIdx ? 1 : comp_type_size(attr, attrFmt.type);
+      srcOffset += isMtxIdx ? 1 : static_cast<u8>(comp_type_size(attr, attrFmt.type) * cnt);
+    } else if (type == GX_INDEX8 || type == GX_INDEX16) {
+      const auto& array = g_gxState.arrays[i];
+      if (array.data == nullptr || array.size == 0 || array.stride == 0) {
+        return native_decline(2, fmt, i);
+      }
+      d.le = array.le;
+      d.arrayStride = array.stride;
+      d.compSize = comp_type_size(attr, attrFmt.type);
+      srcOffset += (type == GX_INDEX8) ? 1 : 2;
+    } else {
+      return native_decline(3, fmt, i);
+    }
+
+    auto& na = nativeAttrs[i];
+    na.attrType = GX_DIRECT;
+    na.offset = outOffset;
+    na.cnt = isMtxIdx ? 1 : (isColor ? 1 : (attr == GX_VA_POS || attr == GX_VA_NRM ? 3 : 2));
+    na.compType = static_cast<u8>(attrFmt.type);
+    outOffset += canonical_attr_size(attr);
+    descs.push_back(d);
+    if (attr == GX_VA_POS) {
+      hasPos = true;
+    }
+    if (++count > 16) {
+      return native_decline(4, fmt, i);
+    }
+  }
+  if (!hasPos) {
+    return native_decline(5, fmt, GX_VA_POS);
+  }
+  nativeStride = outOffset;
+  return true;
+}
+
+// Expand one GX vertex (FIFO record at `rec`) into hardware attributes.
+static void expand_native_vertex(const std::vector<NativeAttrDesc>& descs, const u8* rec, ByteBuffer& out) {
+  for (const auto& d : descs) {
+    const u8* p;
+    if (d.attrType == GX_DIRECT) {
+      p = rec + d.srcOffset;
+    } else {
+      u32 index = d.attrType == GX_INDEX8 ? u32(*(rec + d.srcOffset)) : u32(read_u16(rec + d.srcOffset, true));
+      const auto& array = g_gxState.arrays[d.attr];
+      const u32 maxIndex = d.arrayStride != 0 ? static_cast<u32>(array.size) / d.arrayStride : 0u;
+      if (index >= maxIndex) {
+        index = 0; // guard against malformed indices; valid content never hits this
+      }
+      p = static_cast<const u8*>(array.data) + static_cast<size_t>(index) * d.arrayStride;
+    }
+    const bool be = !d.le;
+    const auto attr = d.attr;
+    const auto compType = static_cast<GXCompType>(d.compType);
+    if (attr == GX_VA_PNMTXIDX) {
+      out.append<u32>(u32(*p) / 3u); // /3: GX counts matrix rows; shader indexes postex_mtx[in_pnmtxidx] directly
+    } else if (attr >= GX_VA_TEX0MTXIDX && attr <= GX_VA_TEX7MTXIDX) {
+      out.append<u32>(u32(*p)); // raw; shader divides by 3
+    } else if (attr == GX_VA_POS || attr == GX_VA_NRM) {
+      for (int c = 0; c < 3; ++c) {
+        out.append<f32>(c < d.cnt ? read_component_as_float(p + c * d.compSize, compType, d.frac, be) : 0.0f);
+      }
+    } else if (attr == GX_VA_CLR0 || attr == GX_VA_CLR1) {
+      out.append<u32>(read_color_as_rgba8(p, compType, be));
+    } else { // TEXn
+      for (int c = 0; c < 2; ++c) {
+        out.append<f32>(c < d.cnt ? read_component_as_float(p + c * d.compSize, compType, d.frac, be) : 0.0f);
+      }
+    }
+  }
+}
+
+static ByteBuffer s_nativeVtxBuf;
+static ByteBuffer s_nativeIdxBuf;
+static std::vector<NativeAttrDesc> s_nativeDescs;
+
+static void push_native_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount,
+                                const std::array<AttrConfig, MaxVtxAttr>& nativeAttrs, u8 nativeStride,
+                                gfx::Range vertRange, gfx::Range idxRange, u32 numIndices) {
+  PipelineConfig config{};
+  populate_pipeline_config(config, prim, fmt); // TEV/color/blend/etc; also fills storage attrs (overwritten below)
+  config.shaderConfig.attrs = nativeAttrs;
+  config.shaderConfig.vtxStride = nativeStride;
+  config.shaderConfig.nativeVertexFetch = 1;
+
+  const auto info = build_shader_info(config.shaderConfig);
+  resolve_sampled_textures(info);
+  const auto bindGroups = build_bind_groups(info);
+  const auto pipeline = gfx::pipeline_ref(config);
+
+  BindGroupRanges ranges{}; // native resolves indexed attrs on the CPU — no array uploads
+  gfx::push_draw_command(DrawData{
+      .pipeline = pipeline,
+      .vertRange = vertRange,
+      .idxRange = idxRange,
+      .uniformRange = build_uniform(info, vertRange.offset, ranges),
+      .vtxCount = vtxCount,
+      .indexCount = numIndices,
+      .instanceCount = 1,
+      .bindGroups = bindGroups,
+      .dstAlpha = g_gxState.dstAlpha,
+      .nativeVertexFetch = true,
+  });
+}
+
+// Expand `vtxCount` raw FIFO vertices and push a native draw.
+static bool try_native_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, const u8* data, u32& pos, u32 vtxSize) {
+  if (prim != GX_TRIANGLES && prim != GX_TRIANGLESTRIP && prim != GX_TRIANGLEFAN && prim != GX_QUADS) {
+    return false;
+  }
+  u8 nativeStride = 0;
+  std::array<AttrConfig, MaxVtxAttr> nativeAttrs{};
+  if (!build_native_layout(fmt, s_nativeDescs, nativeStride, nativeAttrs)) {
+    return false;
+  }
+  const u32 srcBytes = static_cast<u32>(vtxCount) * vtxSize;
+
+  // Expand the vertices into flat native attributes.
+  s_nativeVtxBuf.clear();
+  s_nativeVtxBuf.reserve_extra(static_cast<u32>(vtxCount) * nativeStride);
+  for (u32 v = 0; v < vtxCount; ++v) {
+    expand_native_vertex(s_nativeDescs, data + pos + static_cast<size_t>(v) * vtxSize, s_nativeVtxBuf);
+  }
+  pos += srcBytes;
+
+  // Strips/fans/quads get a generated index buffer; plain triangle lists draw non-indexed.
+  const bool indexed = prim != GX_TRIANGLES;
+  u32 numIndices = 0;
+  s_nativeIdxBuf.clear();
+  if (indexed) {
+    numIndices = prepare_idx_buffer(s_nativeIdxBuf, prim, 0, vtxCount);
+  }
+
+  const gfx::Range vertRange = gfx::push_verts(s_nativeVtxBuf.data(), s_nativeVtxBuf.size(), 4);
+  gfx::Range idxRange{};
+  if (indexed) {
+    idxRange = gfx::push_indices(s_nativeIdxBuf.data(), s_nativeIdxBuf.size(), 4);
+  }
+  s_nativeIdxBuf.clear();
+
+  push_native_gx_draw(prim, fmt, vtxCount, nativeAttrs, nativeStride, vertRange, idxRange, numIndices);
+  return true;
+}
+
+// Emit ONE GX_AURORA_DRAW_INDEXED normally (no merge): expand the (already deduped) vertices and use
+// the supplied triangle-list indices.
+static bool native_emit_indexed(GXVtxFmt fmt, u16 vtxCount, const u8* vtxData, u32 vtxSize, const u8* idxData,
+                                u32 idxBytes, u32 indexCount) {
+  u8 nativeStride = 0;
+  std::array<AttrConfig, MaxVtxAttr> nativeAttrs{};
+  if (!build_native_layout(fmt, s_nativeDescs, nativeStride, nativeAttrs)) {
+    return false;
+  }
+
+  s_nativeVtxBuf.clear();
+  s_nativeVtxBuf.reserve_extra(static_cast<u32>(vtxCount) * nativeStride);
+  for (u32 v = 0; v < vtxCount; ++v) {
+    expand_native_vertex(s_nativeDescs, vtxData + static_cast<size_t>(v) * vtxSize, s_nativeVtxBuf);
+  }
+
+  const gfx::Range vertRange = gfx::push_verts(s_nativeVtxBuf.data(), s_nativeVtxBuf.size(), 4);
+  gfx::Range idxRange{};
+  if (idxData != nullptr && idxBytes > 0) {
+    idxRange = gfx::push_indices(idxData, idxBytes, 4);
+  }
+
+  push_native_gx_draw(GX_TRIANGLES, fmt, vtxCount, nativeAttrs, nativeStride, vertRange, idxRange, indexCount);
+  return true;
+}
+
+// Native path for GX_AURORA_DRAW_INDEXED: expand the marker's vertices into hardware attributes and
+// emit one native draw.
+static bool try_native_draw_indexed(GXVtxFmt fmt, u16 vtxCount, const u8* vtxData, u32 vtxSize, const u8* idxData,
+                                    u32 idxBytes, u32 indexCount) {
+  return native_emit_indexed(fmt, vtxCount, vtxData, vtxSize, idxData, idxBytes, indexCount);
 }
 
 std::string read_string(const u8* data, u32& pos, u32 size, bool bigEndian) {
@@ -1915,8 +2287,9 @@ void handle_aurora(const u8* data, u32& pos, u32 size, bool bigEndian) {
            static_cast<u32>(prim));
     const u32 idxBytes = indexCount * static_cast<u32>(sizeof(u16));
     CHECK(pos + idxBytes <= size, "GX_AURORA_DRAW_INDEXED index data overrun");
-    // Index data is always host-endian; push it to the GPU buffer as-is
-    const gfx::Range idxRange = gfx::push_indices(data + pos, idxBytes, 4);
+    // Index data is always host-endian. The native path pushes it itself; the storage
+    // fallback pushes it to the ring below.
+    const u8* idxData = data + pos;
     pos += idxBytes;
     u32 vtxSize;
     if (g_gxState.lastVtxFmt == fmt) {
@@ -1926,10 +2299,14 @@ void handle_aurora(const u8* data, u32& pos, u32 size, bool bigEndian) {
     }
     const u32 totalVtxBytes = vtxCount * vtxSize;
     CHECK(pos + totalVtxBytes <= size, "GX_AURORA_DRAW_INDEXED vertex data overrun");
-    const gfx::Range vertRange = gfx::push_verts(data + pos, totalVtxBytes, 4);
+    const u8* vtxData = data + pos;
     pos += totalVtxBytes;
     if (indexCount != 0) {
-      push_gx_draw(prim, fmt, vtxCount, vertRange, idxRange, indexCount);
+      if (!try_native_draw_indexed(fmt, vtxCount, vtxData, vtxSize, idxData, idxBytes, indexCount)) {
+        const gfx::Range idxRange = gfx::push_indices(idxData, idxBytes, 4);
+        const gfx::Range vertRange = gfx::push_verts(vtxData, totalVtxBytes, 4);
+        push_gx_draw(prim, fmt, vtxCount, vertRange, idxRange, indexCount);
+      }
     }
   } else if (subCmd == GX_AURORA_DEBUG_GROUP_PUSH) {
     auto label = read_string(data, pos, size, bigEndian);

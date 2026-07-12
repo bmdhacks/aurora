@@ -14,9 +14,12 @@ struct DrawData {
   uint32_t instanceCount;
   GXBindGroups bindGroups;
   uint32_t dstAlpha;
+  // When true, bind vertRange as a hardware vertex buffer (slot 0) instead of
+  // relying on the group-0 storage buffers. Set by the native-fetch draw path.
+  bool nativeVertexFetch = false;
 };
 
-constexpr uint32_t GXPipelineConfigVersion = 13;
+constexpr uint32_t GXPipelineConfigVersion = 14;
 struct PipelineConfig {
   uint32_t version = GXPipelineConfigVersion;
   uint32_t msaaSamples = 1;

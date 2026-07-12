@@ -450,7 +450,12 @@ struct ShaderConfig {
   u8 fogType = GX_FOG_NONE;
   u8 vtxStride = 0;
   u8 lineMode : 2 = 0; // 1 = GX_LINES, 2 = GX_LINESTRIP, 3 = GX_POINTS
-  u8 pad1 : 6 = 0;
+  // When set, vertices arrive as real hardware vertex attributes (CPU-expanded)
+  // rather than software-fetched from the vbuf/abuf SSBOs. Fixes the matrix-palette
+  // "porcupine" (pnmtxidx no longer flows through the miscompiled storage byte-load)
+  // and is the only vertex-fetch path that links on Mali (0 vertex SSBOs).
+  u8 nativeVertexFetch : 1 = 0;
+  u8 pad1 : 5 = 0;
   u8 pad2 = 0;
   std::array<AttrConfig, MaxVtxAttr> attrs;
   std::array<TevSwap, MaxTevSwap> tevSwapTable;

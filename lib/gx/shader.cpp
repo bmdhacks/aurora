@@ -956,10 +956,39 @@ std::string build_shader_source(const ShaderConfig& config) noexcept {
     vtxXfrAttrsPre += "\n    let in_pnmtxidx = ubuf.current_pnmtx;";
   }
 
+  // Native vertex fetch: present attrs arrive as real @location inputs (CPU-expanded)
+  // rather than being software-fetched from vbuf. This attribute order MUST match
+  // native_vertex_layout() (pipeline.cpp) and build_native_layout()
+  // (command_processor.cpp) — canonical GX attr order, one @location per present attr.
+  if (config.nativeVertexFetch) {
+    u32 location = 0;
+    const auto addNativeInput = [&](GXAttr attr, std::string_view type) {
+      if (config.attrs[attr].attrType == GX_NONE) {
+        return;
+      }
+      vtxInAttrs += fmt::format(",\n    @location({}) {}: {}", location++, vtx_attr(config, attr), type);
+    };
+    addNativeInput(GX_VA_PNMTXIDX, "u32");
+    for (GXAttr attr = GX_VA_TEX0MTXIDX; attr <= GX_VA_TEX7MTXIDX; attr = static_cast<GXAttr>(attr + 1)) {
+      addNativeInput(attr, "u32");
+    }
+    addNativeInput(GX_VA_POS, "vec3f");
+    addNativeInput(GX_VA_NRM, "vec3f");
+    addNativeInput(GX_VA_CLR0, "vec4f");
+    addNativeInput(GX_VA_CLR1, "vec4f");
+    for (GXAttr attr = GX_VA_TEX0; attr <= GX_VA_TEX7; attr = static_cast<GXAttr>(attr + 1)) {
+      addNativeInput(attr, "vec2f");
+    }
+  }
+
   // Load vertex attributes
   for (GXAttr attr = GX_VA_PNMTXIDX; attr <= GX_VA_TEX7; attr = static_cast<GXAttr>(attr + 1)) {
     const auto attrType = config.attrs[attr].attrType;
     if (attrType == GX_NONE) {
+      continue;
+    }
+    // Native inputs are already bound by name (in_pos, in_pnmtxidx, ...) — no software load.
+    if (config.nativeVertexFetch) {
       continue;
     }
     // in_pnmtxidx and in_pos written above for line mode
