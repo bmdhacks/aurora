@@ -108,7 +108,11 @@ endif ()
 # A prebuilt ("package") or system Dawn is unpatched and will not render on Mali (no persistent-mapped
 # buffers, no GL state/FBO caches). Fail loudly rather than silently shipping the slow/broken path —
 # note that AURORA_DAWN_PROVIDER=auto resolves to "package" whenever a prebuilt is available.
-if (DAWN_ENABLE_OPENGLES AND NOT _aurora_dawn_provider STREQUAL "vendor")
+# Do NOT test DAWN_ENABLE_OPENGLES here: it only enters the cache later (from Dawn's own build or
+# _aurora_dawn_set_platform_backends), so in a fresh build dir it is unset when this guard runs and
+# auto→package sails through, failing much later on the patched-API compile. Infer the platform the
+# same way _aurora_dawn_set_platform_backends does: every non-Windows/non-Apple target builds GLES.
+if (NOT WIN32 AND NOT APPLE AND NOT _aurora_dawn_provider STREQUAL "vendor")
   message(FATAL_ERROR
     "aurora: the OpenGLES backend needs the Dawn GL patch stack (cmake/patches/dawn/), which can only "
     "be applied to a from-source build. Set -DAURORA_DAWN_PROVIDER=vendor (got '${_aurora_dawn_provider}').")
