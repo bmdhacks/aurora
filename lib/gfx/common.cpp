@@ -264,6 +264,7 @@ struct RenderPass {
   bool clearDepth = true;
   bool hasDepth = true;
   bool hasStencil = false;
+  bool depthReadOnly = false;
   bool hasDraws = false;
   bool discardable = false;
   bool captureDepthSnapshot = false;
@@ -749,6 +750,7 @@ void begin_color_pass(const ColorPassDescriptor& desc) {
       .clearDepth = desc.depthLoadOp == wgpu::LoadOp::Clear,
       .hasDepth = desc.hasDepth,
       .hasStencil = desc.hasStencil,
+      .depthReadOnly = desc.depthReadOnly,
   };
   pass.commands.reserve(128);
   frame.renderPasses.emplace_back(std::move(pass));
@@ -1959,6 +1961,7 @@ static void render(wgpu::CommandEncoder& cmd, FramePacket& frame, RenderPass& pa
                                          : wgpu::LoadOp::Undefined,
         .depthStoreOp = passInfo.hasDepth ? passInfo.depthStoreOp : wgpu::StoreOp::Undefined,
         .depthClearValue = passInfo.clearDepthValue,
+        .depthReadOnly = passInfo.depthReadOnly,
         .stencilLoadOp = passInfo.hasStencil ? passInfo.stencilLoadOp : wgpu::LoadOp::Undefined,
         .stencilStoreOp = passInfo.hasStencil ? passInfo.stencilStoreOp : wgpu::StoreOp::Undefined,
         .stencilClearValue = passInfo.stencilClearValue,

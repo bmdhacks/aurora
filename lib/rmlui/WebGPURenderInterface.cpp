@@ -693,6 +693,7 @@ void WebGPURenderInterface::BeginRenderTargetPass(const wgpu::TextureView& view,
       .colorLoadOp = loadOp,
       .colorStoreOp = wgpu::StoreOp::Store,
       .clearColor = {0.f, 0.f, 0.f, 0.f},
+      .depthReadOnly = clearStencil,
       .hasStencil = clearStencil,
       .stencilLoadOp = clearStencil ? wgpu::LoadOp::Clear : wgpu::LoadOp::Undefined,
       .stencilStoreOp = clearStencil ? wgpu::StoreOp::Store : wgpu::StoreOp::Undefined,
@@ -720,6 +721,7 @@ void WebGPURenderInterface::BeginLayerPass(Rml::LayerHandle layer, wgpu::LoadOp 
       .colorLoadOp = loadOp,
       .colorStoreOp = wgpu::StoreOp::Store,
       .clearColor = {0.f, 0.f, 0.f, 0.f},
+      .depthReadOnly = true,
       .hasStencil = true,
       .stencilLoadOp = clearStencil ? wgpu::LoadOp::Clear : wgpu::LoadOp::Load,
       .stencilStoreOp = wgpu::StoreOp::Store,
@@ -1578,7 +1580,8 @@ wgpu::TextureView WebGPURenderInterface::GetClipMaskStencilView(const wgpu::Exte
       .label = "RmlUi Clip Mask Stencil View",
       .format = ClipMaskStencilFormat,
       .dimension = wgpu::TextureViewDimension::e2D,
-      .aspect = wgpu::TextureAspect::StencilOnly,
+      // Render attachment of a combined format must expose all aspects, not stencil-only.
+      .aspect = wgpu::TextureAspect::All,
   };
   m_clipMaskStencilView = m_clipMaskStencilTexture.CreateView(&viewDesc);
   return m_clipMaskStencilView;

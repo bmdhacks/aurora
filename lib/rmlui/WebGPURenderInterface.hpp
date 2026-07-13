@@ -68,7 +68,10 @@ enum class BaseLayerContent {
 
 class WebGPURenderInterface : public Rml::RenderInterface {
 public:
-  static constexpr wgpu::TextureFormat ClipMaskStencilFormat = wgpu::TextureFormat::Stencil8;
+  // Combined depth-stencil rather than standalone Stencil8: a stencil-only texture maps to
+  // GL_STENCIL_INDEX8, which needs GL_OES_texture_stencil8 (ES 3.2) and is absent on older GLES
+  // blobs (e.g. some PowerVR). GL_DEPTH24_STENCIL8 is core ES 3.0. The depth aspect goes unused.
+  static constexpr wgpu::TextureFormat ClipMaskStencilFormat = wgpu::TextureFormat::Depth24PlusStencil8;
 
   enum class PipelineType {
     Normal,

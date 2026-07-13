@@ -806,6 +806,10 @@ wgpu::RenderPipeline create_pipeline(const PipelineConfig& config) {
     };
     depthStencilState = {
         .format = stencilFormat,
+        // Combined depth-stencil format: the depth aspect is present but unused, so disable depth
+        // writes and always-pass the depth test. Matches the depth-read-only clip-mask passes.
+        .depthWriteEnabled = false,
+        .depthCompare = wgpu::CompareFunction::Always,
         .stencilFront = face,
         .stencilBack = face,
         .stencilReadMask = 0xFF,

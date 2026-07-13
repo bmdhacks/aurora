@@ -251,6 +251,9 @@ struct ColorPassDescriptor {
   wgpu::LoadOp depthLoadOp = wgpu::LoadOp::Undefined;
   wgpu::StoreOp depthStoreOp = wgpu::StoreOp::Undefined;
   float depthClearValue = 0.f;
+  // Combined depth-stencil attachment whose depth aspect is present but unused (stencil-only passes
+  // on a packed format). Marks the depth aspect read-only so no load/store op is required.
+  bool depthReadOnly = false;
   bool hasStencil = false;
   wgpu::LoadOp stencilLoadOp = wgpu::LoadOp::Undefined;
   wgpu::StoreOp stencilStoreOp = wgpu::StoreOp::Undefined;
