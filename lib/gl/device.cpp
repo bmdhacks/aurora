@@ -13,15 +13,22 @@
 
 #include "../webgpu/gpu.hpp"
 
+#include "../gfx/render_worker.hpp"
 #include "../internal.hpp"
 #include "../window.hpp"
 #include "context.hpp"
+#include "fbo_cache.hpp"
 #include "gl_core.hpp"
+#include "state.hpp"
+#include "textures.hpp"
 
 #include <aurora/gfx.h>
 #include <SDL3/SDL_video.h>
 
+#include <cmath>
+#include <cstdio>
 #include <cstring>
+#include <vector>
 
 namespace aurora::webgpu {
 namespace {
@@ -71,6 +78,15 @@ bool g_bcTexturesSupported = false;
 bool g_astcTexturesSupported = false;
 bool g_textureComponentSwizzleSupported = false;
 uint32_t g_uniformBufferOffsetAlignment = 256;
+// True once the EFB color/depth render targets exist. Until then resize_swapchain only
+// records the surface size; gfx::initialize brings the worker online and creates them.
+static bool g_targetsInitialized = false;
+// The default framebuffer / window drawable size in pixels (SDL_GetWindowSizeInPixels).
+// This is the *present* destination and is distinct from surfaceConfiguration, which holds the
+// (possibly internalResolutionScale-downscaled) EFB render size -- e.g. 1216x896 drawable vs a
+// 608x448 EFB at scale 0.5. present_frame must blit into the native size, not the render size.
+static uint32_t g_presentWidth = 0;
+static uint32_t g_presentHeight = 0;
 
 bool initialize(AuroraBackend backend, bool allowCpu) {
   (void)allowCpu;
@@ -105,6 +121,8 @@ bool initialize(AuroraBackend backend, bool allowCpu) {
   g_graphicsConfig.surfaceConfiguration.format = gl::TextureFormat::RGBA8Unorm;
   g_graphicsConfig.surfaceConfiguration.width = size.fb_width;
   g_graphicsConfig.surfaceConfiguration.height = size.fb_height;
+  g_presentWidth = size.native_fb_width;
+  g_presentHeight = size.native_fb_height;
   g_graphicsConfig.depthFormat = gl::TextureFormat::Depth32Float;
   g_graphicsConfig.msaaSamples = 1;
 
@@ -116,9 +134,11 @@ bool initialize(AuroraBackend backend, bool allowCpu) {
 }
 
 void shutdown() {
+  // The render targets are GL objects owned by the context; destroy_contexts frees them.
   g_frameBuffer = {};
   g_frameBufferResolved = {};
   g_depthBuffer = {};
+  g_targetsInitialized = false;
   gl::destroy_contexts();
   g_sdlWindow = nullptr;
 }
@@ -130,25 +150,101 @@ bool refresh_surface(bool recreate) {
   return true;
 }
 
-void resize_swapchain(uint32_t width, uint32_t height, uint32_t nativeWidth, uint32_t nativeHeight, bool force) {
-  (void)nativeWidth;
-  (void)nativeHeight;
-  (void)force;
+TextureWithSampler create_render_texture(uint32_t width, uint32_t height, bool multisampled) {
+  // GL objects must be created with the render context current. If we are called off the
+  // worker while it is running (e.g. RmlUi's ensure_render_target on the recording thread,
+  // Phase 5 territory), return an empty handle rather than issuing GL on a context-less
+  // thread -- the caller keeps its Phase-1 behavior until that path moves to the worker.
+  if (gfx::render_worker::is_running() && !gfx::render_worker::is_worker_thread()) {
+    return {};
+  }
+  (void)multisampled; // MSAA > 1 is out of scope (config clamps to 1); single-sample only.
+  const gl::Extent3D size{width, height, 1};
+  const auto format = g_graphicsConfig.surfaceConfiguration.format;
+  gl::Texture texture = gl::create_texture(format, size, 1, /*renderable=*/true);
+  gl::SamplerDescriptor samplerDesc{};
+  samplerDesc.magFilter = gl::FilterMode::Linear;
+  samplerDesc.minFilter = gl::FilterMode::Linear;
+  gl::Sampler sampler = gl::create_sampler(samplerDesc, g_graphicsConfig.textureAnisotropy > 0);
+  return TextureWithSampler{
+      .texture = texture,
+      .view = texture, // WebGPU's separate view collapses into the texture on GL
+      .size = size,
+      .format = format,
+      .sampler = sampler,
+  };
+}
+
+static TextureWithSampler create_depth_texture(uint32_t width, uint32_t height) {
+  const gl::Extent3D size{width, height, 1};
+  const auto format = g_graphicsConfig.depthFormat;
+  gl::Texture texture = gl::create_texture(format, size, 1, /*renderable=*/true);
+  return TextureWithSampler{
+      .texture = texture,
+      .view = texture,
+      .size = size,
+      .format = format,
+  };
+}
+
+static void destroy_render_targets() {
+  // Requires the context current. FBO cache entries reference these attachments; drop
+  // them first so a recycled texture name can't alias a stale FBO.
+  gl::clear_framebuffer_cache();
+  for (TextureWithSampler* t : {&g_frameBuffer, &g_frameBufferResolved, &g_depthBuffer}) {
+    gl::destroy_texture(t->texture);
+    gl::destroy_sampler(t->sampler);
+    *t = {};
+  }
+}
+
+// (Re)create the EFB color + depth targets at the configured surface size. Must run on
+// the render worker (context current): gfx::initialize calls it once the worker is up,
+// and resize_swapchain marshals it here on later window resizes.
+void create_frame_targets() {
+  const uint32_t width = g_graphicsConfig.surfaceConfiguration.width;
+  const uint32_t height = g_graphicsConfig.surfaceConfiguration.height;
   if (width == 0 || height == 0) {
     return;
   }
-  g_graphicsConfig.surfaceConfiguration.width = width;
-  g_graphicsConfig.surfaceConfiguration.height = height;
-  // Phase 2 recreates g_frameBuffer/g_depthBuffer render targets here (on the worker).
+  destroy_render_targets();
+  g_frameBuffer = create_render_texture(width, height, g_graphicsConfig.msaaSamples > 1);
+  if (g_graphicsConfig.msaaSamples > 1) {
+    g_frameBufferResolved = create_render_texture(width, height, false);
+  }
+  g_depthBuffer = create_depth_texture(width, height);
+  g_targetsInitialized = true;
+  Log.info("[gl] render targets {}x{} (color RGBA8, depth {})", width, height,
+           static_cast<int>(g_graphicsConfig.depthFormat));
 }
 
-TextureWithSampler create_render_texture(uint32_t width, uint32_t height, bool multisampled) {
-  // Phase 2: create the offscreen EFB color/depth targets. Phase 1 presents a
-  // cleared default framebuffer, so there is no render target yet.
-  (void)width;
-  (void)height;
-  (void)multisampled;
-  return {};
+void resize_swapchain(uint32_t width, uint32_t height, uint32_t nativeWidth, uint32_t nativeHeight, bool force) {
+  if (width == 0 || height == 0) {
+    return;
+  }
+  if (nativeWidth > 0 && nativeHeight > 0) {
+    g_presentWidth = nativeWidth;
+    g_presentHeight = nativeHeight;
+  }
+  const bool sizeChanged =
+      g_graphicsConfig.surfaceConfiguration.width != width || g_graphicsConfig.surfaceConfiguration.height != height;
+  g_graphicsConfig.surfaceConfiguration.width = width;
+  g_graphicsConfig.surfaceConfiguration.height = height;
+
+  // The first creation is gfx::initialize's job (it owns the worker-online moment). Early
+  // window-init resize calls arrive before the worker exists; just record the size.
+  if (!g_targetsInitialized) {
+    return;
+  }
+  if (!force && !sizeChanged) {
+    return;
+  }
+  if (gfx::render_worker::is_worker_thread()) {
+    create_frame_targets();
+  } else {
+    gfx::render_worker::enqueue_work([] { create_frame_targets(); });
+    gfx::render_worker::synchronize();
+  }
 }
 
 const TextureWithSampler& present_source() noexcept {
@@ -187,14 +283,78 @@ Viewport calculate_present_viewport(uint32_t surface_width, uint32_t surface_hei
   };
 }
 
+// Read the window's default-framebuffer back buffer and write it as a binary PPM. Must run
+// on the render worker (context current), before SDL_GL_SwapWindow makes the back buffer
+// undefined. This is the Phase-2 DoD headless A/B tool (Phase 5 wires it to F12 / console).
+void screenshot(const char* path) noexcept {
+  const uint32_t w = g_presentWidth > 0 ? g_presentWidth : g_graphicsConfig.surfaceConfiguration.width;
+  const uint32_t h = g_presentHeight > 0 ? g_presentHeight : g_graphicsConfig.surfaceConfiguration.height;
+  if (w == 0 || h == 0) {
+    return;
+  }
+  gl::gl.BindFramebuffer(gl::GL_READ_FRAMEBUFFER, 0);
+  gl::gl.ReadBuffer(gl::GL_BACK);
+  gl::gl.PixelStorei(gl::GL_PACK_ALIGNMENT, 1);
+  std::vector<uint8_t> pixels(static_cast<size_t>(w) * h * 4);
+  gl::gl.ReadPixels(0, 0, static_cast<gl::GLsizei>(w), static_cast<gl::GLsizei>(h), gl::GL_RGBA, gl::GL_UNSIGNED_BYTE,
+                    pixels.data());
+  gl::reset_state_cache();
+
+  std::FILE* f = std::fopen(path, "wb");
+  if (f == nullptr) {
+    Log.warn("[gl] screenshot: cannot open {}", path);
+    return;
+  }
+  std::fprintf(f, "P6\n%u %u\n255\n", w, h);
+  // GL is bottom-left origin; PPM is top-left. Flip rows and drop the alpha channel.
+  std::vector<uint8_t> row(static_cast<size_t>(w) * 3);
+  for (uint32_t y = 0; y < h; ++y) {
+    const uint8_t* src = pixels.data() + static_cast<size_t>(h - 1 - y) * w * 4;
+    for (uint32_t x = 0; x < w; ++x) {
+      row[x * 3 + 0] = src[x * 4 + 0];
+      row[x * 3 + 1] = src[x * 4 + 1];
+      row[x * 3 + 2] = src[x * 4 + 2];
+    }
+    std::fwrite(row.data(), 1, row.size(), f);
+  }
+  std::fclose(f);
+  Log.info("[gl] screenshot written: {} ({}x{})", path, w, h);
+}
+
 void present_frame() noexcept {
-  // Runs on the render worker (owns the GL context). Phase 1: clear the window's
-  // default framebuffer to black and swap. Phase 2 blits the EFB/present source
-  // here; Phase 6 hands the frame to the EFB present module on the device path.
+  // Runs on the render worker (owns the GL context). Desktop present: clear the window's
+  // default framebuffer to black (letterbox bars) and blit the finished color target into
+  // the centered content rect with a linear filter. No Y-flip -- both the source EFB and
+  // the default framebuffer are GL bottom-left origin (S1c). Phase 6 replaces this with the
+  // SDL2-shim EFB slot hand-off on the device path.
   gl::gl.BindFramebuffer(gl::GL_FRAMEBUFFER, 0);
   gl::gl.Disable(gl::GL_SCISSOR_TEST);
+  gl::gl.ColorMask(gl::GL_TRUE, gl::GL_TRUE, gl::GL_TRUE, gl::GL_TRUE);
   gl::gl.ClearColor(0.f, 0.f, 0.f, 1.f);
-  gl::gl.Clear(gl::GL_COLOR_BUFFER_BIT | gl::GL_DEPTH_BUFFER_BIT);
+  gl::gl.Clear(gl::GL_COLOR_BUFFER_BIT);
+
+  const auto& source = present_source();
+  // Destination is the window drawable (native pixel size), NOT the EFB render size.
+  const uint32_t surfaceWidth = g_presentWidth > 0 ? g_presentWidth : g_graphicsConfig.surfaceConfiguration.width;
+  const uint32_t surfaceHeight = g_presentHeight > 0 ? g_presentHeight : g_graphicsConfig.surfaceConfiguration.height;
+  if (source.texture.id != 0 && surfaceWidth > 0 && surfaceHeight > 0) {
+    const auto viewport = calculate_present_viewport(surfaceWidth, surfaceHeight, source.size.width, source.size.height);
+    const gl::GLuint readFbo = gl::get_framebuffer(source.texture);
+    gl::gl.BindFramebuffer(gl::GL_READ_FRAMEBUFFER, readFbo);
+    gl::gl.BindFramebuffer(gl::GL_DRAW_FRAMEBUFFER, 0);
+    const auto dstX0 = static_cast<gl::GLint>(viewport.left);
+    const auto dstY0 = static_cast<gl::GLint>(viewport.top);
+    const auto dstX1 = dstX0 + static_cast<gl::GLint>(viewport.width);
+    const auto dstY1 = dstY0 + static_cast<gl::GLint>(viewport.height);
+    gl::gl.BlitFramebuffer(0, 0, static_cast<gl::GLint>(source.size.width), static_cast<gl::GLint>(source.size.height),
+                           dstX0, dstY0, dstX1, dstY1, gl::GL_COLOR_BUFFER_BIT, gl::GL_LINEAR);
+    gl::gl.BindFramebuffer(gl::GL_FRAMEBUFFER, 0);
+  }
+
+  // The clear + blit touched GL (framebuffer binds, scissor, color mask) outside the
+  // state cache; forget the shadow so the next frame's first pass re-issues everything.
+  gl::reset_state_cache();
+
   if (g_sdlWindow != nullptr) {
     SDL_GL_SwapWindow(g_sdlWindow);
   }

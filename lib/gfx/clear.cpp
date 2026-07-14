@@ -1,5 +1,6 @@
 #include "clear.hpp"
 
+#include "../gl/program.hpp"
 #include "../webgpu/gpu.hpp"
 #include "tracy/Tracy.hpp"
 
@@ -18,11 +19,35 @@ gl::ColorWriteMask clear_write_mask(bool clearColor, bool clearAlpha) {
   }
   return writeMask;
 }
+
+// The clear "pipeline" is a fullscreen triangle whose fragment always writes 1.0;
+// the blend state (src = Constant, dst = Zero) turns that into "write the blend
+// constant" and the write mask restricts it to the requested channels. Every clear
+// config shares this one program -- only the baked fixed-function state differs --
+// so it is compiled once on the render worker (S2/S8: attribute-less, no z remap).
+gl::GLuint s_clearProgram = 0;
+
+constexpr char kVertexSource[] = R"(#version 300 es
+void main() {
+  const vec2 positions[3] = vec2[3](vec2(-1.0, 1.0), vec2(-1.0, -3.0), vec2(3.0, 1.0));
+  gl_Position = vec4(positions[gl_VertexID], 0.0, 1.0);
+}
+)";
+
+constexpr char kFragmentSource[] = R"(#version 300 es
+precision highp float;
+out vec4 fragColor;
+void main() { fragColor = vec4(1.0); }
+)";
 } // namespace
 
-// The clear "pipeline" is a fullscreen triangle that writes the blend-constant
-// color (Phase 2 ports the GLSL). Here we bake only the fixed-function state;
-// `program` stays 0 until Phase 2 compiles the shader on the render worker.
+// Called on the render worker during gfx::initialize (context current). Idempotent.
+void init_program() {
+  if (s_clearProgram == 0) {
+    s_clearProgram = gl::compile_program(kVertexSource, kFragmentSource, "EFB Clear");
+  }
+}
+
 gl::Pipeline create_pipeline(const PipelineConfig& config) {
   ZoneScoped;
   gl::BakedState state{};
@@ -40,8 +65,10 @@ gl::Pipeline create_pipeline(const PipelineConfig& config) {
   state.depthCompare = gl::CompareFunction::Always;
   state.cull = gl::CullMode::None;
   state.topology = gl::PrimitiveTopology::TriangleList;
+  // create_pipeline can run off the worker (pipeline cache / recording thread), so it
+  // issues no GL: it references the program init_program() compiled on the worker.
   return gl::Pipeline{
-      .program = 0,
+      .program = s_clearProgram,
       .state = state,
       .vertexLayout = 0,
   };

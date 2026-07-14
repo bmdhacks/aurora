@@ -59,9 +59,11 @@ public:
 private:
   PassTarget m_target;
 
-  // Draw state assembled across Set* calls and consumed by Draw/DrawIndexed
-  // (filled out in Phase 3). Minimal in Phase 1.
-  const Pipeline* m_pipeline = nullptr;
+  // Draw state assembled across Set* calls and consumed by Draw/DrawIndexed. The
+  // pipeline is stored by value: bind_pipeline() hands us a local gl::Pipeline that
+  // would dangle otherwise, and Draw needs its baked topology/restart flag.
+  Pipeline m_pipeline{};
+  bool m_hasPipeline = false;
   Buffer m_vertexBuffer{};
   uint64_t m_vertexOffset = 0;
   Buffer m_indexBuffer{};

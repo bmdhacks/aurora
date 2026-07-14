@@ -20,6 +20,9 @@ struct PipelineConfig {
 };
 static_assert(std::has_unique_object_representations_v<PipelineConfig>);
 
+// Compile the shared clear program. Must run on the render worker (context current);
+// gfx::initialize calls it before any pipeline is built. Idempotent.
+void init_program();
 gl::Pipeline create_pipeline(const PipelineConfig& config);
 void render(const DrawData& data, gl::PassEncoder& pass, const gl::Extent3D& targetSize);
 } // namespace aurora::gfx::clear

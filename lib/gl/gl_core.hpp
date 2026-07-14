@@ -191,6 +191,10 @@ inline constexpr GLenum GL_FRAMEBUFFER_COMPLETE = 0x8CD5;
 inline constexpr GLbitfield GL_COLOR_BUFFER_BIT = 0x00004000;
 inline constexpr GLbitfield GL_DEPTH_BUFFER_BIT = 0x00000100;
 inline constexpr GLbitfield GL_STENCIL_BUFFER_BIT = 0x00000400;
+// Aspect selectors for glClearBuffer{fv,fi} (distinct from the *_ATTACHMENT enums).
+inline constexpr GLenum GL_COLOR = 0x1800;
+inline constexpr GLenum GL_DEPTH = 0x1801;
+inline constexpr GLenum GL_STENCIL = 0x1802;
 
 // Blend factors / equations
 inline constexpr GLenum GL_ZERO = 0;

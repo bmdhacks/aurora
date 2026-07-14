@@ -4,6 +4,8 @@
 #include "depth_peek.hpp"
 #include "../internal.hpp"
 #include "../gl/context.hpp"
+#include "../gl/fbo_cache.hpp"
+#include "../gl/state.hpp"
 #include "../webgpu/gpu.hpp"
 #include "../webgpu/gpu_prof.hpp"
 #include "../webgpu/sdl2shim_present.hpp"
@@ -20,6 +22,7 @@
 #include "../window.hpp"
 #include "../gx/fifo.hpp"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -1219,20 +1222,26 @@ void initialize() {
   // device.cpp created it and released it on the main thread; bind it on the worker now
   // (runs inline on this thread in the single-threaded fallback -- either way the thread
   // that will execute GL work is the one that holds the context). Every GL call after this
-  // -- buffer/texture creation, draws, present -- happens on the worker.
-  render_worker::enqueue_work([] { gl::make_render_current(); });
+  // -- buffer/texture creation, draws, present -- happens on the worker. Create the shared
+  // per-frame ring buffers, the persistent native-geometry cache, the clear program, and
+  // the EFB render targets here, all with the context freshly current.
+  render_worker::enqueue_work([] {
+    gl::make_render_current();
+    g_vertexBuffer = gl::create_buffer(gl::GL_ARRAY_BUFFER, VertexBufferSize, true);
+    g_uniformBuffer = gl::create_buffer(gl::GL_UNIFORM_BUFFER, UniformBufferSize, true);
+    g_indexBuffer = gl::create_buffer(gl::GL_ELEMENT_ARRAY_BUFFER, IndexBufferSize, true);
+    // The storage-fetch path is dead (native vertex fetch only); no g_storageBuffer.
+    g_nativeVertexCacheBuffer = gl::create_buffer(gl::GL_ARRAY_BUFFER, NativeGeomVertexCacheSize, true);
+    g_nativeIndexCacheBuffer = gl::create_buffer(gl::GL_ELEMENT_ARRAY_BUFFER, NativeGeomIndexCacheSize, true);
+    clear::init_program();
+    webgpu::create_frame_targets();
+  });
   render_worker::synchronize();
 
   depth_peek::initialize();
   tex_copy_conv::initialize();
   tex_palette_conv::initialize();
   texture_replacement::initialize();
-
-  // Phase 1: the shared vertex/uniform/index GL buffers and the native-geometry cache are
-  // created in Phase 2 (frame skeleton). Draw submission is stubbed, so per-frame data is
-  // collected in owned ByteBuffers and never uploaded; the WebGPU static/uniform bind
-  // groups are gone (native shaders don't use group 0, and the uniform buffer binds with a
-  // dynamic offset via glBindBufferRange at draw time).
 
   gx::initialize();
 #ifdef AURORA_ENABLE_RMLUI
@@ -1495,10 +1504,46 @@ static void expire_cached_bind_groups() {
   }
 }
 
-// Phase 2 uploads the op's high-water buffer ranges to the GL ring buffers here with
-// glBufferSubData on the worker (the WebGPU staging-buffer + CopyBufferToBuffer path is
-// gone). Phase 1 has no GL ring buffers and stubs draws, so there is nothing to upload.
+// Upload the dirty per-frame buffer ranges and pending texture uploads this op needs,
+// with glBufferSubData / glTexSubImage2D on the render worker (the WebGPU staging-buffer +
+// CopyBuffer path is gone). Incremental: only the bytes/uploads added since the previous
+// op's high-water are pushed, tracked in frame.copied.
+static void upload_op_data(FramePacket& frame, const FrameOp& op) {
+  const auto& hw = op.highWater;
+  auto& done = frame.copied;
+  const auto upload_range = [](const gl::Buffer& buffer, const ByteBuffer& src, uint32_t from, uint32_t to) {
+    if (buffer.id == 0 || to <= from) {
+      return;
+    }
+    if (to > buffer.size) {
+      Log.warn("upload range end {} exceeds buffer size {}; clamping", to, buffer.size);
+      to = static_cast<uint32_t>(buffer.size);
+      if (to <= from) {
+        return;
+      }
+    }
+    gl::upload_buffer(buffer, from, src.data() + from, to - from);
+  };
+  upload_range(g_vertexBuffer, frame.verts, done.verts, hw.verts);
+  upload_range(g_uniformBuffer, frame.uniforms, done.uniforms, hw.uniforms);
+  upload_range(g_indexBuffer, frame.indices, done.indices, hw.indices);
+  done.verts = std::max(done.verts, hw.verts);
+  done.uniforms = std::max(done.uniforms, hw.uniforms);
+  done.indices = std::max(done.indices, hw.indices);
+
+  for (size_t i = done.textureUploadCount; i < hw.textureUploadCount && i < frame.textureUploads.size(); ++i) {
+    const auto& up = frame.textureUploads[i];
+    if (up.tex.id == 0) {
+      continue;
+    }
+    const uint8_t* srcData = up.data != nullptr ? up.data : frame.textureUpload.data() + up.range.offset;
+    gl::upload_texture(up.tex, up.level, up.origin, up.size, srcData, up.bytesPerRow);
+  }
+  done.textureUploadCount = std::max(done.textureUploadCount, hw.textureUploadCount);
+}
+
 static void encode_op(FramePacket& frame, const FrameOp& op) {
+  upload_op_data(frame, op);
   switch (op.type) {
   case FrameOpType::RenderPass:
     if (op.renderPass != nullptr) {
@@ -1522,19 +1567,67 @@ static void render(FramePacket& frame, RenderPass& passInfo, uint32_t passIndex)
   if (!passInfo.sealed || passInfo.discardable) {
     return;
   }
-  // Phase 2 binds the pass FBO (fbo_cache), applies S7 load ops (glClearBuffer / load),
-  // replays the command list against a gl::PassEncoder, applies store ops
-  // (glInvalidateFramebuffer), then the EFB resolve/snapshot copies + palette conversions
-  // (Phase 4). Phase 1 walks the command stream through an inert PassEncoder so the
-  // record/replay machinery stays exercised; no GL is emitted, and resolve/snapshot/palette
-  // paths are skipped (their targets are stubbed empty).
+  // Offscreen / EFB-copy targets are created by the Phase 4 copy machinery; their
+  // attachments are still empty here, so a pass without a real color attachment has
+  // nothing to render into yet. The main EFB pass always has one (g_frameBuffer).
+  if (passInfo.colorView.id == 0) {
+    return;
+  }
+
+  const bool hasDepth = passInfo.hasDepth && passInfo.depthStencilView.id != 0;
+  const gl::GLuint fbo = gl::get_framebuffer(passInfo.colorView, hasDepth ? &passInfo.depthStencilView : nullptr);
+  gl::gl.BindFramebuffer(gl::GL_FRAMEBUFFER, fbo);
+
+  // Load ops (S7). A WebGPU LoadOp::Clear clears the whole render area regardless of the
+  // scissor, so disable the scissor test and force full write masks around the clears, then
+  // re-enable scissor for the draws.
+  gl::gl.Disable(gl::GL_SCISSOR_TEST);
+  if (passInfo.clearColor) {
+    gl::gl.ColorMask(gl::GL_TRUE, gl::GL_TRUE, gl::GL_TRUE, gl::GL_TRUE);
+    const gl::GLfloat clearColor[4]{passInfo.clearColorValue.x(), passInfo.clearColorValue.y(),
+                                    passInfo.clearColorValue.z(), passInfo.clearColorValue.w()};
+    gl::gl.ClearBufferfv(gl::GL_COLOR, 0, clearColor);
+  }
+  if (hasDepth && passInfo.clearDepth) {
+    gl::gl.DepthMask(gl::GL_TRUE);
+    if (passInfo.hasStencil) {
+      gl::gl.ClearBufferfi(gl::GL_DEPTH_STENCIL, 0, passInfo.clearDepthValue,
+                           static_cast<gl::GLint>(passInfo.stencilClearValue));
+    } else {
+      const gl::GLfloat clearDepth = passInfo.clearDepthValue;
+      gl::gl.ClearBufferfv(gl::GL_DEPTH, 0, &clearDepth);
+    }
+  }
+  gl::gl.Enable(gl::GL_SCISSOR_TEST);
+
+  // The raw clears desynced color/depth mask + scissor from the state-cache shadow; reset it
+  // so the first replayed draw re-issues its full baked pipeline state.
+  gl::reset_state_cache();
+
   gl::PassEncoder pass{gl::PassTarget{
-      .fbo = 0,
+      .fbo = fbo,
       .width = passInfo.targetSize.width,
       .height = passInfo.targetSize.height,
   }};
   render_pass(pass, frame, passInfo);
   pass.End();
+
+  // Store ops (S7): discard attachments explicitly marked StoreOp::Discard. On a tiler this
+  // is a large depth/color bandwidth win, but only sound when the attachment is genuinely not
+  // loaded again -- so it fires solely on an explicit Discard (never inferred). The EFB copy
+  // machinery (Phase 4) sets Discard on the frame's terminal pass.
+  std::array<gl::GLenum, 2> invalidate{};
+  gl::GLsizei invalidateCount = 0;
+  if (passInfo.colorStoreOp == gl::StoreOp::Discard) {
+    invalidate[invalidateCount++] = gl::GL_COLOR_ATTACHMENT0;
+  }
+  if (hasDepth && passInfo.depthStoreOp == gl::StoreOp::Discard) {
+    invalidate[invalidateCount++] = passInfo.hasStencil ? gl::GL_DEPTH_STENCIL_ATTACHMENT : gl::GL_DEPTH_ATTACHMENT;
+  }
+  if (invalidateCount > 0 && gl::gl.InvalidateFramebuffer != nullptr) {
+    gl::gl.InvalidateFramebuffer(gl::GL_FRAMEBUFFER, invalidateCount, invalidate.data());
+  }
+  // Phase 4: EFB resolve / snapshot copies + palette conversions for this pass.
 }
 
 void after_submit() noexcept { depth_peek::after_submit(); }
@@ -1804,9 +1897,9 @@ Range push_indices(const uint8_t* data, size_t length, size_t alignment) {
 }
 
 static bool ensure_native_geom_cache_buffers() {
-  // Phase 2 creates the persistent native-geometry GL cache buffers here (gl::create_buffer,
-  // on the worker). Phase 1 returns false so push_native_cached_* falls back to the per-frame
-  // ByteBuffer ring -- correct behavior, just without the cross-frame geometry cache.
+  // The persistent native-geometry GL cache buffers are created on the worker in
+  // initialize(). If they exist, push_native_cached_* uploads into them; otherwise the
+  // caller falls back to the per-frame ring (e.g. the single-threaded pre-init window).
   return g_nativeVertexCacheBuffer && g_nativeIndexCacheBuffer;
 }
 

@@ -74,6 +74,10 @@ void shutdown();
 void release_surface() noexcept;
 bool refresh_surface(bool recreate = true);
 void resize_swapchain(uint32_t width, uint32_t height, uint32_t nativeWidth, uint32_t nativeHeight, bool force = false);
+// (Re)create the EFB color + depth render targets at the configured surface size. Must be
+// called on the render worker (context current); gfx::initialize invokes it once the
+// worker owns the context, resize_swapchain marshals it here on later resizes.
+void create_frame_targets();
 TextureWithSampler create_render_texture(uint32_t width, uint32_t height, bool multisampled);
 const TextureWithSampler& present_source() noexcept;
 void set_resampler(AuroraSampler sampler) noexcept;
@@ -81,8 +85,12 @@ AuroraSampler get_resampler() noexcept;
 Viewport calculate_present_viewport(uint32_t surface_width, uint32_t surface_height, uint32_t content_width,
                                     uint32_t content_height) noexcept;
 // Present the finished frame. Runs on the render worker (owns the GL context).
-// Phase 1: binds the default framebuffer, clears to black and swaps -- the EFB /
-// swapchain blit + UI overlay come back in Phases 2/5/6.
+// Binds the default framebuffer, clears to black (letterbox bars) and blits the finished
+// EFB into the centered content rect, then swaps. Device EFB present is Phase 6.
 void present_frame() noexcept;
+// Read the window's default-framebuffer back buffer and write it as a binary PPM (the
+// desktop A/B screenshot tool). Must run on the render worker before the swap. Phase 5
+// wires it to an F12 key / console command.
+void screenshot(const char* path) noexcept;
 
 } // namespace aurora::webgpu
