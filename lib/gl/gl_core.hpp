@@ -69,7 +69,8 @@ inline constexpr GLenum GL_MAX_SAMPLES = 0x8D57;
 inline constexpr GLenum GL_UNIFORM_BUFFER_OFFSET_ALIGNMENT = 0x8A34;
 inline constexpr GLenum GL_MAX_UNIFORM_BLOCK_SIZE = 0x8A30;
 inline constexpr GLenum GL_MAX_VERTEX_ATTRIBS = 0x8869;
-inline constexpr GLenum GL_MAX_TEXTURE_MAX_ANISOTROPY_EXT = 0x84FF;
+inline constexpr GLenum GL_MAX_TEXTURE_MAX_ANISOTROPY_EXT = 0x84FF; // getIntegerv limit
+inline constexpr GLenum GL_TEXTURE_MAX_ANISOTROPY_EXT = 0x84FE;     // per-sampler param
 
 // Capabilities (glEnable/glDisable)
 inline constexpr GLenum GL_BLEND = 0x0BE2;
@@ -165,6 +166,17 @@ inline constexpr GLint GL_R32UI = 0x8236;
 inline constexpr GLint GL_DEPTH_COMPONENT24 = 0x81A6;
 inline constexpr GLint GL_DEPTH_COMPONENT32F = 0x8CAC;
 inline constexpr GLint GL_DEPTH24_STENCIL8 = 0x88F0;
+// Compressed internalformats (replacement packs only; extension-gated at upload).
+// S3TC/RGTC/BPTC are desktop/BC packs; ETC2 is ES 3.0 core; ASTC is KHR_texture_compression_astc_ldr.
+inline constexpr GLenum GL_COMPRESSED_RGBA_S3TC_DXT1_EXT = 0x83F1; // BC1
+inline constexpr GLenum GL_COMPRESSED_RGBA_S3TC_DXT5_EXT = 0x83F3; // BC3
+inline constexpr GLenum GL_COMPRESSED_RED_RGTC1_EXT = 0x8DBB;      // BC4
+inline constexpr GLenum GL_COMPRESSED_RG_RGTC2_EXT = 0x8DBD;       // BC5
+inline constexpr GLenum GL_COMPRESSED_RGBA_BPTC_UNORM_EXT = 0x8E8C; // BC7
+inline constexpr GLenum GL_COMPRESSED_RGB8_ETC2 = 0x9274;
+inline constexpr GLenum GL_COMPRESSED_RGBA8_ETC2_EAC = 0x9278;
+inline constexpr GLenum GL_COMPRESSED_RGBA_ASTC_4x4_KHR = 0x93B0;
+inline constexpr GLenum GL_COMPRESSED_RGBA_ASTC_8x8_KHR = 0x93B7;
 
 // Framebuffers / renderbuffers
 inline constexpr GLenum GL_FRAMEBUFFER = 0x8D40;
