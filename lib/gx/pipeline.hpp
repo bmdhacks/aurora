@@ -45,8 +45,8 @@ struct PipelineConfig {
 };
 static_assert(std::has_unique_object_representations_v<PipelineConfig>);
 
-wgpu::RenderPipeline create_pipeline([[maybe_unused]] const PipelineConfig& config);
-void render(const DrawData& data, const wgpu::RenderPassEncoder& pass);
+gl::Pipeline create_pipeline([[maybe_unused]] const PipelineConfig& config);
+void render(const DrawData& data, gl::PassEncoder& pass);
 
 void queue_surface(const u8* dlStart, uint32_t dlSize, bool bigEndian) noexcept;
 } // namespace aurora::gx

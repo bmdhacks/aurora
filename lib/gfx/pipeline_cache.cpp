@@ -34,7 +34,7 @@ constexpr const char* InitialPipelineCacheName = "initial_pipeline_cache.db";
 constexpr const char* SdlVfsName = "aurora_pipeline_cache_sdl_vfs";
 
 struct CachedPipeline {
-  wgpu::RenderPipeline pipeline;
+  gl::Pipeline pipeline;
   uint32_t firstFrameUsed = UINT32_MAX;
 };
 
@@ -432,8 +432,9 @@ static std::optional<PendingPipeline> take_pending_pipeline(PipelineRef hash) {
 static void notify_pipeline_ready(bool queued) {
   ++createdPipelines;
   if (queued && --queuedPipelines == 0 && g_gpuCachePrunePending.exchange(false, std::memory_order_acq_rel)) {
-    // Prune GPU cache entries after fully loading the pipeline cache.
-    webgpu::cache_prune();
+    // The Dawn GPU blob cache (gpu_cache.cpp) is deleted in the GL backend — the
+    // driver's own on-disk shader cache does warm boots (Normalcy rule 2), so there
+    // is nothing to prune here. pipeline_cache.db (pipeline *configs*) is untouched.
   }
   g_pipelineReadyCv.notify_all();
 }
@@ -1193,7 +1194,7 @@ void initialize_pipeline_cache() {
   g_pipelineThreadEnd = false;
   g_gpuCachePrunePending = false;
 
-  if (webgpu::g_backendType == wgpu::BackendType::WebGPU) {
+  if (webgpu::g_backendType == BACKEND_WEBGPU) {
     g_hasPipelineThread = false;
   } else {
     g_hasPipelineThread = true;
@@ -1245,7 +1246,7 @@ void end_pipeline_frame() {
   }
 }
 
-bool get_pipeline(PipelineRef ref, wgpu::RenderPipeline& pipeline) {
+bool get_pipeline(PipelineRef ref, gl::Pipeline& pipeline) {
   std::lock_guard guard{g_pipelineMutex};
   const auto it = g_pipelines.find(ref);
   if (it == g_pipelines.end()) {

@@ -296,8 +296,10 @@ bool create_window(AuroraBackend backend) {
     flags |= SDL_WINDOW_FULLSCREEN;
   }
 #endif
-#if defined(AURORA_ENABLE_GX) && defined(DAWN_ENABLE_BACKEND_OPENGL)
-  if (sdl2ShimDriver && (backend == BACKEND_OPENGL || backend == BACKEND_OPENGLES)) {
+#ifdef AURORA_ENABLE_GX
+  // The GL backend renders through a real SDL GL context (desktop: SDL_GL_CreateContext;
+  // device: the shim's borrowed EGL context), so the window must be an OpenGL window.
+  if (backend == BACKEND_OPENGL || backend == BACKEND_OPENGLES) {
     flags |= SDL_WINDOW_OPENGL;
   }
 #endif
@@ -334,7 +336,12 @@ bool create_window(AuroraBackend backend) {
       SDL_PROP_WINDOW_CREATE_HEIGHT_NUMBER, SDL_GetError());
   TRY(SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_FLAGS_NUMBER, flags), "Failed to set {}: {}",
       SDL_PROP_WINDOW_CREATE_FLAGS_NUMBER, SDL_GetError());
-  TRY(SDL_SetBooleanProperty(props, SDL_PROP_WINDOW_CREATE_EXTERNAL_GRAPHICS_CONTEXT_BOOLEAN, backend != BACKEND_NULL),
+  // Only the shim (device) path supplies the GL context externally (the firmware
+  // EGL context aurora borrows). On desktop, SDL owns the GL context via
+  // SDL_GL_CreateContext, so the window must NOT be flagged external -- otherwise
+  // SDL skips GL setup and SDL_GL_CreateContext rejects the window.
+  const bool externalGraphicsContext = sdl2ShimDriver && backend != BACKEND_NULL;
+  TRY(SDL_SetBooleanProperty(props, SDL_PROP_WINDOW_CREATE_EXTERNAL_GRAPHICS_CONTEXT_BOOLEAN, externalGraphicsContext),
       "Failed to set {}: {}", SDL_PROP_WINDOW_CREATE_EXTERNAL_GRAPHICS_CONTEXT_BOOLEAN, SDL_GetError());
   g_window = SDL_CreateWindowWithProperties(props);
   if (g_window == nullptr) {

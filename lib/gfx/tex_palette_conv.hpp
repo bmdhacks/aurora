@@ -19,6 +19,6 @@ struct ConvRequest {
 
 void initialize();
 void shutdown();
-void run(const wgpu::CommandEncoder& cmd, const ConvRequest& req);
+void run(const ConvRequest& req);
 
 } // namespace aurora::gfx::tex_palette_conv

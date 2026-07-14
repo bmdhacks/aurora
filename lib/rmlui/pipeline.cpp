@@ -14,10 +14,10 @@ namespace aurora::rmlui {
 namespace {
 using namespace std::string_view_literals;
 
-wgpu::BindGroupLayout g_commonBindGroupLayout;
-wgpu::BindGroupLayout g_imageBindGroupLayout;
-wgpu::BindGroupLayout g_uniformBindGroupLayout;
-wgpu::Sampler g_sampler;
+// WebGPU bind-group *layouts* have no GL equivalent (GL binds textures/uniform
+// blocks by unit/index at draw time), so the three layout globals are gone. Only
+// the shared filtering sampler survives.
+gl::Sampler g_sampler;
 
 constexpr uint32_t DynamicGroup1 = 1u << 1u;
 constexpr uint32_t DynamicGroup2 = 1u << 2u;
@@ -478,81 +478,10 @@ fn main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
 }
 )"sv;
 
-wgpu::ComputeState compile_shader(std::string_view wgslSource, std::string_view label) {
-  const wgpu::ShaderSourceWGSL source{
-      wgpu::ShaderSourceWGSL::Init{
-          .nextInChain = nullptr,
-          .code = wgslSource,
-      },
-  };
-  const wgpu::ShaderModuleDescriptor desc{
-      .nextInChain = &source,
-      .label = label,
-  };
-  return {
-      .module = webgpu::g_device.CreateShaderModule(&desc),
-      .entryPoint = "main",
-  };
-}
-
-wgpu::BlendState blend_state(BlendMode mode) {
-  switch (mode) {
-  case BlendMode::Premultiplied:
-    return {
-        .color =
-            {
-                .operation = wgpu::BlendOperation::Add,
-                .srcFactor = wgpu::BlendFactor::One,
-                .dstFactor = wgpu::BlendFactor::OneMinusSrcAlpha,
-            },
-        .alpha =
-            {
-                .operation = wgpu::BlendOperation::Add,
-                .srcFactor = wgpu::BlendFactor::One,
-                .dstFactor = wgpu::BlendFactor::OneMinusSrcAlpha,
-            },
-    };
-  case BlendMode::None:
-  default:
-    return {};
-  }
-}
-
-const wgpu::PipelineLayout create_pipeline_layout(PipelineKind kind) {
-  std::array<wgpu::BindGroupLayout, 3> layouts{};
-  uint32_t layoutCount = 0;
-  layouts[layoutCount++] = g_commonBindGroupLayout;
-
-  switch (kind) {
-  case PipelineKind::Gradient:
-    layouts[layoutCount++] = g_uniformBindGroupLayout;
-    break;
-  case PipelineKind::MaskImage:
-    layouts[layoutCount++] = g_imageBindGroupLayout;
-    layouts[layoutCount++] = g_imageBindGroupLayout;
-    break;
-  case PipelineKind::Blur:
-  case PipelineKind::RegionBlit:
-  case PipelineKind::DropShadow:
-  case PipelineKind::SimpleFilter:
-  case PipelineKind::SeedResample:
-    layouts[layoutCount++] = g_imageBindGroupLayout;
-    layouts[layoutCount++] = g_uniformBindGroupLayout;
-    break;
-  case PipelineKind::Geometry:
-  case PipelineKind::Blit:
-  case PipelineKind::OpaqueBlit:
-  default:
-    layouts[layoutCount++] = g_imageBindGroupLayout;
-    break;
-  }
-
-  const wgpu::PipelineLayoutDescriptor layoutDesc{
-      .bindGroupLayoutCount = layoutCount,
-      .bindGroupLayouts = layouts.data(),
-  };
-  return webgpu::g_device.CreatePipelineLayout(&layoutDesc);
-}
+// compile_shader / blend_state / create_pipeline_layout removed: WGSL module
+// compilation is Phase 3, and WebGPU BlendState / PipelineLayout descriptors have no
+// GL analogue (blend is baked into gl::BakedState in create_pipeline() below; GL has
+// no pipeline-layout object -- it binds by unit/block index at draw time).
 
 const std::string_view fragment_source(PipelineKind kind) {
   switch (kind) {
@@ -595,270 +524,135 @@ const std::string_view vertex_source(VertexLayoutKind kind) {
 } // namespace
 
 void initialize_pipeline() {
-  constexpr std::array commonEntries{
-      wgpu::BindGroupLayoutEntry{
-          .binding = 0,
-          .visibility = wgpu::ShaderStage::Vertex | wgpu::ShaderStage::Fragment,
-          .buffer =
-              {
-                  .type = wgpu::BufferBindingType::Uniform,
-                  .hasDynamicOffset = true,
-              },
-      },
-      wgpu::BindGroupLayoutEntry{
-          .binding = 1,
-          .visibility = wgpu::ShaderStage::Fragment,
-          .sampler =
-              {
-                  .type = wgpu::SamplerBindingType::Filtering,
-              },
-      },
-  };
-  const wgpu::BindGroupLayoutDescriptor commonDesc{
-      .entryCount = commonEntries.size(),
-      .entries = commonEntries.data(),
-  };
-  g_commonBindGroupLayout = webgpu::g_device.CreateBindGroupLayout(&commonDesc);
-
-  constexpr std::array imageEntries{
-      wgpu::BindGroupLayoutEntry{
-          .binding = 0,
-          .visibility = wgpu::ShaderStage::Fragment,
-          .texture =
-              {
-                  .sampleType = wgpu::TextureSampleType::Float,
-                  .viewDimension = wgpu::TextureViewDimension::e2D,
-              },
-      },
-  };
-  const wgpu::BindGroupLayoutDescriptor imageDesc{
-      .entryCount = imageEntries.size(),
-      .entries = imageEntries.data(),
-  };
-  g_imageBindGroupLayout = webgpu::g_device.CreateBindGroupLayout(&imageDesc);
-
-  constexpr std::array uniformEntries{
-      wgpu::BindGroupLayoutEntry{
-          .binding = 0,
-          .visibility = wgpu::ShaderStage::Vertex | wgpu::ShaderStage::Fragment,
-          .buffer =
-              {
-                  .type = wgpu::BufferBindingType::Uniform,
-                  .hasDynamicOffset = true,
-              },
-      },
-  };
-  const wgpu::BindGroupLayoutDescriptor uniformDesc{
-      .entryCount = uniformEntries.size(),
-      .entries = uniformEntries.data(),
-  };
-  g_uniformBindGroupLayout = webgpu::g_device.CreateBindGroupLayout(&uniformDesc);
-
-  constexpr wgpu::SamplerDescriptor samplerDesc{
-      .addressModeU = wgpu::AddressMode::Repeat,
-      .addressModeV = wgpu::AddressMode::Repeat,
-      .addressModeW = wgpu::AddressMode::Repeat,
-      .magFilter = wgpu::FilterMode::Linear,
-      .minFilter = wgpu::FilterMode::Linear,
-      .mipmapFilter = wgpu::MipmapFilterMode::Linear,
+  // The three WebGPU bind-group layouts are gone (no GL equivalent). Only the shared
+  // filtering sampler remains; gfx::sampler_ref is the GL-native replacement for the
+  // old g_device.CreateSampler.
+  constexpr gl::SamplerDescriptor samplerDesc{
+      .addressU = gl::AddressMode::Repeat,
+      .addressV = gl::AddressMode::Repeat,
+      .addressW = gl::AddressMode::Repeat,
+      .magFilter = gl::FilterMode::Linear,
+      .minFilter = gl::FilterMode::Linear,
+      .mipmapFilter = gl::MipmapFilterMode::Linear,
       .maxAnisotropy = 1,
   };
-  g_sampler = webgpu::g_device.CreateSampler(&samplerDesc);
+  g_sampler = gfx::sampler_ref(samplerDesc);
 }
 
 void shutdown_pipeline() {
-  g_commonBindGroupLayout = {};
-  g_imageBindGroupLayout = {};
-  g_uniformBindGroupLayout = {};
   g_sampler = {};
 }
 
-gfx::BindGroupRef texture_bind_group_ref(const wgpu::TextureView& view) {
-  const std::array entries{
-      wgpu::BindGroupEntry{
-          .binding = 0,
-          .textureView = view,
-      },
-  };
-  const wgpu::BindGroupDescriptor desc{
-      .layout = g_imageBindGroupLayout,
-      .entryCount = entries.size(),
-      .entries = entries.data(),
-  };
-  return gfx::bind_group_ref(desc);
+gfx::BindGroupRef texture_bind_group_ref(const gl::Texture& view) {
+  gl::BindingSet set{};
+  set.textures[0].texture = view.id;
+  // The common filtering sampler pairs with the image texture on GL (WebGPU kept the
+  // sampler in group 0; GL binds texture+sampler together at the unit).
+  set.textures[0].sampler = g_sampler.id;
+  return gfx::bind_group_ref(set);
 }
 
 gfx::BindGroupRef common_bind_group_ref() {
-  const std::array entries{
-      wgpu::BindGroupEntry{
-          .binding = 0,
-          .buffer = gfx::g_uniformBuffer,
-          .offset = 0,
-          .size = CommonUniformBindingSize,
-      },
-      wgpu::BindGroupEntry{
-          .binding = 1,
-          .sampler = g_sampler,
-      },
+  gl::BindingSet set{};
+  set.buffers[0] = gl::BindingSet::BufferBinding{
+      .buffer = gfx::g_uniformBuffer.id,
+      .binding = 0,
+      .offset = 0,
+      .size = static_cast<uint32_t>(CommonUniformBindingSize),
+      .dynamic = true,
   };
-  const wgpu::BindGroupDescriptor desc{
-      .layout = g_commonBindGroupLayout,
-      .entryCount = entries.size(),
-      .entries = entries.data(),
-  };
-  return gfx::bind_group_ref(desc);
+  set.bufferCount = 1;
+  return gfx::bind_group_ref(set);
 }
 
 gfx::BindGroupRef uniform_bind_group_ref() {
-  const std::array entries{
-      wgpu::BindGroupEntry{
-          .binding = 0,
-          .buffer = gfx::g_uniformBuffer,
-          .offset = 0,
-          .size = ExtraUniformBindingSize,
-      },
+  gl::BindingSet set{};
+  set.buffers[0] = gl::BindingSet::BufferBinding{
+      .buffer = gfx::g_uniformBuffer.id,
+      .binding = 0,
+      .offset = 0,
+      .size = static_cast<uint32_t>(ExtraUniformBindingSize),
+      .dynamic = true,
   };
-  const wgpu::BindGroupDescriptor desc{
-      .layout = g_uniformBindGroupLayout,
-      .entryCount = entries.size(),
-      .entries = entries.data(),
-  };
-  return gfx::bind_group_ref(desc);
+  set.bufferCount = 1;
+  return gfx::bind_group_ref(set);
 }
 
-wgpu::RenderPipeline create_pipeline(const PipelineConfig& config) {
+gl::Pipeline create_pipeline(const PipelineConfig& config) {
   ZoneScoped;
   const auto kind = static_cast<PipelineKind>(config.kind);
   const auto vertexLayoutKind = static_cast<VertexLayoutKind>(config.vertexLayout);
-  const auto colorFormat = static_cast<wgpu::TextureFormat>(config.colorFormat);
-  const auto stencilFormat = static_cast<wgpu::TextureFormat>(config.stencilFormat);
   const auto stencilMode = static_cast<StencilMode>(config.stencilMode);
   const auto blendMode = static_cast<BlendMode>(config.blendMode);
 
-  const auto vertexShader = compile_shader(vertex_source(vertexLayoutKind), "RmlUi Vertex Shader");
-  const auto fragmentShader = compile_shader(fragment_source(kind), "RmlUi Fragment Shader");
+  // Phase 3: translate these WGSL sources to GLSL, then compile + link a GL program.
+  // Phase 1 keeps the source-selection wiring but produces no program; a zero program
+  // makes gfx::bind_pipeline early-out (gl::Pipeline::operator bool == program != 0).
+  (void)vertex_source(vertexLayoutKind);
+  (void)fragment_source(kind);
 
-  constexpr std::array vertexAttributes{
-      wgpu::VertexAttribute{
-          .format = wgpu::VertexFormat::Float32x2,
-          .offset = offsetof(Rml::Vertex, position),
-          .shaderLocation = 0,
-      },
-      wgpu::VertexAttribute{
-          .format = wgpu::VertexFormat::Float32x2,
-          .offset = offsetof(Rml::Vertex, tex_coord),
-          .shaderLocation = 1,
-      },
-      wgpu::VertexAttribute{
-          .format = wgpu::VertexFormat::Unorm8x4,
-          .offset = offsetof(Rml::Vertex, colour),
-          .shaderLocation = 2,
-      },
-  };
-  const std::array vertexBufferLayouts{
-      wgpu::VertexBufferLayout{
-          .stepMode = wgpu::VertexStepMode::Vertex,
-          .arrayStride = sizeof(Rml::Vertex),
-          .attributeCount = vertexAttributes.size(),
-          .attributes = vertexAttributes.data(),
-      },
-  };
+  // Bake the fixed-function state from the backend-agnostic config. Blend and stencil
+  // config survive the cutover; the colour/stencil formats and MSAA sample count are
+  // resolved by the render-target/FBO setup, not the pipeline, on GL.
+  gl::BakedState state{};
+  if (blendMode == BlendMode::Premultiplied) {
+    state.blendEnabled = true;
+    state.colorOp = gl::BlendOperation::Add;
+    state.colorSrc = gl::BlendFactor::One;
+    state.colorDst = gl::BlendFactor::OneMinusSrcAlpha;
+    state.alphaOp = gl::BlendOperation::Add;
+    state.alphaSrc = gl::BlendFactor::One;
+    state.alphaDst = gl::BlendFactor::OneMinusSrcAlpha;
+  }
+  state.writeMask = static_cast<gl::ColorWriteMask>(config.colorWriteMask);
+  state.topology = gl::PrimitiveTopology::TriangleList;
+  state.frontFace = gl::FrontFace::CW;
+  state.cull = gl::CullMode::None;
+  // Combined depth-stencil format: the depth aspect is present but unused, so depth
+  // writes are off and the depth test always passes (matches the clip-mask passes).
+  state.depthTest = false;
+  state.depthWrite = false;
+  state.depthCompare = gl::CompareFunction::Always;
 
-  const auto blend = blend_state(blendMode);
-  const wgpu::ColorTargetState colorState{
-      .format = colorFormat,
-      .blend = blendMode == BlendMode::None ? nullptr : &blend,
-      .writeMask = static_cast<wgpu::ColorWriteMask>(config.colorWriteMask),
-  };
-  const wgpu::FragmentState fragmentState{
-      .module = fragmentShader.module,
-      .entryPoint = fragmentShader.entryPoint,
-      .targetCount = 1,
-      .targets = &colorState,
-  };
-
-  wgpu::DepthStencilState depthStencilState{};
-  const wgpu::DepthStencilState* depthStencil = nullptr;
   if (stencilMode != StencilMode::None) {
-    wgpu::CompareFunction compare = wgpu::CompareFunction::Always;
-    wgpu::StencilOperation passOp = wgpu::StencilOperation::Keep;
+    state.stencilTest = true;
     switch (stencilMode) {
     case StencilMode::EqualKeep:
-      compare = wgpu::CompareFunction::Equal;
+    case StencilMode::ClipIntersect:
+      state.stencilCompare = gl::CompareFunction::Equal;
       break;
     case StencilMode::ClipReplace:
-      passOp = wgpu::StencilOperation::Replace;
-      break;
-    case StencilMode::ClipIntersect:
-      compare = wgpu::CompareFunction::Equal;
-      passOp = wgpu::StencilOperation::IncrementClamp;
-      break;
     case StencilMode::AlwaysKeep:
     case StencilMode::None:
     default:
+      state.stencilCompare = gl::CompareFunction::Always;
       break;
     }
-    const wgpu::StencilFaceState face{
-        .compare = compare,
-        .failOp = wgpu::StencilOperation::Keep,
-        .depthFailOp = wgpu::StencilOperation::Keep,
-        .passOp = passOp,
-    };
-    depthStencilState = {
-        .format = stencilFormat,
-        // Combined depth-stencil format: the depth aspect is present but unused, so disable depth
-        // writes and always-pass the depth test. Matches the depth-read-only clip-mask passes.
-        .depthWriteEnabled = false,
-        .depthCompare = wgpu::CompareFunction::Always,
-        .stencilFront = face,
-        .stencilBack = face,
-        .stencilReadMask = 0xFF,
-        .stencilWriteMask = 0xFF,
-    };
-    depthStencil = &depthStencilState;
+    state.stencilReadMask = 0xFF;
+    state.stencilWriteMask = 0xFF;
+    // Phase 5: translate the wgpu StencilOperation (Keep/Replace/IncrementClamp per
+    // StencilMode) into the raw GL enums for stencilFail/stencilDepthFail/stencilPass.
   }
 
-  const bool hasVertexBuffer = vertexLayoutKind == VertexLayoutKind::Geometry;
-  const auto pipelineLayout = create_pipeline_layout(kind);
-  const auto label = fmt::format("RmlUi Pipeline {}", config.kind);
-  const wgpu::RenderPipelineDescriptor pipelineDesc{
-      .label = label.c_str(),
-      .layout = pipelineLayout,
-      .vertex =
-          {
-              .module = vertexShader.module,
-              .entryPoint = vertexShader.entryPoint,
-              .bufferCount = hasVertexBuffer ? vertexBufferLayouts.size() : 0,
-              .buffers = hasVertexBuffer ? vertexBufferLayouts.data() : nullptr,
-          },
-      .primitive =
-          {
-              .topology = wgpu::PrimitiveTopology::TriangleList,
-              .stripIndexFormat = wgpu::IndexFormat::Undefined,
-              .frontFace = wgpu::FrontFace::CW,
-              .cullMode = wgpu::CullMode::None,
-          },
-      .depthStencil = depthStencil,
-      .multisample =
-          {
-              .count = config.sampleCount,
-          },
-      .fragment = &fragmentState,
-  };
-  return webgpu::g_device.CreateRenderPipeline(&pipelineDesc);
+  gl::Pipeline pipeline{};
+  pipeline.program = 0;                      // Phase 3: compiled+linked GL program
+  pipeline.state = state;
+  pipeline.vertexLayout = config.vertexLayout; // Phase 3: index into the VAO-layout cache
+  return pipeline;
 }
 
-void render(const DrawData& data, const wgpu::RenderPassEncoder& pass) {
+void render(const DrawData& data, gl::PassEncoder& pass) {
+  // bind_pipeline early-outs on a missing/empty (program 0) pipeline.
   if (!gfx::bind_pipeline(data.pipeline, pass)) {
     return;
   }
 
-  const auto commonBindGroup = gfx::find_bind_group(common_bind_group_ref());
+  const auto& commonBindGroup = gfx::find_bind_group(common_bind_group_ref());
   const std::array commonOffsets{data.uniformRange.offset};
   pass.SetBindGroup(0, commonBindGroup, commonOffsets.size(), commonOffsets.data());
 
   if (data.bindGroup1 != 0) {
-    const auto bindGroup = gfx::find_bind_group(data.bindGroup1);
+    const auto& bindGroup = gfx::find_bind_group(data.bindGroup1);
     if ((data.dynamicBindGroupMask & DynamicGroup1) != 0) {
       const std::array offsets{data.bindGroup1DynamicOffset};
       pass.SetBindGroup(1, bindGroup, offsets.size(), offsets.data());
@@ -868,7 +662,7 @@ void render(const DrawData& data, const wgpu::RenderPassEncoder& pass) {
   }
 
   if (data.bindGroup2 != 0) {
-    const auto bindGroup = gfx::find_bind_group(data.bindGroup2);
+    const auto& bindGroup = gfx::find_bind_group(data.bindGroup2);
     if ((data.dynamicBindGroupMask & DynamicGroup2) != 0) {
       const std::array offsets{data.bindGroup2DynamicOffset};
       pass.SetBindGroup(2, bindGroup, offsets.size(), offsets.data());
@@ -878,14 +672,14 @@ void render(const DrawData& data, const wgpu::RenderPassEncoder& pass) {
   }
 
   if (data.hasBlendConstant != 0) {
-    const wgpu::Color color{data.blendConstant[0], data.blendConstant[1], data.blendConstant[2], data.blendConstant[3]};
+    const gl::Color color{data.blendConstant[0], data.blendConstant[1], data.blendConstant[2], data.blendConstant[3]};
     pass.SetBlendConstant(&color);
   }
   pass.SetStencilReference(data.stencilRef);
 
   if (static_cast<DrawKind>(data.drawKind) == DrawKind::Geometry) {
     pass.SetVertexBuffer(0, gfx::g_vertexBuffer, data.vertexRange.offset, data.vertexRange.size);
-    pass.SetIndexBuffer(gfx::g_indexBuffer, wgpu::IndexFormat::Uint32, data.indexRange.offset, data.indexRange.size);
+    pass.SetIndexBuffer(gfx::g_indexBuffer, gl::IndexFormat::Uint32, data.indexRange.offset, data.indexRange.size);
     pass.DrawIndexed(data.indexCount);
   } else {
     pass.Draw(data.vertexCount);

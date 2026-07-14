@@ -583,19 +583,19 @@ ConvertedTexture convert_texture(u32 format, uint32_t width, uint32_t height, ui
           DecodeLinear<TextureDecoderI8>(static_cast<uint32_t>(ComputeMippedTexelCount(width, height, mips)), data);
       break;
     }
-    return {.format = to_wgpu(format), .width = width, .height = height, .mips = mips};
+    return {.format = to_gl(format), .width = width, .height = height, .mips = mips};
   case GX_TF_RG8_PC:
     if (!uses_direct_texture_upload(format)) {
       converted =
           DecodeLinear<TextureDecoderRG8>(static_cast<uint32_t>(ComputeMippedTexelCount(width, height, mips)), data);
       break;
     }
-    return {.format = to_wgpu(format), .width = width, .height = height, .mips = mips};
+    return {.format = to_gl(format), .width = width, .height = height, .mips = mips};
   case GX_TF_RGBA8_PC:
-    return {.format = to_wgpu(format), .width = width, .height = height, .mips = mips};
+    return {.format = to_gl(format), .width = width, .height = height, .mips = mips};
   case GX_TF_BC1_PC:
     if (uses_direct_texture_upload(format)) {
-      return {.format = to_wgpu(format), .width = width, .height = height, .mips = mips};
+      return {.format = to_gl(format), .width = width, .height = height, .mips = mips};
     }
     converted = BuildRGBA8FromBC1(width, height, mips, data);
     break;
@@ -633,13 +633,13 @@ ConvertedTexture convert_texture(u32 format, uint32_t width, uint32_t height, ui
     converted = BuildRGBA8FromCMPR(width, height, mips, data);
     break;
   }
-  const auto wgpuFormat = to_wgpu(format);
+  const auto glFormat = to_gl(format);
   bool hasArbitraryMips = false;
-  if (!is_pc_texture_format(format) && wgpuFormat == wgpu::TextureFormat::RGBA8Unorm && mips > 1) {
+  if (!is_pc_texture_format(format) && glFormat == gl::TextureFormat::RGBA8Unorm && mips > 1) {
     hasArbitraryMips = arb_mip_check(width, height, mips, converted);
   }
   return {
-      .format = wgpuFormat,
+      .format = glFormat,
       .width = width,
       .height = height,
       .mips = mips,
@@ -663,7 +663,7 @@ ConvertedTexture convert_tlut(u32 format, uint32_t width, ArrayRef<uint8_t> data
     break;
   }
   return {
-      .format = wgpu::TextureFormat::RGBA8Unorm,
+      .format = gl::TextureFormat::RGBA8Unorm,
       .width = width,
       .height = 1,
       .mips = 1,
@@ -721,7 +721,7 @@ ConvertedTexture convert_texture_palette(u32 textureFormat, uint32_t width, uint
 
   bool hasArbitraryMips = arb_mip_check(width, height, mips, pixels);
   return {
-      .format = wgpu::TextureFormat::RGBA8Unorm,
+      .format = gl::TextureFormat::RGBA8Unorm,
       .width = width,
       .height = height,
       .mips = mips,

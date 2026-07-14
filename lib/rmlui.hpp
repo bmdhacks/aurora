@@ -1,16 +1,16 @@
 #pragma once
 
 #include "aurora/aurora.h"
+#include "gfx/common.hpp"
 #include "webgpu/gpu.hpp"
 
 #include <SDL3/SDL_events.h>
 #include <aurora/rmlui.hpp>
-#include <dawn/webgpu_cpp.h>
 
 namespace aurora::rmlui {
 
 struct RecordedFrame {
-  wgpu::BindGroup bindGroup;
+  gfx::BindGroupRef bindGroup = 0; // 0 = no overlay recorded
   bool overlay = false;
 };
 

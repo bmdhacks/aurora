@@ -10,8 +10,9 @@
 namespace aurora::gfx::tex_palette_conv {
 static Module Log("aurora::gfx::tex_palette_conv");
 
-using webgpu::g_device;
-
+// Phase 4: these WGSL sources are dead literals under the GL backend. Phase 4
+// rewrites them to GLSL (fullscreen triangle vtx + index/TLUT lookup frag) and
+// compiles real programs via the GL program cache.
 static constexpr std::string_view ShaderPreambleVtx = R"(
 struct VertexOutput {
     @builtin(position) pos: vec4f,
@@ -84,101 +85,34 @@ static constexpr std::string_view ShaderFromFloat4 = R"(
 }
 )"sv;
 
+// Phase 4: wgpu carried a per-variant BindGroupLayout alongside the pipeline; GL
+// has no layout object, so PipelineInfo collapses to just the pipeline handle.
 struct PipelineInfo {
-  wgpu::RenderPipeline pipeline;
-  wgpu::BindGroupLayout bindGroupLayout;
+  gl::Pipeline pipeline;
 };
 
 static PipelineInfo g_directPipeline;
 static PipelineInfo g_fromFloat8Pipeline;
 static PipelineInfo g_fromFloat4Pipeline;
-static wgpu::Sampler g_sampler;
+static gl::Sampler g_sampler;
 
-static PipelineInfo create_pipeline(std::string_view fragBindingsAndShader, wgpu::TextureSampleType srcSampleType,
-                                    const char* label) {
+static PipelineInfo create_pipeline(std::string_view fragBindingsAndShader, const char* label) {
+  // Assemble the full WGSL source (preamble + per-variant frag bindings/shader).
+  // Backend-agnostic string plumbing kept intact; Phase 4 lowers this to GLSL and
+  // compiles a real program instead of the stub below.
   std::string shaderSource;
   shaderSource.reserve(ShaderPreambleVtx.size() + fragBindingsAndShader.size());
   shaderSource += ShaderPreambleVtx;
   shaderSource += fragBindingsAndShader;
+  (void)shaderSource;
+  (void)label;
 
-  wgpu::ShaderSourceWGSL wgslSource{};
-  wgslSource.code = shaderSource.c_str();
-  const wgpu::ShaderModuleDescriptor moduleDescriptor{
-      .nextInChain = &wgslSource,
-      .label = label,
-  };
-  auto module = g_device.CreateShaderModule(&moduleDescriptor);
-
-  const std::array bindGroupLayoutEntries{
-      wgpu::BindGroupLayoutEntry{
-          .binding = 0,
-          .visibility = wgpu::ShaderStage::Fragment,
-          .sampler =
-              wgpu::SamplerBindingLayout{
-                  .type = wgpu::SamplerBindingType::NonFiltering,
-              },
-      },
-      wgpu::BindGroupLayoutEntry{
-          .binding = 1,
-          .visibility = wgpu::ShaderStage::Fragment,
-          .texture =
-              wgpu::TextureBindingLayout{
-                  .sampleType = srcSampleType,
-                  .viewDimension = wgpu::TextureViewDimension::e2D,
-              },
-      },
-      wgpu::BindGroupLayoutEntry{
-          .binding = 2,
-          .visibility = wgpu::ShaderStage::Fragment,
-          .texture =
-              wgpu::TextureBindingLayout{
-                  .sampleType = wgpu::TextureSampleType::Float,
-                  .viewDimension = wgpu::TextureViewDimension::e2D,
-              },
-      },
-  };
-  const auto bindGroupLayoutLabel = fmt::format("{} Bind Group Layout", label);
-  const wgpu::BindGroupLayoutDescriptor bindGroupLayoutDescriptor{
-      .label = bindGroupLayoutLabel.c_str(),
-      .entryCount = bindGroupLayoutEntries.size(),
-      .entries = bindGroupLayoutEntries.data(),
-  };
-  auto bindGroupLayout = g_device.CreateBindGroupLayout(&bindGroupLayoutDescriptor);
-
-  const wgpu::PipelineLayoutDescriptor layoutDescriptor{
-      .bindGroupLayoutCount = 1,
-      .bindGroupLayouts = &bindGroupLayout,
-  };
-  auto pipelineLayout = g_device.CreatePipelineLayout(&layoutDescriptor);
-
-  constexpr std::array colorTargets{wgpu::ColorTargetState{
-      .format = wgpu::TextureFormat::RGBA8Unorm,
-  }};
-  const wgpu::FragmentState fragmentState{
-      .module = module,
-      .entryPoint = "fs_main",
-      .targetCount = colorTargets.size(),
-      .targets = colorTargets.data(),
-  };
-  const wgpu::RenderPipelineDescriptor pipelineDescriptor{
-      .label = label,
-      .layout = pipelineLayout,
-      .vertex =
-          wgpu::VertexState{
-              .module = module,
-              .entryPoint = "vs_main",
-          },
-      .primitive =
-          wgpu::PrimitiveState{
-              .topology = wgpu::PrimitiveTopology::TriangleList,
-          },
-      .fragment = &fragmentState,
-  };
-
-  return PipelineInfo{
-      .pipeline = g_device.CreateRenderPipeline(&pipelineDescriptor),
-      .bindGroupLayout = std::move(bindGroupLayout),
-  };
+  // Phase 4: compile the program and bake real fixed-function state. For now bake
+  // what we statically know (single RGBA8 color target, triangle-list, no blend/
+  // depth/cull) and return a program-less (0) pipeline.
+  gl::Pipeline pipeline{};
+  pipeline.state.topology = gl::PrimitiveTopology::TriangleList;
+  return PipelineInfo{.pipeline = pipeline};
 }
 
 static const PipelineInfo& pipeline_for_variant(Variant variant) {
@@ -194,17 +128,17 @@ static const PipelineInfo& pipeline_for_variant(Variant variant) {
 }
 
 void initialize() {
-  g_directPipeline = create_pipeline(ShaderDirect, wgpu::TextureSampleType::Sint, "TexPaletteConv Direct");
-  g_fromFloat8Pipeline =
-      create_pipeline(ShaderFromFloat8, wgpu::TextureSampleType::UnfilterableFloat, "TexPaletteConv FromFloat8");
-  g_fromFloat4Pipeline =
-      create_pipeline(ShaderFromFloat4, wgpu::TextureSampleType::UnfilterableFloat, "TexPaletteConv FromFloat4");
-  constexpr wgpu::SamplerDescriptor samplerDesc{
-      .label = "TexPaletteConv Sampler",
-      .magFilter = wgpu::FilterMode::Nearest,
-      .minFilter = wgpu::FilterMode::Nearest,
+  g_directPipeline = create_pipeline(ShaderDirect, "TexPaletteConv Direct");
+  g_fromFloat8Pipeline = create_pipeline(ShaderFromFloat8, "TexPaletteConv FromFloat8");
+  g_fromFloat4Pipeline = create_pipeline(ShaderFromFloat4, "TexPaletteConv FromFloat4");
+  // Phase 4: create the real nearest-filter (NonFiltering) sampler used to sample
+  // the index/TLUT textures. Descriptor intent preserved for the later phase.
+  const gl::SamplerDescriptor samplerDesc{
+      .magFilter = gl::FilterMode::Nearest,
+      .minFilter = gl::FilterMode::Nearest,
   };
-  g_sampler = g_device.CreateSampler(&samplerDesc);
+  (void)samplerDesc;
+  g_sampler = gl::Sampler{};
 }
 
 void shutdown() {
@@ -214,49 +148,19 @@ void shutdown() {
   g_sampler = {};
 }
 
-void run(const wgpu::CommandEncoder& cmd, const ConvRequest& req) {
-  const auto& [pipeline, bindGroupLayout] = pipeline_for_variant(req.variant);
+void run(const ConvRequest& req) {
+  const auto& info = pipeline_for_variant(req.variant);
 
-  const std::array bindGroupEntries{
-      wgpu::BindGroupEntry{
-          .binding = 0,
-          .sampler = g_sampler,
-      },
-      wgpu::BindGroupEntry{
-          .binding = 1,
-          .textureView = req.src->sampleTextureView,
-      },
-      wgpu::BindGroupEntry{
-          .binding = 2,
-          .textureView = req.tlut->sampleTextureView,
-      },
-  };
-  const wgpu::BindGroupDescriptor bindGroupDescriptor{
-      .layout = bindGroupLayout,
-      .entryCount = bindGroupEntries.size(),
-      .entries = bindGroupEntries.data(),
-  };
-  const auto bindGroup = g_device.CreateBindGroup(&bindGroupDescriptor);
-
-  const std::array colorAttachments{
-      wgpu::RenderPassColorAttachment{
-          .view = req.dst->attachmentTextureView,
-          .loadOp = wgpu::LoadOp::Clear,
-          .storeOp = wgpu::StoreOp::Store,
-          .clearValue = {0.0, 0.0, 0.0, 0.0},
-      },
-  };
-  const wgpu::RenderPassDescriptor renderPassDescriptor{
-      .label = "TexPaletteConv Pass",
-      .colorAttachmentCount = colorAttachments.size(),
-      .colorAttachments = colorAttachments.data(),
-      .timestampWrites = webgpu::gpu_prof::pass_writes("Palette convert"),
-  };
-  const auto pass = cmd.BeginRenderPass(&renderPassDescriptor);
-  pass.SetPipeline(pipeline);
-  pass.SetBindGroup(0, bindGroup);
-  pass.Draw(3);
-  pass.End();
+  // Phase 4: build the binding set (sampler @0, src index texture @1, tlut @2),
+  // begin a render pass into req.dst (load=Clear, store=Store, clear 0,0,0,0),
+  // set the pipeline + bindings and Draw(3) the fullscreen triangle to resolve
+  // the paletted texture. Binding intent preserved below for the later phase.
+  gl::BindingSet bindings{};
+  bindings.textures[0] = {req.src->sampleTextureView.id, g_sampler.id};
+  bindings.textures[1] = {req.tlut->sampleTextureView.id, g_sampler.id};
+  (void)info;
+  (void)bindings;
+  (void)req.dst->attachmentTextureView;
 }
 
 } // namespace aurora::gfx::tex_palette_conv

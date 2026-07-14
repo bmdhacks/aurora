@@ -16,13 +16,12 @@ function(aurora_find_package_global)
   set(CMAKE_FIND_PACKAGE_TARGETS_GLOBAL ${_PREV_FIND_PACKAGE_TARGETS_GLOBAL})
 endfunction()
 
-if (AURORA_ENABLE_GX)
-  include(${CMAKE_CURRENT_SOURCE_DIR}/../cmake/AuroraDawnProvider.cmake)
-  set(AURORA_DAWN_IS_SHARED "${AURORA_DAWN_IS_SHARED}" PARENT_SCOPE)
-endif ()
+# Dawn removed: the hand-rolled GLES backend (lib/gl/) replaces it. The provider
+# (which fetched + built Dawn and vendored Abseil) is gone; Abseil is fetched
+# standalone below.
 
-# Abseil is needed for core libraries. It normally comes via Dawn's vendor build.
-# Otherwise prefer a system package and only fetch it as a last resort.
+# Abseil is needed for core libraries. It normally came via Dawn's vendor build;
+# now prefer a system package and fetch it standalone as a fallback.
 if (NOT TARGET absl::flat_hash_map OR NOT TARGET absl::btree)
   aurora_find_package_global(absl CONFIG QUIET GLOBAL)
 endif ()
@@ -208,13 +207,14 @@ if (AURORA_ENABLE_GX)
     )
     target_include_directories(imgui PUBLIC ${imgui_SOURCE_DIR})
 
+    # Dawn WebGPU imgui backend removed. Phase 1 keeps only the SDL3 platform
+    # backend (input/timing); aurora's imgui.cpp no-ops rendering until Phase 5
+    # wires in imgui_impl_opengl3 (ES3).
     add_library(imgui_backends STATIC
       ${imgui_SOURCE_DIR}/backends/imgui_impl_sdl3.cpp
       ${imgui_SOURCE_DIR}/backends/imgui_impl_sdlrenderer3.cpp
-      ${imgui_SOURCE_DIR}/backends/imgui_impl_wgpu.cpp
     )
-    target_compile_definitions(imgui_backends PRIVATE IMGUI_IMPL_WEBGPU_BACKEND_DAWN)
-    target_link_libraries(imgui_backends PRIVATE imgui ${AURORA_SDL3_TARGET} dawn::webgpu_dawn)
+    target_link_libraries(imgui_backends PRIVATE imgui ${AURORA_SDL3_TARGET})
     target_link_libraries(imgui PUBLIC imgui_backends)
 
     if (TARGET Freetype::Freetype)

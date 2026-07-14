@@ -72,7 +72,7 @@ void copy_tex(const void* dest, GXBool clear) noexcept {
             .clearAlpha = true,
             .clearDepth = false,
         }),
-        .color = wgpu::Color{0.f, 0.f, 0.f, g_gxState.dstAlpha / 255.f},
+        .color = gl::Color{0.f, 0.f, 0.f, g_gxState.dstAlpha / 255.f},
     });
   }
   const auto clearColor = clear && g_gxState.colorUpdate;

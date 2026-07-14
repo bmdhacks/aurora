@@ -3,115 +3,51 @@
 #include "../webgpu/gpu.hpp"
 #include "tracy/Tracy.hpp"
 
+namespace aurora::gfx::clear {
+
+using webgpu::g_graphicsConfig;
+
 namespace {
-wgpu::ColorWriteMask clear_write_mask(bool clearColor, bool clearAlpha) {
-  auto writeMask = wgpu::ColorWriteMask::None;
+gl::ColorWriteMask clear_write_mask(bool clearColor, bool clearAlpha) {
+  auto writeMask = gl::ColorWriteMask::None;
   if (clearColor) {
-    writeMask |= wgpu::ColorWriteMask::Red | wgpu::ColorWriteMask::Green | wgpu::ColorWriteMask::Blue;
+    writeMask = writeMask | gl::ColorWriteMask::Red | gl::ColorWriteMask::Green | gl::ColorWriteMask::Blue;
   }
   if (clearAlpha) {
-    writeMask |= wgpu::ColorWriteMask::Alpha;
+    writeMask = writeMask | gl::ColorWriteMask::Alpha;
   }
   return writeMask;
 }
 } // namespace
 
-namespace aurora::gfx::clear {
-
-using webgpu::g_device;
-using webgpu::g_graphicsConfig;
-
-wgpu::RenderPipeline create_pipeline(const PipelineConfig& config) {
+// The clear "pipeline" is a fullscreen triangle that writes the blend-constant
+// color (Phase 2 ports the GLSL). Here we bake only the fixed-function state;
+// `program` stays 0 until Phase 2 compiles the shader on the render worker.
+gl::Pipeline create_pipeline(const PipelineConfig& config) {
   ZoneScoped;
-  wgpu::ShaderSourceWGSL sourceDescriptor{};
-  sourceDescriptor.code = R"""(
-struct VertexOutput {
-    @builtin(position) pos: vec4<f32>,
-};
-
-var<private> pos: array<vec2<f32>, 3> = array<vec2<f32>, 3>(
-    vec2(-1.0, 1.0),
-    vec2(-1.0, -3.0),
-    vec2(3.0, 1.0),
-);
-
-@vertex
-fn vs_main(@builtin(vertex_index) vtxIdx: u32) -> VertexOutput {
-    var out: VertexOutput;
-    out.pos = vec4<f32>(pos[vtxIdx], 0.0, 1.0);
-    return out;
+  gl::BakedState state{};
+  // color = blendConstant * 1 + dst * 0 => write the constant, masked by writeMask
+  state.blendEnabled = true;
+  state.colorOp = gl::BlendOperation::Add;
+  state.colorSrc = gl::BlendFactor::Constant;
+  state.colorDst = gl::BlendFactor::Zero;
+  state.alphaOp = gl::BlendOperation::Add;
+  state.alphaSrc = gl::BlendFactor::Constant;
+  state.alphaDst = gl::BlendFactor::Zero;
+  state.writeMask = clear_write_mask(config.clearColor, config.clearAlpha);
+  state.depthTest = true;
+  state.depthWrite = config.clearDepth;
+  state.depthCompare = gl::CompareFunction::Always;
+  state.cull = gl::CullMode::None;
+  state.topology = gl::PrimitiveTopology::TriangleList;
+  return gl::Pipeline{
+      .program = 0,
+      .state = state,
+      .vertexLayout = 0,
+  };
 }
 
-@fragment
-fn fs_main() -> @location(0) vec4<f32> {
-    return vec4<f32>(1.0);
-}
-)""";
-  const wgpu::ShaderModuleDescriptor moduleDescriptor{
-      .nextInChain = &sourceDescriptor,
-      .label = "EFB Clear Module",
-  };
-  auto module = g_device.CreateShaderModule(&moduleDescriptor);
-  constexpr wgpu::PipelineLayoutDescriptor layoutDescriptor{
-      .bindGroupLayoutCount = 0,
-      .bindGroupLayouts = nullptr,
-  };
-  auto pipelineLayout = g_device.CreatePipelineLayout(&layoutDescriptor);
-  constexpr wgpu::BlendState blendState{
-      .color =
-          wgpu::BlendComponent{
-              .operation = wgpu::BlendOperation::Add,
-              .srcFactor = wgpu::BlendFactor::Constant,
-              .dstFactor = wgpu::BlendFactor::Zero,
-          },
-      .alpha =
-          wgpu::BlendComponent{
-              .operation = wgpu::BlendOperation::Add,
-              .srcFactor = wgpu::BlendFactor::Constant,
-              .dstFactor = wgpu::BlendFactor::Zero,
-          },
-  };
-  const wgpu::ColorTargetState colorTarget{
-      .format = g_graphicsConfig.surfaceConfiguration.format,
-      .blend = &blendState,
-      .writeMask = clear_write_mask(config.clearColor, config.clearAlpha),
-  };
-  const wgpu::FragmentState fragmentState{
-      .module = module,
-      .entryPoint = "fs_main",
-      .targetCount = 1,
-      .targets = &colorTarget,
-  };
-  const wgpu::DepthStencilState depthStencil{
-      .format = g_graphicsConfig.depthFormat,
-      .depthWriteEnabled = config.clearDepth,
-      .depthCompare = wgpu::CompareFunction::Always,
-  };
-  const auto label = fmt::format("EFB Clear Pipeline (color {}, alpha {}, depth {})", config.clearColor,
-                                 config.clearAlpha, config.clearDepth);
-  const wgpu::RenderPipelineDescriptor pipelineDescriptor{
-      .label = label.c_str(),
-      .layout = pipelineLayout,
-      .vertex =
-          wgpu::VertexState{
-              .module = module,
-              .entryPoint = "vs_main",
-          },
-      .primitive =
-          wgpu::PrimitiveState{
-              .topology = wgpu::PrimitiveTopology::TriangleList,
-          },
-      .depthStencil = &depthStencil,
-      .multisample =
-          wgpu::MultisampleState{
-              .count = config.msaaSamples,
-          },
-      .fragment = &fragmentState,
-  };
-  return g_device.CreateRenderPipeline(&pipelineDescriptor);
-}
-
-void render(const DrawData& data, const wgpu::RenderPassEncoder& pass, const wgpu::Extent3D& targetSize) {
+void render(const DrawData& data, gl::PassEncoder& pass, const gl::Extent3D& targetSize) {
   if (!bind_pipeline(data.pipeline, pass)) {
     return;
   }

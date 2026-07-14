@@ -181,3 +181,30 @@ struct Color {
 };
 
 } // namespace aurora::gl
+
+// Dawn is gone: re-export the vocabulary into aurora::gfx so the historical
+// `gfx::TextureFormat` / `gfx::LoadOp` spelling (what the old code called
+// `wgpu::`) keeps working alongside the canonical `gl::` spelling. New GL code
+// prefers `gl::`; either resolves to the same type.
+namespace aurora::gfx {
+using gl::AddressMode;
+using gl::BlendFactor;
+using gl::BlendOperation;
+using gl::Color;
+using gl::ColorWriteMask;
+using gl::CompareFunction;
+using gl::CullMode;
+using gl::Extent3D;
+using gl::FilterMode;
+using gl::FrontFace;
+using gl::IndexFormat;
+using gl::LoadOp;
+using gl::MipmapFilterMode;
+using gl::Origin3D;
+using gl::PrimitiveTopology;
+using gl::StoreOp;
+using gl::TextureFormat;
+using gl::any;
+using gl::operator|;
+using gl::operator&;
+} // namespace aurora::gfx

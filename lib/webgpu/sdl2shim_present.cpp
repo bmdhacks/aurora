@@ -137,9 +137,9 @@ struct Slot {
   uint32_t glTexture = 0;    // lives in the shim context
   uint32_t readFbo = 0;      // lives in the shim context, wraps glTexture
   void* eglImage = nullptr;  // the bridge between the two contexts
-  wgpu::Texture texture;     // Dawn's import of eglImage
-  wgpu::TextureView view;
-  void* fwdSync = nullptr;   // Dawn finished rendering this slot
+  gl::Texture texture;       // Phase 6: the worker-context GL texture wrapping eglImage
+  gl::Texture view;          // (collapses to `texture` on GL)
+  void* fwdSync = nullptr;   // worker finished rendering this slot
   void* revSync = nullptr;   // main finished reading this slot
   SlotState state = SlotState::Free;
 };
@@ -162,7 +162,9 @@ bool g_hasReadyFrame = false;
 uint32_t g_readySlot = 0;
 bool g_aborting = false;
 
+#ifdef WEBGPU_DAWN
 WGPUDevice device_handle() { return g_device.Get(); }
+#endif
 
 void destroy_sync(void*& sync) {
 #ifdef WEBGPU_DAWN
@@ -216,7 +218,7 @@ bool load_procs(ProcAddressFn getProc) {
 
 // Allocates the shim-side GL texture + read FBO, bridges it as an EGLImage, and imports it into
 // Dawn. Runs on the main thread with the shim context current.
-bool create_slot(Slot& slot, void* shimContext, wgpu::TextureFormat format) {
+bool create_slot(Slot& slot, void* shimContext, gl::TextureFormat format) {
 #ifndef WEBGPU_DAWN
   return false;
 #else
@@ -289,7 +291,7 @@ bool create_slot(Slot& slot, void* shimContext, wgpu::TextureFormat format) {
 
 void destroy_slot(Slot& slot);
 
-bool create_slots(void* shimContext, wgpu::TextureFormat format) {
+bool create_slots(void* shimContext, gl::TextureFormat format) {
   for (uint32_t i = 0; i < SlotCount; ++i) {
     if (!create_slot(g_slots[i], shimContext, format)) {
       for (uint32_t j = 0; j <= i; ++j) {
@@ -356,7 +358,7 @@ void blit_and_swap(Slot& slot) {
 bool active() noexcept { return g_active; }
 
 bool initialize(ProcAddressFn getProc, void* eglDisplay, uint32_t width, uint32_t height,
-                wgpu::TextureFormat format) {
+                gl::TextureFormat format) {
 #ifndef WEBGPU_DAWN
   return false;
 #else
@@ -368,7 +370,7 @@ bool initialize(ProcAddressFn getProc, void* eglDisplay, uint32_t width, uint32_
   }
   // The shared textures are allocated as GL_RGBA8, so the present pass must render that format.
   // webgpu::initialize() pins the surface configuration to match on this path.
-  if (format != wgpu::TextureFormat::RGBA8Unorm) {
+  if (format != gl::TextureFormat::RGBA8Unorm) {
     Log.error("[sdl2shim-efb] unsupported present format {}; keeping swapchain present",
               magic_enum::enum_name(format));
     return false;
@@ -411,7 +413,7 @@ bool initialize(ProcAddressFn getProc, void* eglDisplay, uint32_t width, uint32_
 #endif
 }
 
-bool resize(uint32_t width, uint32_t height, wgpu::TextureFormat format) {
+bool resize(uint32_t width, uint32_t height, gl::TextureFormat format) {
   if (!g_active) {
     return false;
   }

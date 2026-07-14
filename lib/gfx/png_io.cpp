@@ -90,7 +90,7 @@ std::optional<ConvertedTexture> parse_png_bytes(ArrayRef<uint8_t> bytes) noexcep
   png_read_end(structs.pStruct, nullptr);
 
   return ConvertedTexture{
-    .format = wgpu::TextureFormat::RGBA8Unorm,
+    .format = gl::TextureFormat::RGBA8Unorm,
     .width = width,
     .height = height,
     .mips = 1,

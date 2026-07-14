@@ -16,8 +16,6 @@ using namespace std::string_literals;
 namespace aurora::gfx::tex_copy_conv {
 static Module Log("aurora::gfx::tex_copy_conv");
 
-using webgpu::g_device;
-
 static constexpr std::string_view ShaderPreamble = R"(
 @group(0) @binding(0) var src_samp: sampler;
 @group(0) @binding(1) var src: texture_2d<f32>;
@@ -286,398 +284,151 @@ var<private> positions: array<vec2f, 3> = array(
 struct ConvPipeline {
   GXTexFmt fmt;
   std::string_view fragShader;
-  wgpu::TextureFormat outputFormat;
+  gl::TextureFormat outputFormat;
   const char* label;
 };
 
 static constexpr std::array ConvPipelines{
-    ConvPipeline{GX_TF_I4, FragI4, wgpu::TextureFormat::RGBA8Unorm, "TexCopyConv I4"},
-    ConvPipeline{GX_TF_I8, FragI8, wgpu::TextureFormat::RGBA8Unorm, "TexCopyConv I8"},
-    ConvPipeline{GX_TF_IA4, FragIA4, wgpu::TextureFormat::RGBA8Unorm, "TexCopyConv IA4"},
-    ConvPipeline{GX_TF_IA8, FragIA8, wgpu::TextureFormat::RGBA8Unorm, "TexCopyConv IA8"},
-    ConvPipeline{GX_TF_RGB565, FragRGB565, wgpu::TextureFormat::RGBA8Unorm, "TexCopyConv RGB565"},
-    ConvPipeline{GX_CTF_R4, FragR4, wgpu::TextureFormat::RGBA8Unorm, "TexCopyConv R4"},
-    ConvPipeline{GX_CTF_RA4, FragRA4, wgpu::TextureFormat::RGBA8Unorm, "TexCopyConv RA4"},
-    ConvPipeline{GX_CTF_RA8, FragRA8, wgpu::TextureFormat::RGBA8Unorm, "TexCopyConv RA8"},
-    ConvPipeline{GX_CTF_A8, FragA8, wgpu::TextureFormat::RGBA8Unorm, "TexCopyConv A8"},
-    ConvPipeline{GX_CTF_R8, FragR8, wgpu::TextureFormat::RGBA8Unorm, "TexCopyConv R8"},
-    ConvPipeline{GX_CTF_G8, FragG8, wgpu::TextureFormat::RGBA8Unorm, "TexCopyConv G8"},
-    ConvPipeline{GX_CTF_B8, FragB8, wgpu::TextureFormat::RGBA8Unorm, "TexCopyConv B8"},
-    ConvPipeline{GX_CTF_RG8, FragRG8, wgpu::TextureFormat::RGBA8Unorm, "TexCopyConv RG8"},
-    ConvPipeline{GX_CTF_GB8, FragGB8, wgpu::TextureFormat::RGBA8Unorm, "TexCopyConv GB8"},
+    ConvPipeline{GX_TF_I4, FragI4, gl::TextureFormat::RGBA8Unorm, "TexCopyConv I4"},
+    ConvPipeline{GX_TF_I8, FragI8, gl::TextureFormat::RGBA8Unorm, "TexCopyConv I8"},
+    ConvPipeline{GX_TF_IA4, FragIA4, gl::TextureFormat::RGBA8Unorm, "TexCopyConv IA4"},
+    ConvPipeline{GX_TF_IA8, FragIA8, gl::TextureFormat::RGBA8Unorm, "TexCopyConv IA8"},
+    ConvPipeline{GX_TF_RGB565, FragRGB565, gl::TextureFormat::RGBA8Unorm, "TexCopyConv RGB565"},
+    ConvPipeline{GX_CTF_R4, FragR4, gl::TextureFormat::RGBA8Unorm, "TexCopyConv R4"},
+    ConvPipeline{GX_CTF_RA4, FragRA4, gl::TextureFormat::RGBA8Unorm, "TexCopyConv RA4"},
+    ConvPipeline{GX_CTF_RA8, FragRA8, gl::TextureFormat::RGBA8Unorm, "TexCopyConv RA8"},
+    ConvPipeline{GX_CTF_A8, FragA8, gl::TextureFormat::RGBA8Unorm, "TexCopyConv A8"},
+    ConvPipeline{GX_CTF_R8, FragR8, gl::TextureFormat::RGBA8Unorm, "TexCopyConv R8"},
+    ConvPipeline{GX_CTF_G8, FragG8, gl::TextureFormat::RGBA8Unorm, "TexCopyConv G8"},
+    ConvPipeline{GX_CTF_B8, FragB8, gl::TextureFormat::RGBA8Unorm, "TexCopyConv B8"},
+    ConvPipeline{GX_CTF_RG8, FragRG8, gl::TextureFormat::RGBA8Unorm, "TexCopyConv RG8"},
+    ConvPipeline{GX_CTF_GB8, FragGB8, gl::TextureFormat::RGBA8Unorm, "TexCopyConv GB8"},
 };
 
 static constexpr std::array DepthConvPipelines{
-    ConvPipeline{GX_TF_Z16, FragZ16, wgpu::TextureFormat::RGBA8Unorm, "TexCopyConv Z16"},
+    ConvPipeline{GX_TF_Z16, FragZ16, gl::TextureFormat::RGBA8Unorm, "TexCopyConv Z16"},
 };
 
-static wgpu::BindGroupLayout g_bindGroupLayout;
-static wgpu::BindGroupLayout g_depthBindGroupLayout;
-static wgpu::Sampler g_nearestSampler;
-static wgpu::Sampler g_linearSampler;
-static absl::flat_hash_map<GXTexFmt, wgpu::RenderPipeline> g_pipelines;
-static wgpu::RenderPipeline g_blitPipeline;
-static wgpu::BindGroupLayout g_depthSnapshotBindGroupLayout;
-static wgpu::BindGroupLayout g_depthSnapshotBindGroupLayoutMS;
-static wgpu::RenderPipeline g_depthSnapshotPipeline;
-static wgpu::RenderPipeline g_depthSnapshotPipelineMS;
+// Phase 4: BindGroupLayout / PipelineLayout have no GL equivalent and are dropped;
+// the src texture/sampler/uniform bindings are resolved directly at draw time.
+static gl::Sampler g_nearestSampler;
+static gl::Sampler g_linearSampler;
+static absl::flat_hash_map<GXTexFmt, gl::Pipeline> g_pipelines;
+static gl::Pipeline g_blitPipeline;
+static gl::Pipeline g_depthSnapshotPipeline;
+static gl::Pipeline g_depthSnapshotPipelineMS;
 
-static wgpu::BindGroupLayout create_depth_snapshot_layout(bool multisampled, const char* label) {
-  const std::array entries{
-      wgpu::BindGroupLayoutEntry{
-          .binding = 0,
-          .visibility = wgpu::ShaderStage::Fragment,
-          .texture =
-              wgpu::TextureBindingLayout{
-                  .sampleType = wgpu::TextureSampleType::Depth,
-                  .viewDimension = wgpu::TextureViewDimension::e2D,
-                  .multisampled = multisampled,
-              },
-      },
-  };
-  const wgpu::BindGroupLayoutDescriptor descriptor{
-      .label = label,
-      .entryCount = entries.size(),
-      .entries = entries.data(),
-  };
-  return g_device.CreateBindGroupLayout(&descriptor);
-}
-
-static wgpu::RenderPipeline create_depth_snapshot_pipeline(const std::string_view shaderSource,
-                                                           const wgpu::BindGroupLayout& bindGroupLayout,
-                                                           const char* label) {
+static gl::Pipeline create_depth_snapshot_pipeline(const std::string_view shaderSource, const char* label) {
   const std::string source{shaderSource};
-  const wgpu::ShaderSourceWGSL wgslSource{wgpu::ShaderSourceWGSL::Init{
-      .code = source.c_str(),
-  }};
-  const wgpu::ShaderModuleDescriptor moduleDescriptor{
-      .nextInChain = &wgslSource,
-      .label = label,
-  };
-  const auto module = g_device.CreateShaderModule(&moduleDescriptor);
-
-  const std::array colorTargets{wgpu::ColorTargetState{
-      .format = wgpu::TextureFormat::R32Float,
-  }};
-  const wgpu::FragmentState fragmentState{
-      .module = module,
-      .entryPoint = "fs_main",
-      .targetCount = colorTargets.size(),
-      .targets = colorTargets.data(),
-  };
-  const wgpu::PipelineLayoutDescriptor layoutDescriptor{
-      .bindGroupLayoutCount = 1,
-      .bindGroupLayouts = &bindGroupLayout,
-  };
-  const auto pipelineLayout = g_device.CreatePipelineLayout(&layoutDescriptor);
-  const wgpu::RenderPipelineDescriptor pipelineDescriptor{
-      .label = label,
-      .layout = pipelineLayout,
-      .vertex =
-          wgpu::VertexState{
-              .module = module,
-              .entryPoint = "vs_main",
-          },
-      .primitive =
-          wgpu::PrimitiveState{
-              .topology = wgpu::PrimitiveTopology::TriangleList,
-          },
-      .fragment = &fragmentState,
-  };
-  return g_device.CreateRenderPipeline(&pipelineDescriptor);
+  // Phase 4: compile `source` (WGSL today, GLSL after translation) into a GL program
+  // rendering depth -> R32Float, and cache it. Program compile is Phase 3/4; return a
+  // state-only stub (program == 0) so the pipeline slot exists.
+  (void)source;
+  (void)label;
+  gl::Pipeline pipeline;
+  pipeline.state.topology = gl::PrimitiveTopology::TriangleList;
+  return pipeline;
 }
 
-static wgpu::RenderPipeline create_pipeline(const ConvPipeline& conv, const std::string_view shaderPreamble,
-                                            const wgpu::BindGroupLayout& bindGroupLayout) {
+static gl::Pipeline create_pipeline(const ConvPipeline& conv, const std::string_view shaderPreamble) {
   std::string shaderSource;
   shaderSource.reserve(shaderPreamble.size() + conv.fragShader.size());
   shaderSource += shaderPreamble;
   shaderSource += conv.fragShader;
 
-  const wgpu::ShaderSourceWGSL wgslSource{wgpu::ShaderSourceWGSL::Init{
-      .code = shaderSource.c_str(),
-  }};
-  const wgpu::ShaderModuleDescriptor moduleDescriptor{
-      .nextInChain = &wgslSource,
-      .label = conv.label,
-  };
-  const auto module = g_device.CreateShaderModule(&moduleDescriptor);
-
-  const std::array colorTargets{wgpu::ColorTargetState{
-      .format = conv.outputFormat,
-  }};
-  const wgpu::FragmentState fragmentState{
-      .module = module,
-      .entryPoint = "fs_main",
-      .targetCount = colorTargets.size(),
-      .targets = colorTargets.data(),
-  };
-
-  const wgpu::PipelineLayoutDescriptor layoutDescriptor{
-      .bindGroupLayoutCount = 1,
-      .bindGroupLayouts = &bindGroupLayout,
-  };
-  const auto pipelineLayout = g_device.CreatePipelineLayout(&layoutDescriptor);
-
-  const wgpu::RenderPipelineDescriptor pipelineDescriptor{
-      .label = conv.label,
-      .layout = pipelineLayout,
-      .vertex =
-          wgpu::VertexState{
-              .module = module,
-              .entryPoint = "vs_main",
-          },
-      .primitive =
-          wgpu::PrimitiveState{
-              .topology = wgpu::PrimitiveTopology::TriangleList,
-          },
-      .fragment = &fragmentState,
-  };
-  return g_device.CreateRenderPipeline(&pipelineDescriptor);
+  // Phase 4: compile `shaderSource` into a GL program targeting conv.outputFormat and
+  // cache it. Program compile is Phase 3/4; return a state-only stub (program == 0) so
+  // needs_conversion() and the g_pipelines map stay correctly populated.
+  (void)shaderSource;
+  gl::Pipeline pipeline;
+  pipeline.state.topology = gl::PrimitiveTopology::TriangleList;
+  return pipeline;
 }
 
 bool needs_conversion(const GXTexFmt fmt) { return g_pipelines.contains(fmt); }
 
 void initialize() {
-  static constexpr std::array bindGroupLayoutEntries{
-      wgpu::BindGroupLayoutEntry{
-          .binding = 0,
-          .visibility = wgpu::ShaderStage::Fragment,
-          .sampler =
-              wgpu::SamplerBindingLayout{
-                  .type = wgpu::SamplerBindingType::Filtering,
-              },
-      },
-      wgpu::BindGroupLayoutEntry{
-          .binding = 1,
-          .visibility = wgpu::ShaderStage::Fragment,
-          .texture =
-              wgpu::TextureBindingLayout{
-                  .sampleType = wgpu::TextureSampleType::Float,
-                  .viewDimension = wgpu::TextureViewDimension::e2D,
-              },
-      },
-      wgpu::BindGroupLayoutEntry{
-          .binding = 2,
-          .visibility = wgpu::ShaderStage::Vertex,
-          .buffer =
-              wgpu::BufferBindingLayout{
-                  .type = wgpu::BufferBindingType::Uniform,
-              },
-      },
-  };
-  static constexpr wgpu::BindGroupLayoutDescriptor bindGroupLayoutDescriptor{
-      .label = "TexCopyConv Bind Group Layout",
-      .entryCount = bindGroupLayoutEntries.size(),
-      .entries = bindGroupLayoutEntries.data(),
-  };
-  g_bindGroupLayout = g_device.CreateBindGroupLayout(&bindGroupLayoutDescriptor);
-
-  static constexpr std::array depthBindGroupLayoutEntries{
-      wgpu::BindGroupLayoutEntry{
-          .binding = 0,
-          .visibility = wgpu::ShaderStage::Fragment,
-          .texture =
-              wgpu::TextureBindingLayout{
-                  .sampleType = wgpu::TextureSampleType::Depth,
-                  .viewDimension = wgpu::TextureViewDimension::e2D,
-              },
-      },
-      wgpu::BindGroupLayoutEntry{
-          .binding = 1,
-          .visibility = wgpu::ShaderStage::Vertex,
-          .buffer =
-              wgpu::BufferBindingLayout{
-                  .type = wgpu::BufferBindingType::Uniform,
-              },
-      },
-  };
-  static constexpr wgpu::BindGroupLayoutDescriptor depthBindGroupLayoutDescriptor{
-      .label = "TexCopyConv Depth Bind Group Layout",
-      .entryCount = depthBindGroupLayoutEntries.size(),
-      .entries = depthBindGroupLayoutEntries.data(),
-  };
-  g_depthBindGroupLayout = g_device.CreateBindGroupLayout(&depthBindGroupLayoutDescriptor);
+  // Phase 4: BindGroupLayout descriptors dropped (no GL equivalent).
 
   g_blitPipeline = create_pipeline(
       {GX_TF_RGBA8, FragPassthrough, webgpu::g_graphicsConfig.surfaceConfiguration.format, "TexCopyConv Blit"},
-      ShaderPreamble, g_bindGroupLayout);
+      ShaderPreamble);
   for (const auto& conv : ConvPipelines) {
-    g_pipelines[conv.fmt] = create_pipeline(conv, ShaderPreamble, g_bindGroupLayout);
-    if (conv.outputFormat != to_wgpu(conv.fmt)) {
+    g_pipelines[conv.fmt] = create_pipeline(conv, ShaderPreamble);
+    if (conv.outputFormat != to_gl(conv.fmt)) {
       Log.fatal("Output format mismatch for {}", conv.fmt);
     }
   }
   // Skip depth copies in compatibility mode
   if (webgpu::g_hasCoreFeatures) {
     for (const auto& conv : DepthConvPipelines) {
-      g_pipelines[conv.fmt] = create_pipeline(conv, DepthShaderPreamble, g_depthBindGroupLayout);
-      if (conv.outputFormat != to_wgpu(conv.fmt)) {
+      g_pipelines[conv.fmt] = create_pipeline(conv, DepthShaderPreamble);
+      if (conv.outputFormat != to_gl(conv.fmt)) {
         Log.fatal("Output format mismatch for {}", conv.fmt);
       }
     }
-    g_depthSnapshotBindGroupLayout = create_depth_snapshot_layout(false, "Depth Snapshot Bind Group Layout");
-    g_depthSnapshotBindGroupLayoutMS = create_depth_snapshot_layout(true, "Depth Snapshot MS Bind Group Layout");
-    g_depthSnapshotPipeline =
-        create_depth_snapshot_pipeline(DepthSnapshotShader, g_depthSnapshotBindGroupLayout, "Depth Snapshot");
-    g_depthSnapshotPipelineMS =
-        create_depth_snapshot_pipeline(DepthSnapshotShaderMS, g_depthSnapshotBindGroupLayoutMS, "Depth Snapshot MS");
+    g_depthSnapshotPipeline = create_depth_snapshot_pipeline(DepthSnapshotShader, "Depth Snapshot");
+    g_depthSnapshotPipelineMS = create_depth_snapshot_pipeline(DepthSnapshotShaderMS, "Depth Snapshot MS");
   }
 
-  static constexpr wgpu::SamplerDescriptor nearestSamplerDescriptor{
-      .label = "TexCopyConv Nearest Sampler",
-      .magFilter = wgpu::FilterMode::Nearest,
-      .minFilter = wgpu::FilterMode::Nearest,
-  };
-  g_nearestSampler = g_device.CreateSampler(&nearestSamplerDescriptor);
-
-  static constexpr wgpu::SamplerDescriptor linearSamplerDescriptor{
-      .label = "TexCopyConv Linear Sampler",
-      .magFilter = wgpu::FilterMode::Linear,
-      .minFilter = wgpu::FilterMode::Linear,
-  };
-  g_linearSampler = g_device.CreateSampler(&linearSamplerDescriptor);
+  // Phase 4: create real GL samplers via gl::create_sampler() once the render context
+  // is current. Nearest for point copies, linear for scaled blits.
+  g_nearestSampler = gl::Sampler{};
+  g_linearSampler = gl::Sampler{};
 }
 
 void shutdown() {
   g_pipelines.clear();
   g_blitPipeline = {};
-  g_bindGroupLayout = {};
-  g_depthBindGroupLayout = {};
   g_nearestSampler = {};
   g_linearSampler = {};
-  g_depthSnapshotBindGroupLayout = {};
-  g_depthSnapshotBindGroupLayoutMS = {};
   g_depthSnapshotPipeline = {};
   g_depthSnapshotPipelineMS = {};
 }
 
-static void execute(const wgpu::CommandEncoder& cmd, const ConvRequest& req, const wgpu::RenderPipeline& pipeline) {
+static void execute(const ConvRequest& req, const gl::Pipeline& pipeline) {
   if (!pipeline) {
     return;
   }
-  wgpu::BindGroup bindGroup;
   if (gx::is_depth_format(req.fmt)) {
     // Skip depth copies in compatibility mode
     if (!webgpu::g_hasCoreFeatures) {
       return;
     }
-    const std::array bindGroupEntries{
-        wgpu::BindGroupEntry{
-            .binding = 0,
-            .textureView = req.srcView,
-        },
-        wgpu::BindGroupEntry{
-            .binding = 1,
-            .buffer = g_uniformBuffer,
-            .offset = req.uniformRange.offset,
-            .size = req.uniformRange.size,
-        },
-    };
-    const wgpu::BindGroupDescriptor bindGroupDescriptor{
-        .layout = g_depthBindGroupLayout,
-        .entryCount = bindGroupEntries.size(),
-        .entries = bindGroupEntries.data(),
-    };
-    bindGroup = g_device.CreateBindGroup(&bindGroupDescriptor);
-  } else {
-    const auto& sampler = req.sampleFilter == SampleFilter::Linear ? g_linearSampler : g_nearestSampler;
-    const std::array bindGroupEntries{
-        wgpu::BindGroupEntry{
-            .binding = 0,
-            .sampler = sampler,
-        },
-        wgpu::BindGroupEntry{
-            .binding = 1,
-            .textureView = req.srcView,
-        },
-        wgpu::BindGroupEntry{
-            .binding = 2,
-            .buffer = g_uniformBuffer,
-            .offset = req.uniformRange.offset,
-            .size = req.uniformRange.size,
-        },
-    };
-    const wgpu::BindGroupDescriptor bindGroupDescriptor{
-        .layout = g_bindGroupLayout,
-        .entryCount = bindGroupEntries.size(),
-        .entries = bindGroupEntries.data(),
-    };
-    bindGroup = g_device.CreateBindGroup(&bindGroupDescriptor);
   }
-
-  const std::array colorAttachments{
-      wgpu::RenderPassColorAttachment{
-          .view = req.dst->attachmentTextureView,
-          .loadOp = wgpu::LoadOp::Clear,
-          .storeOp = wgpu::StoreOp::Store,
-          .clearValue = {0.0, 0.0, 0.0, 0.0},
-      },
-  };
-  const wgpu::RenderPassDescriptor renderPassDescriptor{
-      .label = "TexCopyConv Pass",
-      .colorAttachmentCount = colorAttachments.size(),
-      .colorAttachments = colorAttachments.data(),
-      .timestampWrites = webgpu::gpu_prof::pass_writes("EFB copy convert"),
-  };
-  const auto pass = cmd.BeginRenderPass(&renderPassDescriptor);
-  pass.SetPipeline(pipeline);
-  pass.SetBindGroup(0, bindGroup);
-  pass.Draw(3);
-  pass.End();
+  // Phase 4: issue the actual GL conversion draw directly on the render worker:
+  //   - color path: bind req.srcView (sampled) with the nearest/linear sampler
+  //     (req.sampleFilter) and the g_uniformBuffer UV-transform at req.uniformRange;
+  //   - depth path: bind req.srcView as a depth texture + the same uniform;
+  //   - attach req.dst->attachmentTextureView to an FBO (clear to 0), SetPipeline,
+  //     and draw the 3-vertex fullscreen triangle.
+  // All Dawn bindgroup/render-pass/draw work is stubbed for Phase 1.
+  (void)req;
 }
 
-void run(const wgpu::CommandEncoder& cmd, const ConvRequest& req) {
+void run(const ConvRequest& req) {
   const auto it = g_pipelines.find(req.fmt);
   if (it == g_pipelines.end()) {
     Log.fatal("No copy conversion pipeline for format {}", static_cast<int>(req.fmt));
   }
-  execute(cmd, req, it->second);
+  execute(req, it->second);
 }
 
-void blit(const wgpu::CommandEncoder& cmd, const ConvRequest& req) { execute(cmd, req, g_blitPipeline); }
+void blit(const ConvRequest& req) { execute(req, g_blitPipeline); }
 
 bool snapshot_depth_supported() noexcept { return static_cast<bool>(g_depthSnapshotPipeline); }
 
-void snapshot_depth(const wgpu::CommandEncoder& cmd, const wgpu::TextureView& srcDepth, uint32_t msaaSamples,
-                    const wgpu::TextureView& dst) {
+void snapshot_depth(const gl::Texture& srcDepth, uint32_t msaaSamples, const gl::Texture& dst) {
   const bool multisampled = msaaSamples > 1;
   const auto& pipeline = multisampled ? g_depthSnapshotPipelineMS : g_depthSnapshotPipeline;
   if (!pipeline) {
     return;
   }
-  const std::array bindGroupEntries{
-      wgpu::BindGroupEntry{
-          .binding = 0,
-          .textureView = srcDepth,
-      },
-  };
-  const wgpu::BindGroupDescriptor bindGroupDescriptor{
-      .layout = multisampled ? g_depthSnapshotBindGroupLayoutMS : g_depthSnapshotBindGroupLayout,
-      .entryCount = bindGroupEntries.size(),
-      .entries = bindGroupEntries.data(),
-  };
-  const auto bindGroup = g_device.CreateBindGroup(&bindGroupDescriptor);
-
-  const std::array colorAttachments{
-      wgpu::RenderPassColorAttachment{
-          .view = dst,
-          .loadOp = wgpu::LoadOp::Clear,
-          .storeOp = wgpu::StoreOp::Store,
-          .clearValue = {0.0, 0.0, 0.0, 0.0},
-      },
-  };
-  const wgpu::RenderPassDescriptor renderPassDescriptor{
-      .label = "Depth Snapshot Pass",
-      .colorAttachmentCount = colorAttachments.size(),
-      .colorAttachments = colorAttachments.data(),
-      .timestampWrites = webgpu::gpu_prof::pass_writes("Depth snapshot"),
-  };
-  const auto pass = cmd.BeginRenderPass(&renderPassDescriptor);
-  pass.SetPipeline(pipeline);
-  pass.SetBindGroup(0, bindGroup);
-  pass.Draw(3);
-  pass.End();
+  // Phase 4: bind srcDepth as a (multisampled) depth texture, attach dst to an FBO,
+  // SetPipeline, and draw the fullscreen triangle to snapshot depth -> R32Float.
+  // Dawn bindgroup/render-pass/draw work stubbed for Phase 1.
+  (void)srcDepth;
+  (void)dst;
 }
 
 } // namespace aurora::gfx::tex_copy_conv

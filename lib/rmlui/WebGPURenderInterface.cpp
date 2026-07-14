@@ -42,10 +42,10 @@ struct ShaderGeometryData {
 };
 
 struct ShaderTextureData {
-  wgpu::Texture m_texture;
-  wgpu::TextureView m_textureView;
+  gl::Texture m_texture;
+  gl::Texture m_textureView;
   std::vector<Rml::byte> m_pendingUpload;
-  wgpu::Extent3D m_size{};
+  gl::Extent3D m_size{};
   uint32_t m_rowBytes = 0;
   bool m_uploaded = false;
 };
@@ -250,9 +250,9 @@ Rml::Rectanglei downsample_scissor(Rml::Rectanglei scissor) {
   return scissor;
 }
 
-PipelineConfig make_pipeline_config(PipelineKind kind, wgpu::TextureFormat colorFormat, uint32_t sampleCount,
+PipelineConfig make_pipeline_config(PipelineKind kind, gl::TextureFormat colorFormat, uint32_t sampleCount,
                                     VertexLayoutKind vertexLayout, StencilMode stencilMode, BlendMode blendMode,
-                                    wgpu::ColorWriteMask colorWriteMask = wgpu::ColorWriteMask::All) {
+                                    gl::ColorWriteMask colorWriteMask = gl::ColorWriteMask::All) {
   return {
       .kind = static_cast<uint32_t>(kind),
       .colorFormat = static_cast<uint32_t>(colorFormat),
@@ -265,21 +265,21 @@ PipelineConfig make_pipeline_config(PipelineKind kind, wgpu::TextureFormat color
   };
 }
 
-gfx::PipelineRef geometry_pipeline(wgpu::TextureFormat colorFormat, uint32_t sampleCount,
+gfx::PipelineRef geometry_pipeline(gl::TextureFormat colorFormat, uint32_t sampleCount,
                                    WebGPURenderInterface::PipelineType type) {
   StencilMode stencilMode = StencilMode::AlwaysKeep;
-  auto colorWriteMask = wgpu::ColorWriteMask::All;
+  auto colorWriteMask = gl::ColorWriteMask::All;
   switch (type) {
   case WebGPURenderInterface::PipelineType::Masked:
     stencilMode = StencilMode::EqualKeep;
     break;
   case WebGPURenderInterface::PipelineType::ClipReplace:
     stencilMode = StencilMode::ClipReplace;
-    colorWriteMask = wgpu::ColorWriteMask::None;
+    colorWriteMask = gl::ColorWriteMask::None;
     break;
   case WebGPURenderInterface::PipelineType::ClipIntersect:
     stencilMode = StencilMode::ClipIntersect;
-    colorWriteMask = wgpu::ColorWriteMask::None;
+    colorWriteMask = gl::ColorWriteMask::None;
     break;
   case WebGPURenderInterface::PipelineType::Normal:
   case WebGPURenderInterface::PipelineType::Count:
@@ -291,13 +291,13 @@ gfx::PipelineRef geometry_pipeline(wgpu::TextureFormat colorFormat, uint32_t sam
                                                 colorWriteMask));
 }
 
-gfx::PipelineRef gradient_pipeline(wgpu::TextureFormat colorFormat, uint32_t sampleCount, bool masked) {
+gfx::PipelineRef gradient_pipeline(gl::TextureFormat colorFormat, uint32_t sampleCount, bool masked) {
   return gfx::pipeline_ref(
       make_pipeline_config(PipelineKind::Gradient, colorFormat, sampleCount, VertexLayoutKind::Geometry,
                            masked ? StencilMode::EqualKeep : StencilMode::AlwaysKeep, BlendMode::Premultiplied));
 }
 
-gfx::PipelineRef blit_pipeline(wgpu::TextureFormat colorFormat, uint32_t sampleCount,
+gfx::PipelineRef blit_pipeline(gl::TextureFormat colorFormat, uint32_t sampleCount,
                                WebGPURenderInterface::BlitPipelineType type, bool useStencil) {
   const bool blend = type == WebGPURenderInterface::BlitPipelineType::Blend ||
                      type == WebGPURenderInterface::BlitPipelineType::BlendMasked;
@@ -309,7 +309,7 @@ gfx::PipelineRef blit_pipeline(wgpu::TextureFormat colorFormat, uint32_t sampleC
                            blend ? BlendMode::Premultiplied : BlendMode::None));
 }
 
-gfx::PipelineRef simple_filter_pipeline(wgpu::TextureFormat colorFormat, uint32_t sampleCount,
+gfx::PipelineRef simple_filter_pipeline(gl::TextureFormat colorFormat, uint32_t sampleCount,
                                         WebGPURenderInterface::BlitPipelineType type, bool useStencil) {
   const bool blend = type == WebGPURenderInterface::BlitPipelineType::Blend ||
                      type == WebGPURenderInterface::BlitPipelineType::BlendMasked;
@@ -321,13 +321,13 @@ gfx::PipelineRef simple_filter_pipeline(wgpu::TextureFormat colorFormat, uint32_
                            blend ? BlendMode::Premultiplied : BlendMode::None));
 }
 
-gfx::PipelineRef seed_resample_pipeline(wgpu::TextureFormat colorFormat, uint32_t sampleCount, bool useStencil) {
+gfx::PipelineRef seed_resample_pipeline(gl::TextureFormat colorFormat, uint32_t sampleCount, bool useStencil) {
   return gfx::pipeline_ref(
       make_pipeline_config(PipelineKind::SeedResample, colorFormat, sampleCount, VertexLayoutKind::Fullscreen,
                            useStencil ? StencilMode::AlwaysKeep : StencilMode::None, BlendMode::None));
 }
 
-gfx::PipelineRef filter_pipeline(PipelineKind kind, wgpu::TextureFormat colorFormat,
+gfx::PipelineRef filter_pipeline(PipelineKind kind, gl::TextureFormat colorFormat,
                                  VertexLayoutKind vertexLayout = VertexLayoutKind::Fullscreen,
                                  BlendMode blendMode = BlendMode::None) {
   return gfx::pipeline_ref(make_pipeline_config(kind, colorFormat, 1, vertexLayout, StencilMode::None, blendMode));
@@ -337,12 +337,9 @@ void queue_texture_upload_if_needed(ShaderTextureData& texture) {
   if (texture.m_uploaded || texture.m_pendingUpload.empty()) {
     return;
   }
-  const wgpu::TexelCopyTextureInfo dst{
-      .texture = texture.m_texture,
-      .aspect = wgpu::TextureAspect::All,
-  };
-  gfx::queue_texture_upload_data(texture.m_pendingUpload.data(), texture.m_rowBytes, texture.m_size.height, dst,
-                                 texture.m_size);
+  // Phase 5: direct glTexSubImage2D from CPU memory (no staging buffer / CopyBufferToTexture).
+  gfx::queue_texture_upload_data(texture.m_pendingUpload.data(), texture.m_rowBytes, texture.m_size.height,
+                                 texture.m_texture, gl::Origin3D{}, texture.m_size);
   texture.m_pendingUpload.clear();
   texture.m_pendingUpload.shrink_to_fit();
   texture.m_uploaded = true;
@@ -449,20 +446,15 @@ Rml::TextureHandle WebGPURenderInterface::LoadTexture(Rml::Vector2i& dimensions,
 Rml::TextureHandle WebGPURenderInterface::GenerateTexture(Rml::Span<const Rml::byte> source,
                                                           Rml::Vector2i source_dimensions) {
   auto* texData = new ShaderTextureData();
-  const wgpu::Extent3D size{
+  const gl::Extent3D size{
       .width = static_cast<uint32_t>(source_dimensions.x),
       .height = static_cast<uint32_t>(source_dimensions.y),
       .depthOrArrayLayers = 1,
   };
-  const wgpu::TextureDescriptor textureDesc{
-      .label = "RmlUi Texture",
-      .usage = wgpu::TextureUsage::CopyDst | wgpu::TextureUsage::TextureBinding,
-      .dimension = wgpu::TextureDimension::e2D,
-      .size = size,
-      .format = wgpu::TextureFormat::RGBA8Unorm,
-  };
-  texData->m_texture = webgpu::g_device.CreateTexture(&textureDesc);
-  texData->m_textureView = texData->m_texture.CreateView(nullptr);
+  // Phase 5: create an immutable RGBA8 2D texture (gl::create_texture) and keep its handle.
+  // The view collapses into the texture handle on GL.
+  texData->m_texture = gl::Texture{};
+  texData->m_textureView = texData->m_texture;
 
   constexpr uint32_t BytesPerPixel = 4;
   texData->m_size = size;
@@ -582,7 +574,7 @@ void WebGPURenderInterface::SetTransform(const Rml::Matrix4f* transform) {
   }
 }
 
-void WebGPURenderInterface::EnsureRenderTarget(RenderTarget& target, const char* label, const wgpu::Extent3D& size,
+void WebGPURenderInterface::EnsureRenderTarget(RenderTarget& target, const char* label, const gl::Extent3D& size,
                                                bool multisampled) {
   const bool useMultisampling = multisampled && LayerSampleCount > 1;
   if (target.view && target.size == size && static_cast<bool>(target.multisampleView) == useMultisampling) {
@@ -591,34 +583,18 @@ void WebGPURenderInterface::EnsureRenderTarget(RenderTarget& target, const char*
 
   target = {};
   target.size = size;
-  const wgpu::TextureDescriptor textureDesc{
-      .label = label,
-      .usage = wgpu::TextureUsage::RenderAttachment | wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::CopySrc,
-      .dimension = wgpu::TextureDimension::e2D,
-      .size = size,
-      .format = m_renderTargetFormat,
-      .mipLevelCount = 1,
-      .sampleCount = 1,
-  };
-  target.texture = webgpu::g_device.CreateTexture(&textureDesc);
-  target.view = target.texture.CreateView(nullptr);
+  // Phase 5: allocate the renderable m_renderTargetFormat color texture (+ FBO). View == texture on GL.
+  target.texture = gl::Texture{};
+  target.view = target.texture;
 
   if (useMultisampling) {
-    const wgpu::TextureDescriptor multisampleTextureDesc{
-        .label = "RmlUi Multisampled Render Target",
-        .usage = wgpu::TextureUsage::RenderAttachment,
-        .dimension = wgpu::TextureDimension::e2D,
-        .size = size,
-        .format = m_renderTargetFormat,
-        .mipLevelCount = 1,
-        .sampleCount = LayerSampleCount,
-    };
-    target.multisampleTexture = webgpu::g_device.CreateTexture(&multisampleTextureDesc);
-    target.multisampleView = target.multisampleTexture.CreateView(nullptr);
+    // Phase 5: allocate the multisampled render-attachment texture (LayerSampleCount samples).
+    target.multisampleTexture = gl::Texture{};
+    target.multisampleView = target.multisampleTexture;
   }
 }
 
-void WebGPURenderInterface::EnsureFrameTargets(const wgpu::Extent3D& size) {
+void WebGPURenderInterface::EnsureFrameTargets(const gl::Extent3D& size) {
   if (m_layers.empty()) {
     m_layers.resize(1);
   }
@@ -681,22 +657,22 @@ void WebGPURenderInterface::ApplyFullFrameScissor() const {
   gfx::set_scissor({0, 0, static_cast<int32_t>(m_frameSize.width), static_cast<int32_t>(m_frameSize.height)});
 }
 
-void WebGPURenderInterface::BeginRenderTargetPass(const wgpu::TextureView& view, wgpu::LoadOp loadOp, const char* label,
+void WebGPURenderInterface::BeginRenderTargetPass(const gl::Texture& view, gl::LoadOp loadOp, const char* label,
                                                   bool clearStencil) {
   EndActivePass();
   gfx::begin_color_pass({
       .label = label,
       .colorView = view,
-      .depthStencilView = clearStencil ? GetClipMaskStencilView(m_frameSize) : wgpu::TextureView{},
+      .depthStencilView = clearStencil ? GetClipMaskStencilView(m_frameSize) : gl::Texture{},
       .targetSize = m_frameSize,
       .sampleCount = 1,
       .colorLoadOp = loadOp,
-      .colorStoreOp = wgpu::StoreOp::Store,
+      .colorStoreOp = gl::StoreOp::Store,
       .clearColor = {0.f, 0.f, 0.f, 0.f},
       .depthReadOnly = clearStencil,
       .hasStencil = clearStencil,
-      .stencilLoadOp = clearStencil ? wgpu::LoadOp::Clear : wgpu::LoadOp::Undefined,
-      .stencilStoreOp = clearStencil ? wgpu::StoreOp::Store : wgpu::StoreOp::Undefined,
+      .stencilLoadOp = clearStencil ? gl::LoadOp::Clear : gl::LoadOp::Undefined,
+      .stencilStoreOp = clearStencil ? gl::StoreOp::Store : gl::StoreOp::Undefined,
       .stencilClearValue = 0,
   });
   m_passActive = true;
@@ -704,7 +680,7 @@ void WebGPURenderInterface::BeginRenderTargetPass(const wgpu::TextureView& view,
   ApplyScissorRegion();
 }
 
-void WebGPURenderInterface::BeginLayerPass(Rml::LayerHandle layer, wgpu::LoadOp loadOp, const char* label,
+void WebGPURenderInterface::BeginLayerPass(Rml::LayerHandle layer, gl::LoadOp loadOp, const char* label,
                                            bool clearStencil, bool resolveMultisampled) {
   m_activeLayer = layer;
   EndActivePass();
@@ -714,17 +690,17 @@ void WebGPURenderInterface::BeginLayerPass(Rml::LayerHandle layer, wgpu::LoadOp 
   gfx::begin_color_pass({
       .label = label,
       .colorView = multisampled ? target.multisampleView : target.view,
-      .resolveView = multisampled && resolveMultisampled ? target.view : wgpu::TextureView{},
+      .resolveView = multisampled && resolveMultisampled ? target.view : gl::Texture{},
       .depthStencilView = GetClipMaskStencilView(m_frameSize),
       .targetSize = m_frameSize,
       .sampleCount = multisampled ? LayerSampleCount : 1,
       .colorLoadOp = loadOp,
-      .colorStoreOp = wgpu::StoreOp::Store,
+      .colorStoreOp = gl::StoreOp::Store,
       .clearColor = {0.f, 0.f, 0.f, 0.f},
       .depthReadOnly = true,
       .hasStencil = true,
-      .stencilLoadOp = clearStencil ? wgpu::LoadOp::Clear : wgpu::LoadOp::Load,
-      .stencilStoreOp = wgpu::StoreOp::Store,
+      .stencilLoadOp = clearStencil ? gl::LoadOp::Clear : gl::LoadOp::Load,
+      .stencilStoreOp = gl::StoreOp::Store,
       .stencilClearValue = 0,
   });
   m_passActive = true;
@@ -739,7 +715,7 @@ void WebGPURenderInterface::EnsureFrameRenderingStarted() {
 
   m_frameRenderingStarted = true;
   if (m_baseLayerContent == BaseLayerContent::Transparent) {
-    BeginLayerPass(0, wgpu::LoadOp::Clear, "RmlUi transparent base layer pass", true);
+    BeginLayerPass(0, gl::LoadOp::Clear, "RmlUi transparent base layer pass", true);
     return;
   }
 
@@ -751,17 +727,17 @@ void WebGPURenderInterface::EnsureFrameRenderingStarted() {
   });
 
   if (m_layers[0].multisampleView) {
-    BeginLayerPass(0, wgpu::LoadOp::Clear, "RmlUi base layer seed pass", true);
+    BeginLayerPass(0, gl::LoadOp::Clear, "RmlUi base layer seed pass", true);
     ApplyFullFrameScissor();
     DrawFullscreenTexture(seedBindGroup, seed_resample_pipeline(m_renderTargetFormat, LayerSampleCount, true),
                           uniform_bind_group_ref(), seedUniformRange);
-    BeginLayerPass(0, wgpu::LoadOp::Load, "RmlUi base layer pass");
+    BeginLayerPass(0, gl::LoadOp::Load, "RmlUi base layer pass");
   } else {
-    BeginRenderTargetPass(m_layers[0].view, wgpu::LoadOp::Clear, "RmlUi game frame copy pass");
+    BeginRenderTargetPass(m_layers[0].view, gl::LoadOp::Clear, "RmlUi game frame copy pass");
     ApplyFullFrameScissor();
     DrawFullscreenTexture(seedBindGroup, seed_resample_pipeline(m_renderTargetFormat, 1, false),
                           uniform_bind_group_ref(), seedUniformRange);
-    BeginLayerPass(0, wgpu::LoadOp::Load, "RmlUi base layer pass", true);
+    BeginLayerPass(0, gl::LoadOp::Load, "RmlUi base layer pass", true);
   }
 }
 
@@ -771,7 +747,7 @@ void WebGPURenderInterface::EnsureActiveLayerPass(const char* label) {
     return;
   }
 
-  BeginLayerPass(m_activeLayer, wgpu::LoadOp::Load, label);
+  BeginLayerPass(m_activeLayer, gl::LoadOp::Load, label);
 }
 
 void WebGPURenderInterface::EndActivePass() {
@@ -804,8 +780,8 @@ void WebGPURenderInterface::DrawFullscreenTexture(gfx::BindGroupRef bindGroup, g
   });
 }
 
-void WebGPURenderInterface::CompositeToTarget(gfx::BindGroupRef bindGroup, const wgpu::TextureView& view,
-                                              wgpu::LoadOp loadOp, gfx::PipelineRef pipeline, const char* label,
+void WebGPURenderInterface::CompositeToTarget(gfx::BindGroupRef bindGroup, const gl::Texture& view,
+                                              gl::LoadOp loadOp, gfx::PipelineRef pipeline, const char* label,
                                               gfx::BindGroupRef extraBindGroup, gfx::Range extraUniformRange,
                                               bool extraBindGroupHasDynamicOffset, std::array<float, 4> blendConstant,
                                               bool hasBlendConstant) {
@@ -878,7 +854,7 @@ void WebGPURenderInterface::RenderBlur(float sigma, const RenderTarget& sourceDe
     const RenderTarget& source = fromSource ? sourceDestination : temp;
     const RenderTarget& destination = fromSource ? temp : sourceDestination;
 
-    BeginRenderTargetPass(destination.view, wgpu::LoadOp::Clear, "RmlUi blur downsample pass");
+    BeginRenderTargetPass(destination.view, gl::LoadOp::Clear, "RmlUi blur downsample pass");
     gfx::set_viewport({m_viewport.left, m_viewport.top, std::max(m_viewport.width * 0.5f, 1.f),
                        std::max(m_viewport.height * 0.5f, 1.f), m_viewport.znear, m_viewport.zfar});
     ApplyScissorRegion(scissor);
@@ -887,7 +863,7 @@ void WebGPURenderInterface::RenderBlur(float sigma, const RenderTarget& sourceDe
   }
 
   if ((passLevel % 2) == 0) {
-    BeginRenderTargetPass(temp.view, wgpu::LoadOp::Clear, "RmlUi blur transfer pass");
+    BeginRenderTargetPass(temp.view, gl::LoadOp::Clear, "RmlUi blur transfer pass");
     ApplyViewport();
     ApplyScissorRegion(scissor);
     DrawFullscreenTexture(texture_bind_group_ref(sourceDestination.view),
@@ -896,7 +872,7 @@ void WebGPURenderInterface::RenderBlur(float sigma, const RenderTarget& sourceDe
 
   const auto verticalRange =
       write_blur_uniform({0.f, 1.f / std::max(m_viewport.height, 1.f)}, scissor, radius, weights);
-  BeginRenderTargetPass(sourceDestination.view, wgpu::LoadOp::Clear, "RmlUi vertical blur pass");
+  BeginRenderTargetPass(sourceDestination.view, gl::LoadOp::Clear, "RmlUi vertical blur pass");
   ApplyScissorRegion(scissor);
   DrawFullscreenTexture(texture_bind_group_ref(temp.view),
                         filter_pipeline(PipelineKind::Blur, m_renderTargetFormat, VertexLayoutKind::BlurFullscreen),
@@ -904,14 +880,14 @@ void WebGPURenderInterface::RenderBlur(float sigma, const RenderTarget& sourceDe
 
   const auto horizontalRange =
       write_blur_uniform({1.f / std::max(m_viewport.width, 1.f), 0.f}, scissor, radius, weights);
-  BeginRenderTargetPass(temp.view, wgpu::LoadOp::Clear, "RmlUi horizontal blur pass");
+  BeginRenderTargetPass(temp.view, gl::LoadOp::Clear, "RmlUi horizontal blur pass");
   ApplyScissorRegion(scissor);
   DrawFullscreenTexture(texture_bind_group_ref(sourceDestination.view),
                         filter_pipeline(PipelineKind::Blur, m_renderTargetFormat, VertexLayoutKind::BlurFullscreen),
                         uniform_bind_group_ref(), horizontalRange);
 
   const auto upscaleRange = write_region_blit_uniform(scissor, weights);
-  BeginRenderTargetPass(sourceDestination.view, wgpu::LoadOp::Clear, "RmlUi blur upscale pass");
+  BeginRenderTargetPass(sourceDestination.view, gl::LoadOp::Clear, "RmlUi blur upscale pass");
   gfx::set_viewport({static_cast<float>(originalScissor.Left()), static_cast<float>(originalScissor.Top()),
                      static_cast<float>(std::max(originalScissor.Width(), 1)),
                      static_cast<float>(std::max(originalScissor.Height(), 1)), 0.f, 1.f});
@@ -924,7 +900,7 @@ void WebGPURenderInterface::RenderBlur(float sigma, const RenderTarget& sourceDe
   const auto targetMax = scissor.p1 * (1 << passLevel);
   const auto targetRegion = Rml::Rectanglei::FromCorners(targetMin, targetMax);
   if (targetRegion.p0 != originalScissor.p0 || targetRegion.p1 != originalScissor.p1) {
-    BeginRenderTargetPass(sourceDestination.view, wgpu::LoadOp::Load, "RmlUi blur power-of-two upscale pass");
+    BeginRenderTargetPass(sourceDestination.view, gl::LoadOp::Load, "RmlUi blur power-of-two upscale pass");
     gfx::set_viewport({static_cast<float>(targetRegion.Left()), static_cast<float>(targetRegion.Top()),
                        static_cast<float>(std::max(targetRegion.Width(), 1)),
                        static_cast<float>(std::max(targetRegion.Height(), 1)), 0.f, 1.f});
@@ -953,7 +929,7 @@ size_t WebGPURenderInterface::RenderFilters(Rml::Span<const Rml::CompiledFilterH
           .opacity = {filter->opacity, 0.f, 0.f, 0.f},
       };
       const auto simpleFilterRange = gfx::push_uniform(simpleFilterUniform);
-      BeginRenderTargetPass(m_postprocessTargets[scratchIndex].view, wgpu::LoadOp::Clear, "RmlUi opacity pass");
+      BeginRenderTargetPass(m_postprocessTargets[scratchIndex].view, gl::LoadOp::Clear, "RmlUi opacity pass");
       DrawFullscreenTexture(texture_bind_group_ref(m_postprocessTargets[sourceIndex].view),
                             filter_pipeline(PipelineKind::SimpleFilter, m_renderTargetFormat), uniform_bind_group_ref(),
                             simpleFilterRange);
@@ -987,14 +963,14 @@ size_t WebGPURenderInterface::RenderFilters(Rml::Span<const Rml::CompiledFilterH
       };
       const auto dropShadowRange = gfx::push_uniform(dropShadowUniform);
       CompositeToTarget(texture_bind_group_ref(m_postprocessTargets[sourceIndex].view),
-                        m_postprocessTargets[scratchIndex].view, wgpu::LoadOp::Clear,
+                        m_postprocessTargets[scratchIndex].view, gl::LoadOp::Clear,
                         filter_pipeline(PipelineKind::DropShadow, m_renderTargetFormat), "RmlUi drop shadow pass",
                         uniform_bind_group_ref(), dropShadowRange);
 
       RenderBlur(filter->sigma, m_postprocessTargets[scratchIndex], m_postprocessTargets[tempIndex]);
 
       CompositeToTarget(texture_bind_group_ref(m_postprocessTargets[sourceIndex].view),
-                        m_postprocessTargets[scratchIndex].view, wgpu::LoadOp::Load,
+                        m_postprocessTargets[scratchIndex].view, gl::LoadOp::Load,
                         blit_pipeline(m_renderTargetFormat, 1, BlitPipelineType::Blend, false),
                         "RmlUi drop shadow source composite pass");
       sourceIndex = scratchIndex;
@@ -1008,7 +984,7 @@ size_t WebGPURenderInterface::RenderFilters(Rml::Span<const Rml::CompiledFilterH
       const auto simpleFilterRange = gfx::push_uniform(simpleFilterUniform);
 
       CompositeToTarget(texture_bind_group_ref(m_postprocessTargets[sourceIndex].view),
-                        m_postprocessTargets[scratchIndex].view, wgpu::LoadOp::Clear,
+                        m_postprocessTargets[scratchIndex].view, gl::LoadOp::Clear,
                         filter_pipeline(PipelineKind::SimpleFilter, m_renderTargetFormat), "RmlUi color matrix pass",
                         uniform_bind_group_ref(), simpleFilterRange);
       sourceIndex = scratchIndex;
@@ -1016,7 +992,7 @@ size_t WebGPURenderInterface::RenderFilters(Rml::Span<const Rml::CompiledFilterH
     }
     case FilterType::MaskImage: {
       CompositeToTarget(texture_bind_group_ref(m_postprocessTargets[sourceIndex].view),
-                        m_postprocessTargets[scratchIndex].view, wgpu::LoadOp::Clear,
+                        m_postprocessTargets[scratchIndex].view, gl::LoadOp::Clear,
                         filter_pipeline(PipelineKind::MaskImage, m_renderTargetFormat), "RmlUi mask image pass",
                         texture_bind_group_ref(m_blendMaskTarget.view), {}, false);
       sourceIndex = scratchIndex;
@@ -1052,24 +1028,16 @@ void WebGPURenderInterface::BeginFrame(const webgpu::TextureWithSampler& target,
 
   NewFrame();
   EnsureFrameTargets(target.size);
-  wgpu::Texture multisampleTexture;
-  wgpu::TextureView multisampleView;
+  gl::Texture multisampleTexture;
+  gl::Texture multisampleView;
   if constexpr (LayerSampleCount > 1) {
     if (m_layers[0].multisampleView && m_layers[0].size == target.size) {
       multisampleTexture = m_layers[0].multisampleTexture;
       multisampleView = m_layers[0].multisampleView;
     } else {
-      const wgpu::TextureDescriptor multisampleTextureDesc{
-          .label = "RmlUi Multisampled Base Layer",
-          .usage = wgpu::TextureUsage::RenderAttachment,
-          .dimension = wgpu::TextureDimension::e2D,
-          .size = target.size,
-          .format = m_renderTargetFormat,
-          .mipLevelCount = 1,
-          .sampleCount = LayerSampleCount,
-      };
-      multisampleTexture = webgpu::g_device.CreateTexture(&multisampleTextureDesc);
-      multisampleView = multisampleTexture.CreateView(nullptr);
+      // Phase 5: allocate the multisampled base-layer render-attachment texture.
+      multisampleTexture = gl::Texture{};
+      multisampleView = multisampleTexture;
     }
   }
 
@@ -1111,7 +1079,7 @@ Rml::LayerHandle WebGPURenderInterface::PushLayer() {
 
   EnsureRenderTarget(m_layers[static_cast<size_t>(layer)], "RmlUi Layer", m_frameSize, true);
   m_layerStack.push_back(layer);
-  BeginLayerPass(layer, wgpu::LoadOp::Clear, "RmlUi pushed layer pass");
+  BeginLayerPass(layer, gl::LoadOp::Clear, "RmlUi pushed layer pass");
   return layer;
 }
 
@@ -1133,7 +1101,7 @@ void WebGPURenderInterface::CompositeLayers(Rml::LayerHandle source, Rml::LayerH
       replace ? (m_clipMaskEnabled ? BlitPipelineType::ReplaceMasked : BlitPipelineType::Replace)
               : (m_clipMaskEnabled ? BlitPipelineType::BlendMasked : BlitPipelineType::Blend);
   if (activeFilters.empty() && source != destination) {
-    BeginLayerPass(destination, wgpu::LoadOp::Load, "RmlUi layer direct composite pass");
+    BeginLayerPass(destination, gl::LoadOp::Load, "RmlUi layer direct composite pass");
     DrawFullscreenTexture(texture_bind_group_ref(m_layers[source].view),
                           blit_pipeline(m_renderTargetFormat, LayerSampleCount, pipelineType, true));
 
@@ -1152,7 +1120,7 @@ void WebGPURenderInterface::CompositeLayers(Rml::LayerHandle source, Rml::LayerH
         .opacity = {simpleFilterOpacity, 0.f, 0.f, 0.f},
     };
     const auto simpleFilterRange = gfx::push_uniform(simpleFilterUniform);
-    BeginLayerPass(destination, wgpu::LoadOp::Load, "RmlUi simple filter composite pass");
+    BeginLayerPass(destination, gl::LoadOp::Load, "RmlUi simple filter composite pass");
     DrawFullscreenTexture(texture_bind_group_ref(m_layers[source].view),
                           simple_filter_pipeline(m_renderTargetFormat, LayerSampleCount, pipelineType, true),
                           uniform_bind_group_ref(), simpleFilterRange);
@@ -1164,11 +1132,11 @@ void WebGPURenderInterface::CompositeLayers(Rml::LayerHandle source, Rml::LayerH
     return;
   }
 
-  CompositeToTarget(texture_bind_group_ref(m_layers[source].view), m_postprocessTargets[0].view, wgpu::LoadOp::Clear,
+  CompositeToTarget(texture_bind_group_ref(m_layers[source].view), m_postprocessTargets[0].view, gl::LoadOp::Clear,
                     blit_pipeline(m_renderTargetFormat, 1, BlitPipelineType::Replace, false), "RmlUi layer copy pass");
   const size_t filteredIndex = RenderFilters(activeFilters);
 
-  BeginLayerPass(destination, wgpu::LoadOp::Load, "RmlUi layer composite pass");
+  BeginLayerPass(destination, gl::LoadOp::Load, "RmlUi layer composite pass");
   DrawFullscreenTexture(texture_bind_group_ref(m_postprocessTargets[filteredIndex].view),
                         blit_pipeline(m_renderTargetFormat, LayerSampleCount, pipelineType, true));
 
@@ -1217,44 +1185,35 @@ Rml::TextureHandle WebGPURenderInterface::SaveLayerAsTexture() {
   }
 
   auto* texData = new ShaderTextureData();
-  const wgpu::Extent3D textureSize{
+  const gl::Extent3D textureSize{
       .width = static_cast<uint32_t>(right - left),
       .height = static_cast<uint32_t>(bottom - top),
       .depthOrArrayLayers = 1,
   };
-  const wgpu::TextureDescriptor textureDesc{
-      .label = "RmlUi Saved Layer Texture",
-      .usage = wgpu::TextureUsage::CopyDst | wgpu::TextureUsage::TextureBinding,
-      .dimension = wgpu::TextureDimension::e2D,
-      .size = textureSize,
-      .format = m_renderTargetFormat,
-      .mipLevelCount = 1,
-      .sampleCount = 1,
-  };
-  texData->m_texture = webgpu::g_device.CreateTexture(&textureDesc);
-  texData->m_textureView = texData->m_texture.CreateView(nullptr);
+  // Phase 5: allocate the saved-layer color texture (m_renderTargetFormat). View == texture on GL.
+  texData->m_texture = gl::Texture{};
+  texData->m_textureView = texData->m_texture;
   texData->m_size = textureSize;
   texData->m_rowBytes = textureSize.width * 4;
   texData->m_uploaded = true;
 
   EndActivePass();
 
-  const wgpu::TexelCopyTextureInfo src{
+  // Phase 5: texture-to-texture copy (layer subregion -> saved texture) via glBlitFramebuffer/copy.
+  const gfx::TextureCopyView src{
       .texture = m_layers[layer].texture,
       .origin =
-          wgpu::Origin3D{
+          gl::Origin3D{
               .x = static_cast<uint32_t>(left),
               .y = static_cast<uint32_t>(top),
           },
-      .aspect = wgpu::TextureAspect::All,
   };
-  const wgpu::TexelCopyTextureInfo dst{
+  const gfx::TextureCopyView dst{
       .texture = texData->m_texture,
-      .aspect = wgpu::TextureAspect::All,
   };
   gfx::queue_texture_copy(src, dst, textureSize);
 
-  BeginLayerPass(layer, wgpu::LoadOp::Load, "RmlUi saved layer restore pass");
+  BeginLayerPass(layer, gl::LoadOp::Load, "RmlUi saved layer restore pass");
   return reinterpret_cast<Rml::TextureHandle>(texData);
 }
 
@@ -1272,14 +1231,14 @@ Rml::CompiledFilterHandle WebGPURenderInterface::SaveLayerAsMaskImage() {
 
   EnsureFrameRenderingStarted();
 
-  CompositeToTarget(texture_bind_group_ref(m_layers[layer].view), m_postprocessTargets[0].view, wgpu::LoadOp::Clear,
+  CompositeToTarget(texture_bind_group_ref(m_layers[layer].view), m_postprocessTargets[0].view, gl::LoadOp::Clear,
                     blit_pipeline(m_renderTargetFormat, 1, BlitPipelineType::Replace, false),
                     "RmlUi mask source copy pass");
-  CompositeToTarget(texture_bind_group_ref(m_postprocessTargets[0].view), m_blendMaskTarget.view, wgpu::LoadOp::Clear,
+  CompositeToTarget(texture_bind_group_ref(m_postprocessTargets[0].view), m_blendMaskTarget.view, gl::LoadOp::Clear,
                     blit_pipeline(m_renderTargetFormat, 1, BlitPipelineType::Replace, false),
                     "RmlUi mask image save pass");
 
-  BeginLayerPass(layer, wgpu::LoadOp::Load, "RmlUi mask image restore pass");
+  BeginLayerPass(layer, gl::LoadOp::Load, "RmlUi mask image restore pass");
 
   auto* filter = new CompiledFilter{
       .type = FilterType::MaskImage,
@@ -1471,29 +1430,11 @@ void WebGPURenderInterface::ReleaseShader(Rml::CompiledShaderHandle shader) {
 }
 
 void WebGPURenderInterface::CreateDeviceObjects() {
+  // Phase 5: gl::TextureFormat only enumerates the formats this fork ships, so the sRGB
+  // gamma set collapses to the single sRGB member present (RGBA8UnormSrgb). The GL backend
+  // never selects the BC/ETC/ASTC/BGRA sRGB render-target formats the old Dawn switch listed.
   switch (m_renderTargetFormat) {
-  case wgpu::TextureFormat::ASTC10x10UnormSrgb:
-  case wgpu::TextureFormat::ASTC10x5UnormSrgb:
-  case wgpu::TextureFormat::ASTC10x6UnormSrgb:
-  case wgpu::TextureFormat::ASTC10x8UnormSrgb:
-  case wgpu::TextureFormat::ASTC12x10UnormSrgb:
-  case wgpu::TextureFormat::ASTC12x12UnormSrgb:
-  case wgpu::TextureFormat::ASTC4x4UnormSrgb:
-  case wgpu::TextureFormat::ASTC5x5UnormSrgb:
-  case wgpu::TextureFormat::ASTC6x5UnormSrgb:
-  case wgpu::TextureFormat::ASTC6x6UnormSrgb:
-  case wgpu::TextureFormat::ASTC8x5UnormSrgb:
-  case wgpu::TextureFormat::ASTC8x6UnormSrgb:
-  case wgpu::TextureFormat::ASTC8x8UnormSrgb:
-  case wgpu::TextureFormat::BC1RGBAUnormSrgb:
-  case wgpu::TextureFormat::BC2RGBAUnormSrgb:
-  case wgpu::TextureFormat::BC3RGBAUnormSrgb:
-  case wgpu::TextureFormat::BC7RGBAUnormSrgb:
-  case wgpu::TextureFormat::BGRA8UnormSrgb:
-  case wgpu::TextureFormat::ETC2RGB8A1UnormSrgb:
-  case wgpu::TextureFormat::ETC2RGB8UnormSrgb:
-  case wgpu::TextureFormat::ETC2RGBA8UnormSrgb:
-  case wgpu::TextureFormat::RGBA8UnormSrgb:
+  case gl::TextureFormat::RGBA8UnormSrgb:
     m_gamma = 2.2f;
     break;
   default:
@@ -1559,31 +1500,16 @@ void WebGPURenderInterface::NewFrame() {
   m_stencilRef = 0;
 }
 
-wgpu::TextureView WebGPURenderInterface::GetClipMaskStencilView(const wgpu::Extent3D& size) {
+gl::Texture WebGPURenderInterface::GetClipMaskStencilView(const gl::Extent3D& size) {
   if (m_clipMaskStencilView && m_clipMaskStencilSize == size) {
     return m_clipMaskStencilView;
   }
 
   m_clipMaskStencilSize = size;
-  const wgpu::TextureDescriptor textureDesc{
-      .label = "RmlUi Clip Mask Stencil",
-      .usage = wgpu::TextureUsage::RenderAttachment,
-      .dimension = wgpu::TextureDimension::e2D,
-      .size = size,
-      .format = ClipMaskStencilFormat,
-      .mipLevelCount = 1,
-      .sampleCount = LayerSampleCount,
-  };
-  m_clipMaskStencilTexture = webgpu::g_device.CreateTexture(&textureDesc);
-
-  constexpr wgpu::TextureViewDescriptor viewDesc{
-      .label = "RmlUi Clip Mask Stencil View",
-      .format = ClipMaskStencilFormat,
-      .dimension = wgpu::TextureViewDimension::e2D,
-      // Render attachment of a combined format must expose all aspects, not stencil-only.
-      .aspect = wgpu::TextureAspect::All,
-  };
-  m_clipMaskStencilView = m_clipMaskStencilTexture.CreateView(&viewDesc);
+  // Phase 5: allocate the DEPTH24_STENCIL8 clip-mask attachment (LayerSampleCount samples). The
+  // view exposes all aspects of the combined format; on GL the view collapses into the texture.
+  m_clipMaskStencilTexture = gl::Texture{};
+  m_clipMaskStencilView = m_clipMaskStencilTexture;
   return m_clipMaskStencilView;
 }
 

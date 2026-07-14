@@ -3,7 +3,11 @@
 #include <cstddef>
 #include <cstdint>
 
-#include <webgpu/webgpu_cpp.h>
+// GL backend: the replay encoder handed to custom-draw callbacks. Opaque here;
+// the definition lives in lib/gl/pass.hpp.
+namespace aurora::gl {
+class PassEncoder;
+}
 
 namespace aurora::gfx {
 
@@ -22,14 +26,11 @@ struct Range {
 };
 
 struct DrawContext {
-  wgpu::Device device;
-  wgpu::Queue queue;
-  wgpu::Buffer vertexBuffer;
-  wgpu::Buffer indexBuffer;
-  wgpu::Buffer uniformBuffer;
-  wgpu::Buffer storageBuffer;
-  wgpu::TextureFormat colorFormat;
-  wgpu::TextureFormat depthFormat;
+  uint32_t vertexBuffer = 0; // GL buffer names
+  uint32_t indexBuffer = 0;
+  uint32_t uniformBuffer = 0;
+  uint32_t colorFormat = 0; // gl::TextureFormat underlying value
+  uint32_t depthFormat = 0;
   uint32_t sampleCount = 1;
   uint32_t targetWidth = 0;
   uint32_t targetHeight = 0;
@@ -40,8 +41,8 @@ struct DrawContext {
 /// restored after the callback returns. Handles in the context are borrowed and
 /// valid only for the duration of the call. sampleCount/target dimensions are
 /// those of the containing pass (offscreen passes are always single-sample).
-using DrawCallback = void (*)(const DrawContext& ctx, const wgpu::RenderPassEncoder& pass,
-                              const void* payload, size_t payloadSize, void* userdata);
+using DrawCallback = void (*)(const DrawContext& ctx, gl::PassEncoder& pass, const void* payload, size_t payloadSize,
+                              void* userdata);
 
 struct DrawTypeDescriptor {
   const char* label = nullptr;
@@ -49,10 +50,8 @@ struct DrawTypeDescriptor {
   void* userdata = nullptr;
 };
 
-wgpu::Device device() noexcept;
-wgpu::Queue queue() noexcept;
-wgpu::TextureFormat color_format() noexcept;
-wgpu::TextureFormat depth_format() noexcept;
+uint32_t color_format() noexcept; // gl::TextureFormat underlying value
+uint32_t depth_format() noexcept;
 uint32_t sample_count() noexcept;
 bool uses_reversed_z() noexcept;
 
@@ -68,22 +67,19 @@ using EncoderTaskId = uint64_t;
 inline constexpr EncoderTaskId InvalidEncoderTask = 0;
 
 struct EncoderTaskContext {
-  wgpu::Device device;
-  wgpu::Queue queue;
-  wgpu::Buffer vertexBuffer;
-  wgpu::Buffer indexBuffer;
-  wgpu::Buffer uniformBuffer;
-  wgpu::Buffer storageBuffer;
+  uint32_t vertexBuffer = 0; // GL buffer names
+  uint32_t indexBuffer = 0;
+  uint32_t uniformBuffer = 0;
 };
 
-/// Invoked on the render worker thread with the frame's command encoder,
-/// positioned between two render passes. The callback may begin/end compute
-/// passes and record copies on the encoder; it must leave no pass open when it
-/// returns and must not Finish the encoder. Handles in the context are borrowed
-/// and valid only for the duration of the call. Data appended to the streaming
-/// buffers before the task was pushed is GPU-visible inside it.
-using EncoderTaskCallback = void (*)(const EncoderTaskContext& ctx, const wgpu::CommandEncoder& cmd,
-                                     const void* payload, size_t payloadSize, void* userdata);
+/// Invoked on the render worker thread between two render passes. On GL there is
+/// no command encoder: the callback issues GL directly (aurora's command list
+/// already provides ordering). It must leave no pass bound when it returns.
+/// Handles in the context are borrowed and valid only for the duration of the
+/// call. Data appended to the streaming buffers before the task was pushed is
+/// GPU-visible inside it.
+using EncoderTaskCallback = void (*)(const EncoderTaskContext& ctx, const void* payload, size_t payloadSize,
+                                     void* userdata);
 
 struct EncoderTaskDescriptor {
   const char* label = nullptr;
@@ -114,9 +110,9 @@ struct ResolveDesc {
 };
 
 struct ResolvedTargets {
-  wgpu::TextureView color;  // single-sample snapshot; null if not requested
-  wgpu::TextureView depth;  // single-sample R32Float depth snapshot; null if not requested
-  wgpu::TextureFormat colorFormat = wgpu::TextureFormat::Undefined;
+  uint32_t color = 0;       // GL texture name of single-sample snapshot; 0 if not requested
+  uint32_t depth = 0;       // GL texture name of single-sample R32Float depth snapshot; 0 if not requested
+  uint32_t colorFormat = 0; // gl::TextureFormat underlying value
   uint32_t width = 0;
   uint32_t height = 0;
 };

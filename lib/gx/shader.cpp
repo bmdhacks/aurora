@@ -1978,17 +1978,13 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4f {{{6}{5}
   return shaderSource;
 }
 
-wgpu::ShaderModule build_shader(const ShaderConfig& config) noexcept {
+uint32_t build_shader(const ShaderConfig& config) noexcept {
   ZoneScoped;
-  const auto shaderSource = build_shader_source(config);
-  const auto hash = xxh3_hash(config);
-  wgpu::ShaderSourceWGSL wgslDescriptor{};
-  wgslDescriptor.code = shaderSource.c_str();
-  const auto label = fmt::format("GX Shader {:x}", hash);
-  const auto shaderDescriptor = wgpu::ShaderModuleDescriptor{
-      .nextInChain = &wgslDescriptor,
-      .label = label.c_str(),
-  };
-  return webgpu::g_device.CreateShaderModule(&shaderDescriptor);
+  // Phase 3 rewrites build_shader_source() to emit a "#version 300 es" vertex +
+  // fragment pair and compiles/links it into a GL program here (on the compiler
+  // thread's share context). Phase 1 has no GLSL yet and executes no draws, so
+  // return 0 -- an unlinked program that the draw path treats as "skip".
+  (void)config;
+  return 0;
 }
 } // namespace aurora::gx

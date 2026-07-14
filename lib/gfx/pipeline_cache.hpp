@@ -18,7 +18,7 @@ struct PipelineConfig;
 
 namespace aurora::gfx {
 
-using NewPipelineCallback = std::function<wgpu::RenderPipeline()>;
+using NewPipelineCallback = std::function<gl::Pipeline()>;
 
 void initialize_pipeline_cache();
 void shutdown_pipeline_cache();
@@ -28,6 +28,6 @@ void end_pipeline_frame();
 template <typename Config>
 PipelineRef find_pipeline(ShaderType type, const Config& config, NewPipelineCallback&& cb);
 
-bool get_pipeline(PipelineRef ref, wgpu::RenderPipeline& pipeline);
+bool get_pipeline(PipelineRef ref, gl::Pipeline& pipeline);
 
 } // namespace aurora::gfx

@@ -8,19 +8,20 @@
 #include <utility>
 #include <vector>
 
-#include <webgpu/webgpu_cpp.h>
 #include <SDL3/SDL_events.h>
 #include <SDL3/SDL_render.h>
 
 #include "internal.hpp"
 #include "gfx/render_worker.hpp"
+#include "gl/pass.hpp"
 #include "webgpu/gpu.hpp"
 #include "window.hpp"
 
-#define IMGUI_IMPL_WEBGPU_BACKEND_DAWN
+// Phase 5 wires the real GLES imgui backend (imgui_impl_opengl3 with a
+// "#version 300 es" init string). Phase 1 keeps only the SDL_Renderer path live;
+// the non-SDL-renderer branch is a no-op so the tree builds and boots.
 #include "backends/imgui_impl_sdl3.h"
 #include "backends/imgui_impl_sdlrenderer3.h"
-#include "backends/imgui_impl_wgpu.h"
 #include "tracy/Tracy.hpp"
 
 namespace aurora::imgui {
@@ -30,7 +31,7 @@ static std::string g_imguiLog{};
 static bool g_useSdlRenderer = false;
 
 static std::vector<SDL_Texture*> g_sdlTextures;
-static std::vector<wgpu::Texture> g_wgpuTextures;
+static std::vector<gl::Texture> g_glTextures;
 
 struct DrawData::Impl {
   ImDrawData drawData;
@@ -55,10 +56,17 @@ void initialize() noexcept {
   if (g_useSdlRenderer) {
     ImGui_ImplSDLRenderer3_Init(renderer);
   } else {
-    ImGui_ImplWGPU_InitInfo info;
-    info.Device = webgpu::g_device.Get();
-    info.RenderTargetFormat = static_cast<WGPUTextureFormat>(webgpu::g_graphicsConfig.surfaceConfiguration.format);
-    ImGui_ImplWGPU_Init(&info);
+    // Phase 5: ImGui_ImplOpenGL3_Init("#version 300 es") on the render worker.
+    // Until then no GL imgui backend renders, but ImGui::NewFrame() asserts unless
+    // the font atlas is built and a renderer backend is registered. Build a CPU
+    // atlas and register a null backend name so new_frame()/freeze() run harmlessly
+    // (our render() drops the draw data). Phase 5 replaces this with the real init.
+    ImGuiIO& io = ImGui::GetIO();
+    io.BackendRendererName = "aurora_gl_phase1_stub";
+    unsigned char* pixels = nullptr;
+    int atlasWidth = 0;
+    int atlasHeight = 0;
+    io.Fonts->GetTexDataAsRGBA32(&pixels, &atlasWidth, &atlasHeight); // forces Fonts->Build()
   }
 }
 
@@ -67,7 +75,7 @@ void shutdown() noexcept {
   if (g_useSdlRenderer) {
     ImGui_ImplSDLRenderer3_Shutdown();
   } else {
-    ImGui_ImplWGPU_Shutdown();
+    // Phase 5: ImGui_ImplOpenGL3_Shutdown().
   }
   ImGui_ImplSDL3_Shutdown();
   ImGui::DestroyContext();
@@ -75,7 +83,7 @@ void shutdown() noexcept {
     SDL_DestroyTexture(texture);
   }
   g_sdlTextures.clear();
-  g_wgpuTextures.clear();
+  g_glTextures.clear();
 }
 
 void process_event(const SDL_Event& event) noexcept {
@@ -141,16 +149,8 @@ void new_frame(const AuroraWindowSize& size) noexcept {
     ImGui_ImplSDLRenderer3_NewFrame();
     g_scale = size.scale;
   } else {
-    if (g_scale != size.scale) {
-      if (g_scale > 0.f) {
-        ImGui_ImplWGPU_CreateDeviceObjects();
-      }
-      g_scale = size.scale;
-    }
-    if (!ImGui::GetIO().Fonts->IsBuilt()) {
-      ImGui_ImplWGPU_CreateDeviceObjects();
-    }
-    ImGui_ImplWGPU_NewFrame();
+    // Phase 5: rebuild font/device objects on scale change + ImGui_ImplOpenGL3_NewFrame().
+    g_scale = size.scale;
   }
   ImGui_ImplSDL3_NewFrame();
 
@@ -177,7 +177,7 @@ DrawData freeze() noexcept {
   return DrawData{std::move(frozen)};
 }
 
-void render(const wgpu::RenderPassEncoder& pass, const DrawData& drawData) noexcept {
+void render(gl::PassEncoder& pass, const DrawData& drawData) noexcept {
   ZoneScoped;
 
   if (!drawData.m_impl) {
@@ -193,51 +193,10 @@ void render(const wgpu::RenderPassEncoder& pass, const DrawData& drawData) noexc
     ImGui_ImplSDLRenderer3_RenderDrawData(data, renderer);
     SDL_RenderPresent(renderer);
   } else {
-    pass.PushDebugGroup("Aurora: Dear Imgui");
-    ImGui_ImplWGPU_RenderDrawData(data, pass.Get());
-    pass.PopDebugGroup();
+    // Phase 5: pass.PushDebugGroup("Aurora: Dear Imgui");
+    //          ImGui_ImplOpenGL3_RenderDrawData(data); PopDebugGroup();
+    (void)pass;
   }
-}
-
-static wgpu::Buffer create_texture_upload_buffer(uint32_t width, uint32_t height, const uint8_t* data,
-                                                 uint32_t copyBytesPerRow) {
-  const uint32_t rowBytes = width * 4;
-  const uint64_t uploadSize = static_cast<uint64_t>(copyBytesPerRow) * height;
-  const wgpu::BufferDescriptor desc{
-      .label = "imgui texture upload buffer",
-      .usage = wgpu::BufferUsage::CopySrc,
-      .size = uploadSize,
-      .mappedAtCreation = true,
-  };
-  auto buffer = webgpu::g_device.CreateBuffer(&desc);
-  auto* dst = static_cast<uint8_t*>(buffer.GetMappedRange(0, uploadSize));
-  for (uint32_t row = 0; row < height; ++row) {
-    std::memcpy(dst, data, rowBytes);
-    dst += copyBytesPerRow;
-    data += rowBytes;
-  }
-  buffer.Unmap();
-  return buffer;
-}
-
-static void enqueue_texture_upload(wgpu::Buffer buffer, wgpu::TexelCopyTextureInfo dst,
-                                   wgpu::TexelCopyBufferLayout layout, wgpu::Extent3D size) {
-  gfx::render_worker::enqueue_work([buffer = std::move(buffer), dst = std::move(dst), layout, size] {
-    const wgpu::CommandEncoderDescriptor encoderDesc{
-        .label = "imgui texture upload encoder",
-    };
-    auto encoder = webgpu::g_device.CreateCommandEncoder(&encoderDesc);
-    const wgpu::TexelCopyBufferInfo src{
-        .layout = layout,
-        .buffer = buffer,
-    };
-    encoder.CopyBufferToTexture(&src, &dst, &size);
-    const wgpu::CommandBufferDescriptor commandBufferDesc{
-        .label = "imgui texture upload command buffer",
-    };
-    auto commandBuffer = encoder.Finish(&commandBufferDesc);
-    webgpu::g_queue.Submit(1, &commandBuffer);
-  });
 }
 
 ImTextureID add_texture(uint32_t width, uint32_t height, const uint8_t* data) noexcept {
@@ -248,42 +207,13 @@ ImTextureID add_texture(uint32_t width, uint32_t height, const uint8_t* data) no
     g_sdlTextures.push_back(texture);
     return reinterpret_cast<ImTextureID>(texture);
   }
-  const wgpu::Extent3D size{
-      .width = width,
-      .height = height,
-      .depthOrArrayLayers = 1,
-  };
-  const wgpu::TextureDescriptor textureDescriptor{
-      .label = "imgui texture",
-      .usage = wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::CopyDst,
-      .dimension = wgpu::TextureDimension::e2D,
-      .size = size,
-      .format = wgpu::TextureFormat::RGBA8Unorm,
-      .mipLevelCount = 1,
-      .sampleCount = 1,
-  };
-  const wgpu::TextureViewDescriptor textureViewDescriptor{
-      .label = "imgui texture view",
-      .format = wgpu::TextureFormat::RGBA8Unorm,
-      .dimension = wgpu::TextureViewDimension::e2D,
-      .mipLevelCount = WGPU_MIP_LEVEL_COUNT_UNDEFINED,
-      .arrayLayerCount = WGPU_ARRAY_LAYER_COUNT_UNDEFINED,
-  };
-  auto texture = webgpu::g_device.CreateTexture(&textureDescriptor);
-  auto textureView = texture.CreateView(&textureViewDescriptor);
-  {
-    const wgpu::TexelCopyTextureInfo dstView{
-        .texture = texture,
-    };
-    const uint32_t copyBytesPerRow = AURORA_ALIGN(width * 4, 256);
-    const wgpu::TexelCopyBufferLayout dataLayout{
-        .bytesPerRow = copyBytesPerRow,
-        .rowsPerImage = height,
-    };
-    enqueue_texture_upload(create_texture_upload_buffer(width, height, data, copyBytesPerRow), dstView, dataLayout, size);
-  }
-  g_wgpuTextures.push_back(texture);
-  return reinterpret_cast<ImTextureID>(textureView.MoveToCHandle());
+  // Phase 5: create a GL texture on the render worker (gl::create_texture RGBA8 +
+  // glTexSubImage2D upload) and return its GL name as the ImTextureID. Phase 1 has
+  // no imgui GL rendering, so no texture is created.
+  (void)width;
+  (void)height;
+  (void)data;
+  return ImTextureID{};
 }
 } // namespace aurora::imgui
 

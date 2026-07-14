@@ -8,67 +8,42 @@
 namespace aurora::gx {
 static Module Log("aurora::gx");
 
-// Build the hardware vertex-attribute layout for a native-fetch pipeline.
-//
-// The attribute ORDER here must stay identical to the shader's native input
-// emission (shader.cpp addNativeInput) and the CPU expansion order
-// (command_processor build_native_layout): canonical GX attr order, one
-// @location per present attr, offset taken from the CPU-expanded stride. Any
-// divergence silently scrambles attributes.
-static wgpu::VertexBufferLayout native_vertex_layout(const ShaderConfig& sc,
-                                                     std::array<wgpu::VertexAttribute, MaxVtxAttr>& attrs) {
-  uint32_t count = 0;
-  const auto add = [&](GXAttr attr, wgpu::VertexFormat format) {
-    if (sc.attrs[attr].attrType == GX_NONE) {
-      return;
-    }
-    attrs[count] = wgpu::VertexAttribute{
-        .format = format,
-        .offset = sc.attrs[attr].offset,
-        .shaderLocation = count,
-    };
-    ++count;
-  };
-  add(GX_VA_PNMTXIDX, wgpu::VertexFormat::Uint32);
-  for (int i = GX_VA_TEX0MTXIDX; i <= GX_VA_TEX7MTXIDX; ++i) {
-    add(static_cast<GXAttr>(i), wgpu::VertexFormat::Uint32);
-  }
-  add(GX_VA_POS, wgpu::VertexFormat::Float32x3);
-  add(GX_VA_NRM, wgpu::VertexFormat::Float32x3);
-  add(GX_VA_CLR0, wgpu::VertexFormat::Unorm8x4);
-  add(GX_VA_CLR1, wgpu::VertexFormat::Unorm8x4);
-  for (int i = GX_VA_TEX0; i <= GX_VA_TEX7; ++i) {
-    add(static_cast<GXAttr>(i), wgpu::VertexFormat::Float32x2);
-  }
-  return wgpu::VertexBufferLayout{
-      .stepMode = wgpu::VertexStepMode::Vertex,
-      .arrayStride = sc.vtxStride,
-      .attributeCount = count,
-      .attributes = attrs.data(),
-  };
-}
+// The hardware vertex-attribute layout (native fetch) is built in Phase 3, where
+// the draw path creates a VAO per layout hash and issues glVertexAttrib(I)Pointer
+// in canonical GX attr order:
+//   PNMTXIDX Uint32 -> TEX0-7MTXIDX Uint32 -> POS F32x3 -> NRM F32x3 ->
+//   CLR0/1 Unorm8x4 -> TEX0-7 F32x2
+// That order must stay byte-identical to shader.cpp's native inputs and the CPU
+// expansion in command_processor. The old wgpu::VertexBufferLayout builder is gone;
+// gl::Pipeline::vertexLayout carries the layout hash instead.
 
-wgpu::RenderPipeline create_pipeline(const PipelineConfig& config) {
+gl::Pipeline create_pipeline(const PipelineConfig& config) {
   ZoneScoped;
-  const auto shader = build_shader(config.shaderConfig);
+  const uint32_t program = build_shader(config.shaderConfig);
   const auto label = fmt::format("GX Pipeline {:x} shader {:x}",
                                  xxh3_hash(config, static_cast<HashType>(gfx::ShaderType::GX)),
                                  xxh3_hash(config.shaderConfig));
-  if (config.shaderConfig.nativeVertexFetch) {
-    std::array<wgpu::VertexAttribute, MaxVtxAttr> attrs{};
-    const std::array vtxBuffers{native_vertex_layout(config.shaderConfig, attrs)};
-    return build_pipeline(config, vtxBuffers, shader, label.c_str());
-  }
-  return build_pipeline(config, {}, shader, label.c_str());
+  return build_pipeline(config, program, label.c_str());
 }
 
-void render(const DrawData& data, const wgpu::RenderPassEncoder& pass) {
+void render(const DrawData& data, gl::PassEncoder& pass) {
   if (!gfx::bind_pipeline(data.pipeline, pass)) {
     return;
   }
 
+  // Group 1: the GX uniform block, bound with a per-draw dynamic offset
+  // (glBindBufferRange in Phase 3).
+  gl::BindingSet uniformSet{};
+  uniformSet.buffers[0] = gl::BindingSet::BufferBinding{
+      .buffer = gfx::g_uniformBuffer.id,
+      .binding = 0,
+      .offset = 0,
+      .size = static_cast<uint32_t>(data.uniformRange.size),
+      .dynamic = true,
+  };
+  uniformSet.bufferCount = 1;
   const std::array offsets{data.uniformRange.offset};
-  pass.SetBindGroup(1, gfx::g_uniformBindGroup, offsets.size(), offsets.data());
+  pass.SetBindGroup(1, uniformSet, offsets.size(), offsets.data());
   if (data.bindGroups.textureBindGroup) {
     pass.SetBindGroup(2, gfx::find_bind_group(data.bindGroups.textureBindGroup));
   }
@@ -76,13 +51,13 @@ void render(const DrawData& data, const wgpu::RenderPassEncoder& pass) {
     // Native draws read from a real vertex buffer instead of the group-0 SSBOs. Cached
     // geometry lives in the persistent cross-frame cache buffer; everything else in the
     // shared per-frame vertex ring.
-    const wgpu::Buffer& vtxBuffer = data.cachedGeometry ? gfx::g_nativeVertexCacheBuffer : gfx::g_vertexBuffer;
+    const gl::Buffer& vtxBuffer = data.cachedGeometry ? gfx::g_nativeVertexCacheBuffer : gfx::g_vertexBuffer;
     pass.SetVertexBuffer(0, vtxBuffer, data.vertRange.offset, data.vertRange.size);
   }
-  const wgpu::Buffer& idxBuffer = data.cachedGeometry ? gfx::g_nativeIndexCacheBuffer : gfx::g_indexBuffer;
-  pass.SetIndexBuffer(idxBuffer, wgpu::IndexFormat::Uint16, data.idxRange.offset, data.idxRange.size);
+  const gl::Buffer& idxBuffer = data.cachedGeometry ? gfx::g_nativeIndexCacheBuffer : gfx::g_indexBuffer;
+  pass.SetIndexBuffer(idxBuffer, gl::IndexFormat::Uint16, data.idxRange.offset, data.idxRange.size);
   if (data.dstAlpha != UINT32_MAX) {
-    const wgpu::Color color{0.f, 0.f, 0.f, data.dstAlpha / 255.f};
+    const gl::Color color{0.f, 0.f, 0.f, data.dstAlpha / 255.f};
     pass.SetBlendConstant(&color);
   }
   if (data.indexCount == 0) {

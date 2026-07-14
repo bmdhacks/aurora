@@ -3,7 +3,7 @@
 #include <cstdint>
 #include <optional>
 
-#include <webgpu/webgpu_cpp.h>
+#include "../gl/handles.hpp"
 
 namespace aurora::webgpu::sdl2shim_present {
 
@@ -23,7 +23,7 @@ namespace aurora::webgpu::sdl2shim_present {
 // Inert unless the SDL2-shim video driver is in use; desktop keeps presenting from the worker.
 struct AcquiredFrame {
   uint32_t slot = 0;
-  wgpu::TextureView view;
+  gl::Texture view;
 };
 
 // Resolves EGL and GLES entry points (the shim's loader; see gpu.cpp).
@@ -34,11 +34,10 @@ using ProcAddressFn = void* (*)(const char*);
 
 // Main thread, during webgpu::initialize(), with the shim's EGL context current.
 // `width`/`height` must match the surface configuration the present pass renders against.
-bool initialize(ProcAddressFn getProc, void* eglDisplay, uint32_t width, uint32_t height,
-                wgpu::TextureFormat format);
+bool initialize(ProcAddressFn getProc, void* eglDisplay, uint32_t width, uint32_t height, gl::TextureFormat format);
 // Reallocate the shared textures for a new window size. No-op when the size is unchanged.
 // Main thread, shim context current, with no frame in flight.
-bool resize(uint32_t width, uint32_t height, wgpu::TextureFormat format);
+bool resize(uint32_t width, uint32_t height, gl::TextureFormat format);
 void shutdown();
 
 // --- Render worker ---

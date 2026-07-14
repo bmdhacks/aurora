@@ -3,6 +3,7 @@
 #include "clear.hpp"
 #include "depth_peek.hpp"
 #include "../internal.hpp"
+#include "../gl/context.hpp"
 #include "../webgpu/gpu.hpp"
 #include "../webgpu/gpu_prof.hpp"
 #include "../webgpu/sdl2shim_present.hpp"
@@ -37,9 +38,7 @@
 namespace aurora::gfx {
 static Module Log("aurora::gfx");
 
-using webgpu::g_device;
-using webgpu::g_instance;
-using webgpu::g_queue;
+namespace gl = aurora::gl;
 
 #ifdef AURORA_GFX_DEBUG_GROUPS
 std::vector<std::string> g_debugGroupStack;
@@ -55,10 +54,7 @@ static std::string pass_label(std::string_view kind) {
   return std::string{kind};
 }
 
-constexpr uint64_t StagingBufferSize = UniformBufferSize + VertexBufferSize + IndexBufferSize + StorageBufferSize +
-                                       (UseTextureBuffer ? TextureUploadSize : 0);
 constexpr size_t FrameSlotCount = 2;
-constexpr size_t StagingBufferCount = FrameSlotCount + 3;
 
 struct StagingHighWater {
   uint32_t verts = 0;
@@ -107,29 +103,10 @@ struct Command {
 };
 } // namespace aurora::gfx
 
-namespace aurora {
-// For types that we can't ensure are safe to hash with has_unique_object_representations,
-// we create specialized methods to handle them. Note that these are highly dependent on
-// the structure definition, which could easily change with Dawn updates.
-template <>
-inline HashType xxh3_hash(const WGPUBindGroupDescriptor& input, HashType seed) {
-  constexpr auto offset = offsetof(WGPUBindGroupDescriptor, layout); // skip nextInChain, label
-  const auto hash = xxh3_hash_s(reinterpret_cast<const u8*>(&input) + offset,
-                                sizeof(WGPUBindGroupDescriptor) - offset - sizeof(void*) /* skip entries */, seed);
-  return xxh3_hash_s(input.entries, sizeof(WGPUBindGroupEntry) * input.entryCount, hash);
-}
-template <>
-inline HashType xxh3_hash(const wgpu::SamplerDescriptor& input, HashType seed) {
-  constexpr auto offset = offsetof(wgpu::SamplerDescriptor, addressModeU); // skip nextInChain, label
-  return xxh3_hash_s(reinterpret_cast<const u8*>(&input) + offset,
-                     sizeof(wgpu::SamplerDescriptor) - offset - 2 /* skip padding */, seed);
-}
-} // namespace aurora
-
 namespace aurora::gfx {
 namespace {
 struct CachedBindGroup {
-  wgpu::BindGroup bindGroup;
+  gl::BindingSet bindGroup;
   uint32_t lastUsedFrame = 0;
 };
 
@@ -158,7 +135,7 @@ constexpr uint32_t BindGroupCacheSweepPeriod = 16;
 } // namespace
 
 static absl::flat_hash_map<BindGroupRef, CachedBindGroup> g_cachedBindGroups;
-static absl::flat_hash_map<SamplerRef, wgpu::Sampler> g_cachedSamplers;
+static absl::flat_hash_map<SamplerRef, gl::Sampler> g_cachedSamplers;
 static std::vector<RuntimeDrawType> g_runtimeDrawTypes;
 static std::vector<uint32_t> g_freeDrawTypeSlots;
 static std::vector<RuntimeEncoderTaskType> g_runtimeEncoderTaskTypes;
@@ -193,15 +170,15 @@ static const RuntimeEncoderTaskType* find_runtime_encoder_task_type(EncoderTaskI
   return &slot;
 }
 
-wgpu::Buffer g_vertexBuffer;
-wgpu::Buffer g_uniformBuffer;
-wgpu::Buffer g_indexBuffer;
-wgpu::Buffer g_storageBuffer;
+gl::Buffer g_vertexBuffer;
+gl::Buffer g_uniformBuffer;
+gl::Buffer g_indexBuffer;
+gl::Buffer g_storageBuffer;
 // Persistent caches for CPU-expanded native-fetch geometry. Separate from the per-frame
 // staging rings so cached ranges can never be clobbered by ring uploads. Filled once per
 // unique mesh (by content hash) and referenced every subsequent frame.
-wgpu::Buffer g_nativeVertexCacheBuffer;
-wgpu::Buffer g_nativeIndexCacheBuffer;
+gl::Buffer g_nativeVertexCacheBuffer;
+gl::Buffer g_nativeIndexCacheBuffer;
 static constexpr uint64_t NativeGeomVertexCacheSize = 24ull * 1024 * 1024;
 static constexpr uint64_t NativeGeomIndexCacheSize = 4ull * 1024 * 1024;
 // Bump-allocator cursors; on exhaustion the whole cache is reset (deferred to a frame
@@ -211,20 +188,11 @@ static uint32_t s_nativeVertexCacheOffset = 0;
 static uint32_t s_nativeIndexCacheOffset = 0;
 static uint32_t s_nativeGeomCacheGeneration = 0;
 static bool s_nativeGeomCacheResetPending = false;
-enum class BufferMapState {
-  Unmapped,
-  Mapping,
-  Mapped,
-};
-static std::array<wgpu::Buffer, StagingBufferCount> g_stagingBuffers;
-static std::array<std::atomic<BufferMapState>, StagingBufferCount> s_mappingStates;
-static wgpu::Limits g_cachedLimits;
+// Phase 1: the WebGPU staging-buffer + MapAsync machinery is gone. Frame data is
+// collected into plain owned ByteBuffers and (from Phase 2) uploaded with
+// glBufferSubData on the worker. No mapping states, no staging slot pool.
 static uint32_t g_frameIndex = UINT32_MAX;
 static PipelineRef g_currentPipeline;
-wgpu::BindGroupLayout g_staticBindGroupLayout;
-wgpu::BindGroup g_staticBindGroup;
-wgpu::BindGroupLayout g_uniformBindGroupLayout;
-wgpu::BindGroup g_uniformBindGroup;
 
 // for imgui debug
 AuroraStats g_stats{};
@@ -234,13 +202,13 @@ uint32_t g_mergedDrawCallCount = 0;
 using CommandList = std::vector<Command>;
 struct RenderPass {
   std::string label;
-  wgpu::TextureView colorView;
-  wgpu::TextureView resolveView; // MSAA resolve target; null if msaaSamples == 1
-  wgpu::TextureView depthStencilView;
-  wgpu::Texture copySourceTexture;
-  wgpu::TextureView copySourceView;
-  wgpu::TextureView copySourceDepthView;
-  wgpu::Extent3D targetSize;
+  gl::Texture colorView;
+  gl::Texture resolveView; // MSAA resolve target; null if msaaSamples == 1
+  gl::Texture depthStencilView;
+  gl::Texture copySourceTexture;
+  gl::Texture copySourceView;
+  gl::Texture copySourceDepthView;
+  gl::Extent3D targetSize;
   uint32_t msaaSamples = 1;
 
   TextureHandle resolveTarget;
@@ -248,16 +216,16 @@ struct RenderPass {
   ClipRect resolveRect;
   Range resolveUniformRange;
   // Full-target snapshots for the public resolve_pass API
-  wgpu::Texture snapshotColorDst;
-  wgpu::TextureView snapshotDepthDst;
+  gl::Texture snapshotColorDst;
+  gl::Texture snapshotDepthDst;
   Vec4<float> clearColorValue{0.f, 0.f, 0.f, 0.f};
   float clearDepthValue = gx::UseReversedZ ? 0.f : 1.f;
-  wgpu::LoadOp colorLoadOp = wgpu::LoadOp::Undefined;
-  wgpu::StoreOp colorStoreOp = wgpu::StoreOp::Store;
-  wgpu::LoadOp depthLoadOp = wgpu::LoadOp::Undefined;
-  wgpu::StoreOp depthStoreOp = wgpu::StoreOp::Store;
-  wgpu::LoadOp stencilLoadOp = wgpu::LoadOp::Undefined;
-  wgpu::StoreOp stencilStoreOp = wgpu::StoreOp::Undefined;
+  gl::LoadOp colorLoadOp = gl::LoadOp::Undefined;
+  gl::StoreOp colorStoreOp = gl::StoreOp::Store;
+  gl::LoadOp depthLoadOp = gl::LoadOp::Undefined;
+  gl::StoreOp depthStoreOp = gl::StoreOp::Store;
+  gl::LoadOp stencilLoadOp = gl::LoadOp::Undefined;
+  gl::StoreOp stencilStoreOp = gl::StoreOp::Undefined;
   uint32_t stencilClearValue = 0;
   CommandList commands;
   bool clearColor = true;
@@ -278,9 +246,9 @@ struct RenderPass {
 };
 
 struct TextureCopy {
-  wgpu::TexelCopyTextureInfo src;
-  wgpu::TexelCopyTextureInfo dst;
-  wgpu::Extent3D size;
+  TextureCopyView src;
+  TextureCopyView dst;
+  gl::Extent3D size;
 };
 
 struct EncoderTask {
@@ -317,10 +285,8 @@ struct FramePacket {
   ByteBuffer indices;
   ByteBuffer storage;
   ByteBuffer textureUpload;
-  wgpu::CommandEncoder encoder;
   uint64_t frameId = 0;
   uint32_t frameIndex = 0;
-  size_t stagingBuffer = 0;
   StagingHighWater copied;
   AuroraStats stats{};
 };
@@ -330,7 +296,6 @@ static FramePacket* g_recordingFrame = nullptr;
 static size_t g_recordingFrameSlot = 0;
 static uint64_t g_nextFrameId = 1;
 static render_worker::FrameSlotPool g_frameSlots{FrameSlotCount};
-static render_worker::FrameSlotPool g_stagingSlots{StagingBufferCount};
 static u32 g_currentRenderPass = UINT32_MAX;
 static bool g_inOffscreen = false;
 static std::optional<RenderPass> g_suspendedEfbPass;
@@ -387,10 +352,8 @@ static void prune_present_times(PresentClock::time_point now) {
 }
 
 static void process_events() {
-  ZoneScopedN("ProcessEvents");
-  if (g_instance) {
-    g_instance.ProcessEvents();
-  }
+  // No Dawn instance to pump on GL: async GPU work is driven by the render worker
+  // and GL fences. Kept as a hook so the callers (idle-wait paths) keep their shape.
 }
 
 static void enqueue_process_events() {
@@ -449,36 +412,9 @@ static void pace_frame_start() {
   }
 }
 
-static void map_staging_buffer(size_t slot, bool releaseSlotOnCompletion = false) {
-  auto expected = BufferMapState::Unmapped;
-  if (!s_mappingStates[slot].compare_exchange_strong(expected, BufferMapState::Mapping, std::memory_order_acq_rel,
-                                                     std::memory_order_acquire)) {
-    return;
-  }
-
-  g_stagingBuffers[slot].MapAsync(
-      wgpu::MapMode::Write, 0, StagingBufferSize, wgpu::CallbackMode::AllowSpontaneous,
-      [slot, releaseSlotOnCompletion](wgpu::MapAsyncStatus status, wgpu::StringView message) {
-        if (status == wgpu::MapAsyncStatus::CallbackCancelled || status == wgpu::MapAsyncStatus::Aborted) {
-          Log.warn("Buffer mapping {}: {}", magic_enum::enum_name(status), message);
-          s_mappingStates[slot].store(BufferMapState::Unmapped, std::memory_order_release);
-          if (releaseSlotOnCompletion) {
-            g_stagingSlots.release(slot);
-          }
-          return;
-        }
-        ASSERT(status == wgpu::MapAsyncStatus::Success, "Buffer mapping failed: {} {}", magic_enum::enum_name(status),
-               message);
-        s_mappingStates[slot].store(BufferMapState::Mapped, std::memory_order_release);
-        if (releaseSlotOnCompletion) {
-          g_stagingSlots.release(slot);
-        }
-      });
-}
-
 static void set_efb_targets(RenderPass& pass) {
   pass.colorView = webgpu::g_frameBuffer.view;
-  pass.resolveView = webgpu::g_graphicsConfig.msaaSamples > 1 ? webgpu::g_frameBufferResolved.view : nullptr;
+  pass.resolveView = webgpu::g_graphicsConfig.msaaSamples > 1 ? webgpu::g_frameBufferResolved.view : gl::Texture{};
   pass.depthStencilView = webgpu::g_depthBuffer.view;
   pass.copySourceTexture =
       webgpu::g_graphicsConfig.msaaSamples > 1 ? webgpu::g_frameBufferResolved.texture : webgpu::g_frameBuffer.texture;
@@ -522,53 +458,18 @@ struct PassSnapshotPool {
 static std::array<PassSnapshotPool, FrameSlotCount> g_passSnapshotPools;
 
 static PassSnapshotEntry& acquire_pass_snapshot(uint32_t width, uint32_t height, bool wantColor, bool wantDepth) {
+  // Phase 4 (EFB copy machinery) creates the snapshot color/depth gl::Textures here on
+  // the worker. Phase 1 hands back an (empty) pooled entry: resolve_pass is stubbed and
+  // no draw samples a snapshot yet, so nothing consumes these.
+  (void)width;
+  (void)height;
+  (void)wantColor;
+  (void)wantDepth;
   auto& pool = g_passSnapshotPools[g_recordingFrameSlot];
   if (pool.used == pool.entries.size()) {
     pool.entries.emplace_back();
   }
-  auto& entry = pool.entries[pool.used++];
-  const wgpu::Extent3D size{width, height, 1};
-  if (wantColor && (!entry.color.texture || entry.color.size.width != width || entry.color.size.height != height ||
-                    entry.color.format != webgpu::g_graphicsConfig.surfaceConfiguration.format)) {
-    const auto format = webgpu::g_graphicsConfig.surfaceConfiguration.format;
-    const wgpu::TextureDescriptor desc{
-        .label = "Pass Snapshot Color",
-        .usage = wgpu::TextureUsage::CopyDst | wgpu::TextureUsage::TextureBinding,
-        .dimension = wgpu::TextureDimension::e2D,
-        .size = size,
-        .format = format,
-        .mipLevelCount = 1,
-        .sampleCount = 1,
-    };
-    auto texture = g_device.CreateTexture(&desc);
-    auto view = texture.CreateView();
-    entry.color = webgpu::TextureWithSampler{
-        .texture = std::move(texture),
-        .view = std::move(view),
-        .size = size,
-        .format = format,
-    };
-  }
-  if (wantDepth && (!entry.depth.texture || entry.depth.size.width != width || entry.depth.size.height != height)) {
-    const wgpu::TextureDescriptor desc{
-        .label = "Pass Snapshot Depth",
-        .usage = wgpu::TextureUsage::RenderAttachment | wgpu::TextureUsage::TextureBinding,
-        .dimension = wgpu::TextureDimension::e2D,
-        .size = size,
-        .format = wgpu::TextureFormat::R32Float,
-        .mipLevelCount = 1,
-        .sampleCount = 1,
-    };
-    auto texture = g_device.CreateTexture(&desc);
-    auto view = texture.CreateView();
-    entry.depth = webgpu::TextureWithSampler{
-        .texture = std::move(texture),
-        .view = std::move(view),
-        .size = size,
-        .format = wgpu::TextureFormat::R32Float,
-    };
-  }
-  return entry;
+  return pool.entries[pool.used++];
 }
 
 static FramePacket& current_frame_packet() {
@@ -620,12 +521,11 @@ static void seal_pass(FramePacket& frame, uint32_t passIndex) {
   pass.sealed = true;
 }
 
-static void encode_op(wgpu::CommandEncoder& cmd, FramePacket& frame, const FrameOp& op);
-static void render(wgpu::CommandEncoder& cmd, FramePacket& frame, RenderPass& passInfo, uint32_t passIndex);
-static void render_pass(const wgpu::RenderPassEncoder& pass, FramePacket& frame, const RenderPass& passInfo);
-static void render_custom_draw(const CustomDrawCommand& draw, const wgpu::RenderPassEncoder& pass,
-                               const RenderPass& passInfo);
-static void execute_encoder_task(wgpu::CommandEncoder& cmd, const EncoderTask& task);
+static void encode_op(FramePacket& frame, const FrameOp& op);
+static void render(FramePacket& frame, RenderPass& passInfo, uint32_t passIndex);
+static void render_pass(gl::PassEncoder& pass, FramePacket& frame, const RenderPass& passInfo);
+static void render_custom_draw(const CustomDrawCommand& draw, gl::PassEncoder& pass, const RenderPass& passInfo);
+static void execute_encoder_task(const EncoderTask& task);
 static void resume_efb_pass_loading(const RenderPass& prevPass);
 static void expire_cached_bind_groups();
 static void push_command(CommandType type, const Command::Data& data);
@@ -640,7 +540,7 @@ static void enqueue_op(FramePacket& frame, size_t frameSlot, uint32_t opIndex) {
       return;
     }
     auto& packet = g_framePackets[frameSlot];
-    encode_op(packet.encoder, packet, op);
+    encode_op(packet, op);
   });
 }
 
@@ -659,46 +559,19 @@ void queue_texture_upload(TextureUpload upload) {
   current_frame_packet().textureUploads.emplace_back(std::move(upload));
 }
 
-void queue_texture_upload_data(const uint8_t* data, uint32_t bytesPerRow, uint32_t rowsPerImage,
-                               wgpu::TexelCopyTextureInfo tex, wgpu::Extent3D size) {
-  const auto copyBytesPerRow = AURORA_ALIGN(bytesPerRow, 256);
+void queue_texture_upload_data(const uint8_t* data, uint32_t bytesPerRow, uint32_t rowsPerImage, gl::Texture tex,
+                               gl::Origin3D origin, gl::Extent3D size, uint32_t level) {
+  // GL: stage the tightly-packed source rows into the frame's textureUpload ByteBuffer;
+  // the worker does glTexSubImage2D from that range at the op slot (Phase 2). No 256-byte
+  // row alignment (that was a Dawn CopyBufferToTexture requirement) and no staging buffer.
   auto& frame = current_frame_packet();
-  if (frame.textureUpload.size() + copyBytesPerRow * rowsPerImage <= TextureUploadSize) {
-    const auto range = push_texture_data(data, bytesPerRow, rowsPerImage);
-    const wgpu::TexelCopyBufferLayout layout{
-        .offset = range.offset,
-        .bytesPerRow = bytesPerRow,
-        .rowsPerImage = rowsPerImage,
-    };
-    queue_texture_upload(TextureUpload{layout, std::move(tex), size});
-    return;
-  }
-
-  const uint64_t uploadSize = copyBytesPerRow * rowsPerImage;
-  const wgpu::BufferDescriptor descriptor{
-      .label = "Overflow Texture Upload Buffer",
-      .usage = wgpu::BufferUsage::MapWrite | wgpu::BufferUsage::CopySrc,
-      .size = uploadSize,
-      .mappedAtCreation = true,
-  };
-  auto buffer = g_device.CreateBuffer(&descriptor);
-  auto* dst = static_cast<uint8_t*>(buffer.GetMappedRange(0, uploadSize));
-  for (uint32_t row = 0; row < rowsPerImage; ++row) {
-    memcpy(dst, data, bytesPerRow);
-    data += bytesPerRow;
-    dst += copyBytesPerRow;
-  }
-  buffer.Unmap();
-
-  const wgpu::TexelCopyBufferLayout layout{
-      .offset = 0,
-      .bytesPerRow = bytesPerRow,
-      .rowsPerImage = rowsPerImage,
-  };
-  queue_texture_upload(TextureUpload{layout, std::move(tex), size, std::move(buffer)});
+  const uint32_t offset = static_cast<uint32_t>(frame.textureUpload.size());
+  const size_t byteCount = static_cast<size_t>(bytesPerRow) * rowsPerImage;
+  frame.textureUpload.append(data, byteCount);
+  queue_texture_upload(TextureUpload{tex, origin, size, level, bytesPerRow, Range{offset, static_cast<uint32_t>(byteCount)}});
 }
 
-void queue_texture_copy(wgpu::TexelCopyTextureInfo src, wgpu::TexelCopyTextureInfo dst, wgpu::Extent3D size) {
+void queue_texture_copy(TextureCopyView src, TextureCopyView dst, gl::Extent3D size) {
   ZoneScoped;
   auto& frame = current_frame_packet();
   if (g_currentRenderPass != UINT32_MAX) {
@@ -746,8 +619,8 @@ void begin_color_pass(const ColorPassDescriptor& desc) {
       .stencilLoadOp = desc.stencilLoadOp,
       .stencilStoreOp = desc.stencilStoreOp,
       .stencilClearValue = desc.stencilClearValue,
-      .clearColor = desc.colorLoadOp == wgpu::LoadOp::Clear,
-      .clearDepth = desc.depthLoadOp == wgpu::LoadOp::Clear,
+      .clearColor = desc.colorLoadOp == gl::LoadOp::Clear,
+      .clearDepth = desc.depthLoadOp == gl::LoadOp::Clear,
       .hasDepth = desc.hasDepth,
       .hasStencil = desc.hasStencil,
       .depthReadOnly = desc.depthReadOnly,
@@ -895,7 +768,7 @@ void resolve_pass_into(TextureHandle texture, ClipRect rect, bool clearColor, bo
             .clearDepth = false, // Depth cleared via render attachment
         }),
         .color =
-            wgpu::Color{
+            gl::Color{
                 .r = clearColorValue.x(),
                 .g = clearColorValue.y(),
                 .b = clearColorValue.z(),
@@ -926,13 +799,11 @@ void clear_caches() noexcept {
   g_cachedBindGroups.clear();
 }
 
-wgpu::Device device() noexcept { return g_device; }
+uint32_t color_format() noexcept {
+  return static_cast<uint32_t>(webgpu::g_graphicsConfig.surfaceConfiguration.format);
+}
 
-wgpu::Queue queue() noexcept { return g_queue; }
-
-wgpu::TextureFormat color_format() noexcept { return webgpu::g_graphicsConfig.surfaceConfiguration.format; }
-
-wgpu::TextureFormat depth_format() noexcept { return webgpu::g_graphicsConfig.depthFormat; }
+uint32_t depth_format() noexcept { return static_cast<uint32_t>(webgpu::g_graphicsConfig.depthFormat); }
 
 uint32_t sample_count() noexcept { return webgpu::g_graphicsConfig.msaaSamples; }
 
@@ -1024,47 +895,15 @@ static OffscreenCacheEntry get_offscreen_textures(uint32_t width, uint32_t heigh
   if (const auto it = g_offscreenCache.find(key); it != g_offscreenCache.end()) {
     return it->second;
   }
+  // Phase 4 (EFB copy / offscreen) creates the color + depth gl::Textures here on the
+  // worker (via gl::create_texture) and caches them. Phase 1 caches an empty entry:
+  // offscreen passes still open/close and stay balanced, but draws into them are inert.
   const auto colorFormat = webgpu::g_graphicsConfig.surfaceConfiguration.format;
-  const wgpu::Extent3D size{width, height, 1};
-  const wgpu::TextureDescriptor colorDesc{
-      .label = "Offscreen Color",
-      .usage = wgpu::TextureUsage::RenderAttachment | wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::CopySrc |
-               wgpu::TextureUsage::CopyDst,
-      .dimension = wgpu::TextureDimension::e2D,
-      .size = size,
-      .format = colorFormat,
-      .mipLevelCount = 1,
-      .sampleCount = 1,
-  };
-  auto colorTexture = g_device.CreateTexture(&colorDesc);
-  auto colorView = colorTexture.CreateView();
-  webgpu::TextureWithSampler color{
-      .texture = std::move(colorTexture),
-      .view = std::move(colorView),
-      .size = size,
-      .format = colorFormat,
-  };
   const auto depthFormat = webgpu::g_graphicsConfig.depthFormat;
-  const wgpu::TextureDescriptor depthDesc{
-      .label = "Offscreen Depth",
-      .usage = wgpu::TextureUsage::RenderAttachment | wgpu::TextureUsage::TextureBinding,
-      .dimension = wgpu::TextureDimension::e2D,
-      .size = size,
-      .format = depthFormat,
-      .mipLevelCount = 1,
-      .sampleCount = 1,
-  };
-  auto depthTexture = g_device.CreateTexture(&depthDesc);
-  auto depthView = depthTexture.CreateView();
-  webgpu::TextureWithSampler depth{
-      .texture = std::move(depthTexture),
-      .view = std::move(depthView),
-      .size = size,
-      .format = depthFormat,
-  };
+  const gl::Extent3D size{width, height, 1};
   OffscreenCacheEntry entry{
-      .color = std::move(color),
-      .depth = std::move(depth),
+      .color = webgpu::TextureWithSampler{.size = size, .format = colorFormat},
+      .depth = webgpu::TextureWithSampler{.size = size, .format = depthFormat},
   };
   auto [insertIt, _] = g_offscreenCache.emplace(key, std::move(entry));
   return insertIt->second;
@@ -1199,12 +1038,12 @@ bool resolve_pass(const ResolveDesc& desc, ResolvedTargets& out) {
     auto& entry = acquire_pass_snapshot(width, height, desc.color, wantDepth);
     if (desc.color) {
       prevPass.snapshotColorDst = entry.color.texture;
-      out.color = entry.color.view;
-      out.colorFormat = entry.color.format;
+      out.color = entry.color.view.id;
+      out.colorFormat = static_cast<uint32_t>(entry.color.format);
     }
     if (wantDepth) {
       prevPass.snapshotDepthDst = entry.depth.view;
-      out.depth = entry.depth.view;
+      out.depth = entry.depth.view.id;
     }
   }
   out.width = width;
@@ -1375,142 +1214,25 @@ void initialize() {
     std::lock_guard lock{g_presentStatsMutex};
     g_presentTimes.clear();
   }
-  // The render worker runs on the SDL2-shim EFB path too. The game thread still makes Dawn calls
-  // mid-frame (vertex-cache uploads, texture creation), each taking Dawn's EGL-context mutex, but
-  // the worker can no longer park while holding it: the EFB slot's reverse-fence wait in
-  // sdl2shim_present::acquire() is a client-side wait taken with no context held, so every
-  // worker-side mutex hold is bounded by GPU progress alone and no game-thread call can close a
-  // deadlock cycle against it (the Mali-G31 hang this used to gate on).
   render_worker::initialize();
-  // Create the native geometry cache buffers before any frame traffic: on GLES, buffer
-  // creation makes Dawn's EGL context current, and doing that from the game thread while
-  // the render worker holds the context can deadlock libmali (Mali-G31).
-  ensure_native_geom_cache_buffers();
-  // This appears to take a while and blocks the render thread for periods of time
-  // render_worker::set_event_pump([] {
-  //   if (g_instance) {
-  //     g_instance.ProcessEvents();
-  //   }
-  // });
+  // Normalcy Doctrine rule 3: the render worker owns the GL context for its whole life.
+  // device.cpp created it and released it on the main thread; bind it on the worker now
+  // (runs inline on this thread in the single-threaded fallback -- either way the thread
+  // that will execute GL work is the one that holds the context). Every GL call after this
+  // -- buffer/texture creation, draws, present -- happens on the worker.
+  render_worker::enqueue_work([] { gl::make_render_current(); });
+  render_worker::synchronize();
+
   depth_peek::initialize();
   tex_copy_conv::initialize();
   tex_palette_conv::initialize();
   texture_replacement::initialize();
 
-  // For uniform & storage buffer offset alignments
-  g_device.GetLimits(&g_cachedLimits);
-
-  const auto createBuffer = [](wgpu::Buffer& out, wgpu::BufferUsage usage, uint64_t size, const char* label) {
-    if (size <= 0) {
-      return;
-    }
-    const wgpu::BufferDescriptor descriptor{
-        .label = label,
-        .usage = usage,
-        .size = size,
-    };
-    out = g_device.CreateBuffer(&descriptor);
-  };
-  createBuffer(g_uniformBuffer, wgpu::BufferUsage::Uniform | wgpu::BufferUsage::CopyDst, UniformBufferSize,
-               "Shared Uniform Buffer");
-  createBuffer(g_vertexBuffer, wgpu::BufferUsage::Storage | wgpu::BufferUsage::Vertex | wgpu::BufferUsage::CopyDst,
-               VertexBufferSize, "Shared Vertex Buffer");
-  createBuffer(g_indexBuffer, wgpu::BufferUsage::Index | wgpu::BufferUsage::CopyDst, IndexBufferSize,
-               "Shared Index Buffer");
-  createBuffer(g_storageBuffer, wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopyDst, StorageBufferSize,
-               "Shared Storage Buffer");
-  for (size_t i = 0; i < g_stagingBuffers.size(); ++i) {
-    const auto label = fmt::format("Staging Buffer {}", i);
-    createBuffer(g_stagingBuffers[i], wgpu::BufferUsage::MapWrite | wgpu::BufferUsage::CopySrc, StagingBufferSize,
-                 label.c_str());
-  }
-  for (auto& state : s_mappingStates) {
-    state.store(BufferMapState::Unmapped, std::memory_order_release);
-  }
-  for (size_t slot = 0; slot < g_stagingBuffers.size(); ++slot) {
-    map_staging_buffer(slot);
-  }
-
-  {
-    constexpr std::array layoutEntries{
-        // Vertex data buffer
-        wgpu::BindGroupLayoutEntry{
-            .binding = 0,
-            .visibility = wgpu::ShaderStage::Vertex,
-            .buffer =
-                wgpu::BufferBindingLayout{
-                    .type = wgpu::BufferBindingType::ReadOnlyStorage,
-                },
-        },
-        // Storage data buffer
-        wgpu::BindGroupLayoutEntry{
-            .binding = 1,
-            .visibility = wgpu::ShaderStage::Vertex,
-            .buffer =
-                wgpu::BufferBindingLayout{
-                    .type = wgpu::BufferBindingType::ReadOnlyStorage,
-                },
-        },
-    };
-    const wgpu::BindGroupLayoutDescriptor layoutDesc{
-        .label = "Static bind group layout",
-        .entryCount = layoutEntries.size(),
-        .entries = layoutEntries.data(),
-    };
-    g_staticBindGroupLayout = g_device.CreateBindGroupLayout(&layoutDesc);
-    const std::array entries{
-        wgpu::BindGroupEntry{
-            .binding = 0,
-            .buffer = g_vertexBuffer,
-        },
-        wgpu::BindGroupEntry{
-            .binding = 1,
-            .buffer = g_storageBuffer,
-        },
-    };
-    const wgpu::BindGroupDescriptor bindGroupDescriptor{
-        .label = "Static bind group",
-        .layout = g_staticBindGroupLayout,
-        .entryCount = entries.size(),
-        .entries = entries.data(),
-    };
-    g_staticBindGroup = g_device.CreateBindGroup(&bindGroupDescriptor);
-  }
-
-  {
-    constexpr std::array layoutEntries{
-        // Uniform buffer (dynamic offset)
-        wgpu::BindGroupLayoutEntry{
-            .binding = 0,
-            .visibility = wgpu::ShaderStage::Vertex | wgpu::ShaderStage::Fragment,
-            .buffer =
-                wgpu::BufferBindingLayout{
-                    .type = wgpu::BufferBindingType::Uniform,
-                    .hasDynamicOffset = true,
-                },
-        },
-    };
-    const wgpu::BindGroupLayoutDescriptor layoutDesc{
-        .label = "Uniform bind group layout",
-        .entryCount = layoutEntries.size(),
-        .entries = layoutEntries.data(),
-    };
-    g_uniformBindGroupLayout = g_device.CreateBindGroupLayout(&layoutDesc);
-    const std::array entries{
-        wgpu::BindGroupEntry{
-            .binding = 0,
-            .buffer = g_uniformBuffer,
-            .size = gx::MaxUniformSize,
-        },
-    };
-    const wgpu::BindGroupDescriptor bindGroupDescriptor{
-        .label = "Uniform bind group",
-        .layout = g_uniformBindGroupLayout,
-        .entryCount = entries.size(),
-        .entries = entries.data(),
-    };
-    g_uniformBindGroup = g_device.CreateBindGroup(&bindGroupDescriptor);
-  }
+  // Phase 1: the shared vertex/uniform/index GL buffers and the native-geometry cache are
+  // created in Phase 2 (frame skeleton). Draw submission is stubbed, so per-frame data is
+  // collected in owned ByteBuffers and never uploaded; the WebGPU static/uniform bind
+  // groups are gone (native shaders don't use group 0, and the uniform buffer binds with a
+  // dynamic offset via glBindBufferRange at draw time).
 
   gx::initialize();
 #ifdef AURORA_ENABLE_RMLUI
@@ -1568,7 +1290,6 @@ void shutdown() {
   s_nativeIndexCacheOffset = 0;
   s_nativeGeomCacheResetPending = false;
   ++s_nativeGeomCacheGeneration;
-  g_stagingBuffers.fill({});
   for (auto& packet : g_framePackets) {
     packet = {};
   }
@@ -1577,32 +1298,9 @@ void shutdown() {
   g_offscreenCache.clear();
   g_offscreenColor = {};
   g_offscreenDepth = {};
-  g_staticBindGroup = {};
-  g_staticBindGroupLayout = {};
-  g_uniformBindGroup = {};
-  g_uniformBindGroupLayout = {};
   g_inOffscreen = false;
   g_frameIndex = UINT32_MAX;
   g_frameSlots.reset();
-  g_stagingSlots.reset();
-  for (auto& state : s_mappingStates) {
-    state.store(BufferMapState::Unmapped, std::memory_order_release);
-  }
-}
-
-static bool wait_for_staging_buffer(size_t slot) {
-  ZoneScopedN("Wait for buffer map");
-  map_staging_buffer(slot);
-  while (true) {
-    const auto mappingState = s_mappingStates[slot].load(std::memory_order_acquire);
-    if (mappingState == BufferMapState::Mapped) {
-      return true;
-    }
-    if (mappingState == BufferMapState::Unmapped) {
-      return false;
-    }
-    wait_for_gpu_progress(std::chrono::milliseconds{1});
-  }
 }
 
 static size_t acquire_frame_slot() {
@@ -1619,66 +1317,37 @@ static size_t acquire_frame_slot() {
   }
 }
 
-static std::optional<size_t> acquire_mapped_staging_buffer() {
-  ZoneScopedN("Acquire mapped staging buffer");
-  while (true) {
-    if (auto slot = g_stagingSlots.try_acquire()) {
-      if (wait_for_staging_buffer(*slot)) {
-        return *slot;
-      }
-      g_stagingSlots.release(*slot);
-      return std::nullopt;
-    }
-    wait_for_gpu_progress(std::chrono::microseconds{100});
-  }
-}
-
 bool begin_frame() {
   ZoneScoped;
   // pace_frame_start();
   const size_t frameSlot = acquire_frame_slot();
-  const auto stagingSlot = acquire_mapped_staging_buffer();
-  if (!stagingSlot) {
-    g_frameSlots.release(frameSlot);
-    return false;
-  }
 
   auto& frame = g_framePackets[frameSlot];
   frame = {};
   frame.frameId = g_nextFrameId++;
   frame.frameIndex = g_frameIndex;
-  frame.stagingBuffer = *stagingSlot;
   g_recordingFrame = &frame;
   g_recordingFrameSlot = frameSlot;
   g_passSnapshotPools[frameSlot].used = 0;
 
   if (s_nativeGeomCacheResetPending) {
     // Deferred cache reset: every frame that referenced the old cached ranges has already
-    // been submitted, and queue.WriteBuffer is ordered after those submits, so recycling
-    // the cache regions from offset 0 cannot race the GPU's reads of the old contents.
-    // Bump the generation so the CPU-side content maps drop their now-stale entries.
+    // been submitted; recycling the cache regions from offset 0 cannot race the GPU's reads
+    // of the old contents. Bump the generation so CPU-side content maps drop stale entries.
     s_nativeGeomCacheResetPending = false;
     s_nativeVertexCacheOffset = 0;
     s_nativeIndexCacheOffset = 0;
     ++s_nativeGeomCacheGeneration;
   }
 
-  size_t bufferOffset = 0;
-  const auto& stagingBuf = g_stagingBuffers[*stagingSlot];
-  const auto mapBuffer = [&](ByteBuffer& buf, uint64_t size) {
-    if (size <= 0) {
-      return;
-    }
-    buf = ByteBuffer{static_cast<u8*>(stagingBuf.GetMappedRange(bufferOffset, size)), static_cast<size_t>(size)};
-    bufferOffset += size;
-  };
-  mapBuffer(frame.verts, VertexBufferSize);
-  mapBuffer(frame.uniforms, UniformBufferSize);
-  mapBuffer(frame.indices, IndexBufferSize);
-  mapBuffer(frame.storage, StorageBufferSize);
-  if constexpr (UseTextureBuffer) {
-    mapBuffer(frame.textureUpload, TextureUploadSize);
-  }
+  // Phase 1: per-frame data goes into owned ByteBuffers (grown on demand) instead of a
+  // mapped staging buffer. Phase 2 uploads the dirty ranges to GL ring buffers with
+  // glBufferSubData on the worker; for now draws are stubbed and the data is discarded.
+  frame.verts = {};
+  frame.uniforms = {};
+  frame.indices = {};
+  frame.storage = {};
+  frame.textureUpload = {};
 
   g_drawCallCount = 0;
   g_mergedDrawCallCount = 0;
@@ -1697,11 +1366,7 @@ bool begin_frame() {
   push_command(CommandType::SetViewport, Command::Data{.setViewport = g_cachedViewport});
   push_command(CommandType::SetScissor, Command::Data{.setScissor = g_cachedScissor});
   begin_pipeline_frame();
-  render_worker::enqueue_begin_frame(frame.frameId, [frameSlot] {
-    static constexpr wgpu::CommandEncoderDescriptor EncoderDescriptor{.label = "Redraw encoder"};
-    g_framePackets[frameSlot].encoder = g_device.CreateCommandEncoder(&EncoderDescriptor);
-    webgpu::gpu_prof::frame_begin(g_framePackets[frameSlot].encoder);
-  });
+  render_worker::enqueue_begin_frame(frame.frameId, [] { webgpu::gpu_prof::frame_begin(); });
   g_cpuFrameStart = PresentClock::now();
   return true;
 }
@@ -1787,15 +1452,11 @@ void end_frame(EndFrameCallback callback) {
   }
 #endif
 
-  const size_t stagingSlot = frame.stagingBuffer;
   // Dusklight (P4): tell the present module a frame is on its way, so the next flush_present()
   // knows to wait for it. Must precede the enqueue, which is what produces that frame.
   webgpu::sdl2shim_present::note_frame_enqueued();
-  render_worker::enqueue_end_frame(frameId, [frameSlot, stagingSlot, callback = std::move(callback)]() mutable {
+  render_worker::enqueue_end_frame(frameId, [frameSlot, callback = std::move(callback)]() mutable {
     auto& packet = g_framePackets[frameSlot];
-    g_stagingBuffers[stagingSlot].Unmap();
-    s_mappingStates[stagingSlot].store(BufferMapState::Unmapped, std::memory_order_release);
-    auto encoder = std::move(packet.encoder);
     const auto stats = packet.stats;
     packet = {};
     g_stats.drawCallCount = stats.drawCallCount;
@@ -1805,12 +1466,13 @@ void end_frame(EndFrameCallback callback) {
     g_stats.lastIndexSize = stats.lastIndexSize;
     g_stats.lastStorageSize = stats.lastStorageSize;
     g_stats.lastTextureUploadSize = stats.lastTextureUploadSize;
+    // GL present: aurora's command list already sequenced the frame; there is no command
+    // buffer to submit. The callback (aurora.cpp) issues the present GL and swaps.
     if (callback) {
-      callback(encoder);
+      callback();
     }
     g_frameSlots.release(frameSlot);
     expire_cached_bind_groups();
-    map_staging_buffer(stagingSlot, true);
     process_events();
   });
 }
@@ -1833,219 +1495,46 @@ static void expire_cached_bind_groups() {
   }
 }
 
-static constexpr uint64_t VertexStagingOffset = 0;
-static constexpr uint64_t UniformStagingOffset = VertexStagingOffset + VertexBufferSize;
-static constexpr uint64_t IndexStagingOffset = UniformStagingOffset + UniformBufferSize;
-static constexpr uint64_t StorageStagingOffset = IndexStagingOffset + IndexBufferSize;
-static constexpr uint64_t TextureUploadStagingOffset = StorageStagingOffset + StorageBufferSize;
-
-static constexpr uint32_t align_down_copy_offset(uint32_t value) noexcept { return value & ~3u; }
-
-static void copy_staging_buffer_range(wgpu::CommandEncoder& cmd, const FramePacket& frame, uint32_t& copied,
-                                      uint32_t highWater, uint64_t stagingOffset, const wgpu::Buffer& dst) {
-  if (highWater <= copied) {
-    return;
-  }
-  const uint32_t copyStart = align_down_copy_offset(copied);
-  const uint32_t copyEnd = AURORA_ALIGN(highWater, 4);
-  cmd.CopyBufferToBuffer(g_stagingBuffers[frame.stagingBuffer], stagingOffset + copyStart, dst, copyStart,
-                         copyEnd - copyStart);
-  copied = highWater;
-}
-
-static bool needs_staging_copy(const FramePacket& frame, const FrameOp& op) {
-  const auto& highWater = op.highWater;
-  if (highWater.verts > frame.copied.verts || highWater.uniforms > frame.copied.uniforms ||
-      highWater.indices > frame.copied.indices || highWater.storage > frame.copied.storage) {
-    return true;
-  }
-  if constexpr (UseTextureBuffer) {
-    return op.textureUploads.size() > frame.copied.textureUploadCount;
-  }
-  return false;
-}
-
-static void copy_staging_to_high_water(wgpu::CommandEncoder& cmd, FramePacket& frame, const FrameOp& op) {
-  if (!needs_staging_copy(frame, op)) {
-    return;
-  }
-  const webgpu::gpu_prof::Zone zone{cmd, "Staging copies"};
-  const auto& highWater = op.highWater;
-  copy_staging_buffer_range(cmd, frame, frame.copied.verts, highWater.verts, VertexStagingOffset, g_vertexBuffer);
-  copy_staging_buffer_range(cmd, frame, frame.copied.uniforms, highWater.uniforms, UniformStagingOffset,
-                            g_uniformBuffer);
-  copy_staging_buffer_range(cmd, frame, frame.copied.indices, highWater.indices, IndexStagingOffset, g_indexBuffer);
-  copy_staging_buffer_range(cmd, frame, frame.copied.storage, highWater.storage, StorageStagingOffset, g_storageBuffer);
-
-  if constexpr (UseTextureBuffer) {
-    for (size_t i = frame.copied.textureUploadCount; i < op.textureUploads.size(); ++i) {
-      const auto& item = *op.textureUploads[i];
-      const wgpu::TexelCopyBufferInfo buf{
-          .layout =
-              wgpu::TexelCopyBufferLayout{
-                  .offset = item.buffer ? item.layout.offset : item.layout.offset + TextureUploadStagingOffset,
-                  .bytesPerRow = AURORA_ALIGN(item.layout.bytesPerRow, 256),
-                  .rowsPerImage = item.layout.rowsPerImage,
-              },
-          .buffer = item.buffer ? item.buffer : g_stagingBuffers[frame.stagingBuffer],
-      };
-      cmd.CopyBufferToTexture(&buf, &item.tex, &item.size);
-    }
-    frame.copied.textureUpload = highWater.textureUpload;
-    frame.copied.textureUploadCount = op.textureUploads.size();
-  }
-}
-
-static void encode_op(wgpu::CommandEncoder& cmd, FramePacket& frame, const FrameOp& op) {
-  copy_staging_to_high_water(cmd, frame, op);
+// Phase 2 uploads the op's high-water buffer ranges to the GL ring buffers here with
+// glBufferSubData on the worker (the WebGPU staging-buffer + CopyBufferToBuffer path is
+// gone). Phase 1 has no GL ring buffers and stubs draws, so there is nothing to upload.
+static void encode_op(FramePacket& frame, const FrameOp& op) {
   switch (op.type) {
   case FrameOpType::RenderPass:
     if (op.renderPass != nullptr) {
-      render(cmd, frame, *op.renderPass, op.index);
+      render(frame, *op.renderPass, op.index);
     }
     break;
   case FrameOpType::TextureCopy:
-    if (op.textureCopy != nullptr) {
-      const webgpu::gpu_prof::Zone zone{cmd, "Texture copy"};
-      cmd.CopyTextureToTexture(&op.textureCopy->src, &op.textureCopy->dst, &op.textureCopy->size);
-    }
+    // Phase 4: FBO-to-FBO glBlitFramebuffer(op.textureCopy->{src,dst,size}).
     break;
   case FrameOpType::EncoderTask:
     if (op.encoderTask != nullptr) {
-      execute_encoder_task(cmd, *op.encoderTask);
+      execute_encoder_task(*op.encoderTask);
     }
     break;
   }
 }
 
-static void render(wgpu::CommandEncoder& cmd, FramePacket& frame, RenderPass& passInfo, uint32_t passIndex) {
+static void render(FramePacket& frame, RenderPass& passInfo, uint32_t passIndex) {
   ZoneScoped;
-  if (!passInfo.sealed) {
+  (void)passIndex;
+  if (!passInfo.sealed || passInfo.discardable) {
     return;
   }
-
-  for (const auto& conv : passInfo.paletteConvs) {
-    tex_palette_conv::run(cmd, conv);
-  }
-  if (passInfo.discardable) {
-    // This pass has no effect and can be safely discarded (e.g. an empty EFB segment between two back-to-back pass
-    // breaks, or an unresolved offscreen pass).
-    return;
-  }
-
-  const std::array attachments{
-      wgpu::RenderPassColorAttachment{
-          .view = passInfo.colorView,
-          .resolveTarget = passInfo.resolveView,
-          .loadOp = passInfo.colorLoadOp != wgpu::LoadOp::Undefined
-                        ? passInfo.colorLoadOp
-                        : (passInfo.clearColor ? wgpu::LoadOp::Clear : wgpu::LoadOp::Load),
-          .storeOp = passInfo.colorStoreOp,
-          .clearValue =
-              {
-                  .r = passInfo.clearColorValue.x(),
-                  .g = passInfo.clearColorValue.y(),
-                  .b = passInfo.clearColorValue.z(),
-                  .a = passInfo.clearColorValue.w(),
-              },
-      },
-  };
-  wgpu::RenderPassDepthStencilAttachment depthStencilAttachment{};
-  const wgpu::RenderPassDepthStencilAttachment* depthStencilAttachmentPtr = nullptr;
-  if (passInfo.depthStencilView) {
-    depthStencilAttachment = {
-        .view = passInfo.depthStencilView,
-        .depthLoadOp = passInfo.hasDepth ? (passInfo.depthLoadOp != wgpu::LoadOp::Undefined
-                                                ? passInfo.depthLoadOp
-                                                : (passInfo.clearDepth ? wgpu::LoadOp::Clear : wgpu::LoadOp::Load))
-                                         : wgpu::LoadOp::Undefined,
-        .depthStoreOp = passInfo.hasDepth ? passInfo.depthStoreOp : wgpu::StoreOp::Undefined,
-        .depthClearValue = passInfo.clearDepthValue,
-        .depthReadOnly = passInfo.depthReadOnly,
-        .stencilLoadOp = passInfo.hasStencil ? passInfo.stencilLoadOp : wgpu::LoadOp::Undefined,
-        .stencilStoreOp = passInfo.hasStencil ? passInfo.stencilStoreOp : wgpu::StoreOp::Undefined,
-        .stencilClearValue = passInfo.stencilClearValue,
-    };
-    depthStencilAttachmentPtr = &depthStencilAttachment;
-  }
-  const auto label = passInfo.label.empty() ? fmt::format("Render pass {}", passIndex)
-                                            : fmt::format("{} {}", passInfo.label, passIndex);
-  const wgpu::RenderPassDescriptor renderPassDescriptor{
-      .label = label.c_str(),
-      .colorAttachmentCount = attachments.size(),
-      .colorAttachments = attachments.data(),
-      .depthStencilAttachment = depthStencilAttachmentPtr,
-      .timestampWrites = webgpu::gpu_prof::pass_writes(label),
-  };
-
-  auto pass = cmd.BeginRenderPass(&renderPassDescriptor);
+  // Phase 2 binds the pass FBO (fbo_cache), applies S7 load ops (glClearBuffer / load),
+  // replays the command list against a gl::PassEncoder, applies store ops
+  // (glInvalidateFramebuffer), then the EFB resolve/snapshot copies + palette conversions
+  // (Phase 4). Phase 1 walks the command stream through an inert PassEncoder so the
+  // record/replay machinery stays exercised; no GL is emitted, and resolve/snapshot/palette
+  // paths are skipped (their targets are stubbed empty).
+  gl::PassEncoder pass{gl::PassTarget{
+      .fbo = 0,
+      .width = passInfo.targetSize.width,
+      .height = passInfo.targetSize.height,
+  }};
   render_pass(pass, frame, passInfo);
   pass.End();
-
-  if (passInfo.captureDepthSnapshot) {
-    depth_peek::encode_frame_snapshot(cmd, passInfo.copySourceDepthView, passInfo.targetSize, passInfo.msaaSamples);
-  }
-
-  if (passInfo.resolveTarget) {
-    const auto& dstSize = passInfo.resolveTarget->size;
-    const bool needsConversion = tex_copy_conv::needs_conversion(passInfo.resolveFormat);
-    const bool needsScaling = dstSize.width != static_cast<uint32_t>(passInfo.resolveRect.width) ||
-                              dstSize.height != static_cast<uint32_t>(passInfo.resolveRect.height);
-    const bool isDepth = gx::is_depth_format(passInfo.resolveFormat);
-    if (isDepth && passInfo.msaaSamples > 1) {
-      Log.fatal("Depth tex copies from multisampled EFB targets are not supported");
-    }
-    const tex_copy_conv::ConvRequest convReq{
-        .fmt = passInfo.resolveFormat,
-        .srcView = isDepth ? passInfo.copySourceDepthView : passInfo.copySourceView,
-        .uniformRange = passInfo.resolveUniformRange,
-        .dst = passInfo.resolveTarget,
-        .sampleFilter = needsScaling ? tex_copy_conv::SampleFilter::Linear : tex_copy_conv::SampleFilter::Nearest,
-    };
-    if (needsConversion) {
-      tex_copy_conv::run(cmd, convReq);
-    } else if (needsScaling) {
-      tex_copy_conv::blit(cmd, convReq);
-    } else {
-      const webgpu::gpu_prof::Zone zone{cmd, "EFB copy"};
-      const wgpu::TexelCopyTextureInfo src{
-          .texture = passInfo.copySourceTexture,
-          .origin =
-              wgpu::Origin3D{
-                  .x = static_cast<uint32_t>(passInfo.resolveRect.x),
-                  .y = static_cast<uint32_t>(passInfo.resolveRect.y),
-              },
-      };
-      const wgpu::TexelCopyTextureInfo dst{
-          .texture = passInfo.resolveTarget->texture,
-      };
-      const wgpu::Extent3D size{
-          .width = static_cast<uint32_t>(passInfo.resolveRect.width),
-          .height = static_cast<uint32_t>(passInfo.resolveRect.height),
-          .depthOrArrayLayers = 1,
-      };
-      cmd.CopyTextureToTexture(&src, &dst, &size);
-    }
-  }
-
-  if (passInfo.snapshotColorDst) {
-    const webgpu::gpu_prof::Zone zone{cmd, "Pass snapshot"};
-    const wgpu::TexelCopyTextureInfo src{
-        .texture = passInfo.copySourceTexture,
-    };
-    const wgpu::TexelCopyTextureInfo dst{
-        .texture = passInfo.snapshotColorDst,
-    };
-    const wgpu::Extent3D size{
-        .width = passInfo.targetSize.width,
-        .height = passInfo.targetSize.height,
-        .depthOrArrayLayers = 1,
-    };
-    cmd.CopyTextureToTexture(&src, &dst, &size);
-  }
-  if (passInfo.snapshotDepthDst) {
-    tex_copy_conv::snapshot_depth(cmd, passInfo.copySourceDepthView, passInfo.msaaSamples, passInfo.snapshotDepthDst);
-  }
 }
 
 void after_submit() noexcept { depth_peek::after_submit(); }
@@ -2088,13 +1577,13 @@ float calculate_fps() noexcept {
   return static_cast<float>(g_presentTimes.size() - 1) / elapsed;
 }
 
-static void apply_viewport(const wgpu::RenderPassEncoder& pass, const Viewport& vp) {
+static void apply_viewport(gl::PassEncoder& pass, const Viewport& vp) {
   const float minDepth = gx::UseReversedZ ? 1.f - vp.zfar : vp.znear;
   const float maxDepth = gx::UseReversedZ ? 1.f - vp.znear : vp.zfar;
   pass.SetViewport(vp.left, vp.top, vp.width, vp.height, minDepth, maxDepth);
 }
 
-static void apply_scissor(const wgpu::RenderPassEncoder& pass, const ClipRect& sc, const wgpu::Extent3D& size) {
+static void apply_scissor(gl::PassEncoder& pass, const ClipRect& sc, const gl::Extent3D& size) {
   const auto x = std::clamp(static_cast<uint32_t>(sc.x), 0u, size.width);
   const auto y = std::clamp(static_cast<uint32_t>(sc.y), 0u, size.height);
   const auto w = std::clamp(static_cast<uint32_t>(sc.width), 0u, size.width - x);
@@ -2104,22 +1593,18 @@ static void apply_scissor(const wgpu::RenderPassEncoder& pass, const ClipRect& s
 
 static DrawContext make_draw_context(const RenderPass& passInfo) {
   return {
-      .device = g_device,
-      .queue = g_queue,
-      .vertexBuffer = g_vertexBuffer,
-      .indexBuffer = g_indexBuffer,
-      .uniformBuffer = g_uniformBuffer,
-      .storageBuffer = g_storageBuffer,
-      .colorFormat = webgpu::g_graphicsConfig.surfaceConfiguration.format,
-      .depthFormat = webgpu::g_graphicsConfig.depthFormat,
+      .vertexBuffer = g_vertexBuffer.id,
+      .indexBuffer = g_indexBuffer.id,
+      .uniformBuffer = g_uniformBuffer.id,
+      .colorFormat = static_cast<uint32_t>(webgpu::g_graphicsConfig.surfaceConfiguration.format),
+      .depthFormat = static_cast<uint32_t>(webgpu::g_graphicsConfig.depthFormat),
       .sampleCount = passInfo.msaaSamples,
       .targetWidth = passInfo.targetSize.width,
       .targetHeight = passInfo.targetSize.height,
   };
 }
 
-static void render_custom_draw(const CustomDrawCommand& draw, const wgpu::RenderPassEncoder& pass,
-                               const RenderPass& passInfo) {
+static void render_custom_draw(const CustomDrawCommand& draw, gl::PassEncoder& pass, const RenderPass& passInfo) {
   RuntimeDrawType drawType;
   {
     std::lock_guard lock{g_runtimeDrawTypeMutex};
@@ -2135,7 +1620,7 @@ static void render_custom_draw(const CustomDrawCommand& draw, const wgpu::Render
   drawType.draw(context, pass, draw.payload.data(), draw.payloadSize, drawType.userdata);
 }
 
-static void execute_encoder_task(wgpu::CommandEncoder& cmd, const EncoderTask& task) {
+static void execute_encoder_task(const EncoderTask& task) {
   RuntimeEncoderTaskType taskType;
   {
     std::lock_guard lock{g_runtimeDrawTypeMutex};
@@ -2148,17 +1633,14 @@ static void execute_encoder_task(wgpu::CommandEncoder& cmd, const EncoderTask& t
   }
 
   const EncoderTaskContext context{
-      .device = g_device,
-      .queue = g_queue,
-      .vertexBuffer = g_vertexBuffer,
-      .indexBuffer = g_indexBuffer,
-      .uniformBuffer = g_uniformBuffer,
-      .storageBuffer = g_storageBuffer,
+      .vertexBuffer = g_vertexBuffer.id,
+      .indexBuffer = g_indexBuffer.id,
+      .uniformBuffer = g_uniformBuffer.id,
   };
-  taskType.callback(context, cmd, task.payload.data(), task.payloadSize, taskType.userdata);
+  taskType.callback(context, task.payload.data(), task.payloadSize, taskType.userdata);
 }
 
-static void render_pass(const wgpu::RenderPassEncoder& pass, FramePacket& frame, const RenderPass& passInfo) {
+static void render_pass(gl::PassEncoder& pass, FramePacket& frame, const RenderPass& passInfo) {
   ZoneScoped;
   g_currentPipeline = UINTPTR_MAX;
 #ifdef AURORA_GFX_DEBUG_GROUPS
@@ -2169,8 +1651,8 @@ static void render_pass(const wgpu::RenderPassEncoder& pass, FramePacket& frame,
   bool hasViewport = false;
   bool hasScissor = false;
 
-  // Bind static bind group for the whole pass
-  pass.SetBindGroup(0, g_staticBindGroup);
+  // Native shaders don't use group 0 (the dead storage-fetch path is gone); bind only the
+  // empty texture set (group 2) so unused GX texture units sample a 1x1 fill.
   pass.SetBindGroup(2, gx::g_emptyTextureBindGroup);
 
   for (const auto& cmd : passInfo.commands) {
@@ -2224,7 +1706,6 @@ static void render_pass(const wgpu::RenderPassEncoder& pass, FramePacket& frame,
     case CommandType::CustomDraw: {
       render_custom_draw(cmd.data.customDraw, pass, passInfo);
       g_currentPipeline = UINTPTR_MAX;
-      pass.SetBindGroup(0, g_staticBindGroup);
       pass.SetBindGroup(2, gx::g_emptyTextureBindGroup);
       if (hasViewport) {
         apply_viewport(pass, currentViewport);
@@ -2248,16 +1729,16 @@ static void render_pass(const wgpu::RenderPassEncoder& pass, FramePacket& frame,
 #endif
 }
 
-void render_pass(const wgpu::RenderPassEncoder& pass, u32 idx) {
+void render_pass(gl::PassEncoder& pass, u32 idx) {
   auto& frame = current_frame_packet();
   render_pass(pass, frame, frame.renderPasses[idx]);
 }
 
-bool bind_pipeline(PipelineRef ref, const wgpu::RenderPassEncoder& pass) {
+bool bind_pipeline(PipelineRef ref, gl::PassEncoder& pass) {
   if (ref == g_currentPipeline) {
     return true;
   }
-  wgpu::RenderPipeline pipeline;
+  gl::Pipeline pipeline;
   if (!get_pipeline(ref, pipeline)) {
     return false;
   }
@@ -2323,46 +1804,27 @@ Range push_indices(const uint8_t* data, size_t length, size_t alignment) {
 }
 
 static bool ensure_native_geom_cache_buffers() {
-  if (g_nativeVertexCacheBuffer && g_nativeIndexCacheBuffer) {
-    return true;
-  }
-  if (!g_device) {
-    return false;
-  }
-  const wgpu::BufferDescriptor vtxDescriptor{
-      .label = "Native Geometry Vertex Cache",
-      .usage = wgpu::BufferUsage::Vertex | wgpu::BufferUsage::CopyDst,
-      .size = NativeGeomVertexCacheSize,
-  };
-  g_nativeVertexCacheBuffer = g_device.CreateBuffer(&vtxDescriptor);
-  const wgpu::BufferDescriptor idxDescriptor{
-      .label = "Native Geometry Index Cache",
-      .usage = wgpu::BufferUsage::Index | wgpu::BufferUsage::CopyDst,
-      .size = NativeGeomIndexCacheSize,
-  };
-  g_nativeIndexCacheBuffer = g_device.CreateBuffer(&idxDescriptor);
+  // Phase 2 creates the persistent native-geometry GL cache buffers here (gl::create_buffer,
+  // on the worker). Phase 1 returns false so push_native_cached_* falls back to the per-frame
+  // ByteBuffer ring -- correct behavior, just without the cross-frame geometry cache.
   return g_nativeVertexCacheBuffer && g_nativeIndexCacheBuffer;
 }
 
-// Bump-allocate `length` bytes from a persistent cache buffer and upload the data with a
-// queue write (ordered after prior submits, so it never races a prior frame's reads).
-static std::pair<Range, bool> push_native_cached(const wgpu::Buffer& buffer, uint32_t& cursor, uint64_t limit,
+// Bump-allocate `length` bytes from a persistent cache buffer and upload the data on the
+// render worker (FIFO-ordered after prior submits, so it never races a prior frame's reads).
+static std::pair<Range, bool> push_native_cached(const gl::Buffer& buffer, uint32_t& cursor, uint64_t limit,
                                                  const uint8_t* data, size_t length) {
   const uint32_t offset = static_cast<uint32_t>(AURORA_ALIGN(cursor, 4));
-  const size_t alignedSize = AURORA_ALIGN(length, 4); // WriteBuffer requires a 4-byte-aligned size
+  const size_t alignedSize = AURORA_ALIGN(length, 4);
   if (static_cast<uint64_t>(offset) + alignedSize > limit) {
     return {{}, false};
   }
-  // The queue write must run on the render worker: on GLES it makes Dawn's EGL context
-  // current, and grabbing that from the game thread while the worker holds it deadlocks
-  // libmali (Mali-G31). The worker queue is FIFO, so the write still lands before the
-  // encode pass that reads this range and after all prior submits. The copy (zero-padded
-  // to the aligned size) keeps the data alive until the worker executes it.
+  // The GL upload must run on the render worker (it owns the context). The copy keeps the
+  // data alive until the worker executes the glBufferSubData.
   std::vector<uint8_t> copy(alignedSize);
   memcpy(copy.data(), data, length);
-  render_worker::enqueue_work([buffer, offset, copy = std::move(copy)] {
-    g_queue.WriteBuffer(buffer, offset, copy.data(), copy.size());
-  });
+  render_worker::enqueue_work(
+      [buffer, offset, copy = std::move(copy)] { gl::upload_buffer(buffer, offset, copy.data(), copy.size()); });
   cursor = offset + static_cast<uint32_t>(alignedSize);
   return {Range{offset, static_cast<uint32_t>(length)}, true};
 }
@@ -2390,7 +1852,7 @@ Range push_uniform(const uint8_t* data, size_t length) {
   if (!check_recording("push_uniform")) {
     return {};
   }
-  return push(current_frame_packet().uniforms, data, length, g_cachedLimits.minUniformBufferOffsetAlignment);
+  return push(current_frame_packet().uniforms, data, length, webgpu::g_uniformBufferOffsetAlignment);
 }
 
 Range push_storage(const uint8_t* data, size_t length) {
@@ -2398,7 +1860,9 @@ Range push_storage(const uint8_t* data, size_t length) {
   if (!check_recording("push_storage")) {
     return {};
   }
-  return push(current_frame_packet().storage, data, length, g_cachedLimits.minStorageBufferOffsetAlignment);
+  // The storage-fetch path is dead (native vertex fetch only); this remains for API
+  // completeness. Reuse the uniform alignment.
+  return push(current_frame_packet().storage, data, length, webgpu::g_uniformBufferOffsetAlignment);
 }
 
 Range push_texture_data(const uint8_t* data, u32 bytesPerRow, u32 rowsPerImage) {
@@ -2414,40 +1878,39 @@ Range push_texture_data(const uint8_t* data, u32 bytesPerRow, u32 rowsPerImage) 
   return range;
 }
 
-BindGroupRef bind_group_ref(const WGPUBindGroupDescriptor& descriptor) {
-  const auto id = xxh3_hash(descriptor);
+BindGroupRef bind_group_ref(const gl::BindingSet& bindingSet) {
+  // Hash the POD binding set (callers zero-init it, so trailing padding is deterministic).
+  const auto id = xxh3_hash_s(&bindingSet, sizeof(bindingSet));
   std::lock_guard lock{g_bindGroupCacheMutex};
   const auto it = g_cachedBindGroups.find(id);
   if (it == g_cachedBindGroups.end()) {
-    auto bg = wgpu::BindGroup::Acquire(wgpuDeviceCreateBindGroup(g_device.Get(), &descriptor));
-    g_cachedBindGroups.emplace(id, CachedBindGroup{
-                                       .bindGroup = std::move(bg),
-                                       .lastUsedFrame = g_frameIndex,
-                                   });
+    g_cachedBindGroups.emplace(id, CachedBindGroup{.bindGroup = bindingSet, .lastUsedFrame = g_frameIndex});
   } else {
     it->second.lastUsedFrame = g_frameIndex;
   }
   return id;
 }
 
-wgpu::BindGroup find_bind_group(BindGroupRef id) {
+const gl::BindingSet& find_bind_group(BindGroupRef id) {
   std::lock_guard lock{g_bindGroupCacheMutex};
   const auto it = g_cachedBindGroups.find(id);
   CHECK(it != g_cachedBindGroups.end(), "get_bind_group: failed to locate {:x}", id);
   return it->second.bindGroup;
 }
 
-wgpu::Sampler sampler_ref(const wgpu::SamplerDescriptor& descriptor) {
-  const auto id = xxh3_hash(descriptor);
+gl::Sampler sampler_ref(const gl::SamplerDescriptor& descriptor) {
+  const auto id = xxh3_hash_s(&descriptor, sizeof(descriptor));
   std::lock_guard lock{g_samplerCacheMutex};
   auto it = g_cachedSamplers.find(id);
   if (it == g_cachedSamplers.end()) {
-    it = g_cachedSamplers.try_emplace(id, g_device.CreateSampler(&descriptor)).first;
+    // Phase 3 creates the GL sampler object (gl::create_sampler) on the worker. Phase 1
+    // caches an empty handle: samplers are only consumed by draws, which are stubbed.
+    it = g_cachedSamplers.try_emplace(id, gl::Sampler{}).first;
   }
   return it->second;
 }
 
-uint32_t align_uniform(uint32_t value) { return AURORA_ALIGN(value, g_cachedLimits.minUniformBufferOffsetAlignment); }
+uint32_t align_uniform(uint32_t value) { return AURORA_ALIGN(value, webgpu::g_uniformBufferOffsetAlignment); }
 
 void insert_debug_marker(std::string label) {
 #if defined(AURORA_GFX_DEBUG_GROUPS)

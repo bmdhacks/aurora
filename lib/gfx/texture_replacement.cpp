@@ -30,7 +30,6 @@
 #include <vector>
 
 using namespace aurora::gx;
-using aurora::webgpu::g_device;
 
 namespace {
 aurora::Module Log("aurora::texture");
@@ -511,58 +510,27 @@ bool remove_mipmaps(aurora::gfx::ConvertedTexture& texture) noexcept {
   return true;
 }
 
-constexpr bool is_unsupported_texture_format(wgpu::TextureFormat format) {
+// Phase 1: the gl::TextureFormat enum only carries the compressed formats this fork
+// actually uploads (BC1/3/4/5/7, ETC2, ASTC 4x4/8x8) -- the Srgb/BC2/BC6H/Snorm and the
+// non-4x4/8x8 ASTC block sizes that wgpu named have no enumerator here, so the switch is
+// pruned to the surviving cases. DDS/PNG loaders can only produce these formats now.
+constexpr bool is_unsupported_texture_format(aurora::gfx::TextureFormat format) {
   switch (format) {
-  case wgpu::TextureFormat::BC1RGBAUnorm:
-  case wgpu::TextureFormat::BC1RGBAUnormSrgb:
-  case wgpu::TextureFormat::BC2RGBAUnorm:
-  case wgpu::TextureFormat::BC2RGBAUnormSrgb:
-  case wgpu::TextureFormat::BC3RGBAUnorm:
-  case wgpu::TextureFormat::BC3RGBAUnormSrgb:
-  case wgpu::TextureFormat::BC4RUnorm:
-  case wgpu::TextureFormat::BC4RSnorm:
-  case wgpu::TextureFormat::BC5RGUnorm:
-  case wgpu::TextureFormat::BC5RGSnorm:
-  case wgpu::TextureFormat::BC6HRGBUfloat:
-  case wgpu::TextureFormat::BC6HRGBFloat:
-  case wgpu::TextureFormat::BC7RGBAUnorm:
-  case wgpu::TextureFormat::BC7RGBAUnormSrgb:
+  case aurora::gfx::TextureFormat::BC1RGBAUnorm:
+  case aurora::gfx::TextureFormat::BC3RGBAUnorm:
+  case aurora::gfx::TextureFormat::BC4RUnorm:
+  case aurora::gfx::TextureFormat::BC5RGUnorm:
+  case aurora::gfx::TextureFormat::BC7RGBAUnorm:
     return !aurora::webgpu::g_bcTexturesSupported;
-  case wgpu::TextureFormat::ASTC4x4Unorm:
-  case wgpu::TextureFormat::ASTC4x4UnormSrgb:
-  case wgpu::TextureFormat::ASTC5x4Unorm:
-  case wgpu::TextureFormat::ASTC5x4UnormSrgb:
-  case wgpu::TextureFormat::ASTC5x5Unorm:
-  case wgpu::TextureFormat::ASTC5x5UnormSrgb:
-  case wgpu::TextureFormat::ASTC6x5Unorm:
-  case wgpu::TextureFormat::ASTC6x5UnormSrgb:
-  case wgpu::TextureFormat::ASTC6x6Unorm:
-  case wgpu::TextureFormat::ASTC6x6UnormSrgb:
-  case wgpu::TextureFormat::ASTC8x5Unorm:
-  case wgpu::TextureFormat::ASTC8x5UnormSrgb:
-  case wgpu::TextureFormat::ASTC8x6Unorm:
-  case wgpu::TextureFormat::ASTC8x6UnormSrgb:
-  case wgpu::TextureFormat::ASTC8x8Unorm:
-  case wgpu::TextureFormat::ASTC8x8UnormSrgb:
-  case wgpu::TextureFormat::ASTC10x5Unorm:
-  case wgpu::TextureFormat::ASTC10x5UnormSrgb:
-  case wgpu::TextureFormat::ASTC10x6Unorm:
-  case wgpu::TextureFormat::ASTC10x6UnormSrgb:
-  case wgpu::TextureFormat::ASTC10x8Unorm:
-  case wgpu::TextureFormat::ASTC10x8UnormSrgb:
-  case wgpu::TextureFormat::ASTC10x10Unorm:
-  case wgpu::TextureFormat::ASTC10x10UnormSrgb:
-  case wgpu::TextureFormat::ASTC12x10Unorm:
-  case wgpu::TextureFormat::ASTC12x10UnormSrgb:
-  case wgpu::TextureFormat::ASTC12x12Unorm:
-  case wgpu::TextureFormat::ASTC12x12UnormSrgb:
+  case aurora::gfx::TextureFormat::ASTC4x4Unorm:
+  case aurora::gfx::TextureFormat::ASTC8x8Unorm:
     return !aurora::webgpu::g_astcTexturesSupported;
   default:
     return false;
   }
 }
 
-bool validate_texture_size(wgpu::TextureFormat format, uint32_t width, uint32_t height,
+bool validate_texture_size(aurora::gfx::TextureFormat format, uint32_t width, uint32_t height,
                            std::string_view label) noexcept {
   if (aurora::gfx::is_block_aligned(format, width, height)) {
     return true;
@@ -738,34 +706,26 @@ std::string entry_path_for_log(const ReplacementEntry& entry) {
 aurora::gfx::TextureHandle create_converted_texture_handle(const aurora::texture::ReplacementKey& key,
                                                            const ReplacementEntry& entry,
                                                            const aurora::gfx::ConvertedTexture& replacement) noexcept {
-  const auto label = entry.label.empty() ? fmt::format("TextureReplacement {}", entry.id) : entry.label;
-  const wgpu::Extent3D size{
+  const aurora::gl::Extent3D size{
       .width = replacement.width,
       .height = replacement.height,
       .depthOrArrayLayers = 1,
   };
-  const wgpu::TextureDescriptor textureDescriptor{
-      .label = label.c_str(),
-      .usage = wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::CopyDst,
-      .dimension = wgpu::TextureDimension::e2D,
+  // Phase 2: create the real GL texture (glGenTextures + immutable glTexStorage2D for
+  // `replacement.mips` levels in `replacement.format`) instead of this metadata-only handle.
+  // The sample/attachment "views" collapse to the texture on GL; both fields hold the same
+  // gl::Texture, matching the old (sampleView, attachmentView=null) wgpu construction.
+  const aurora::gl::Texture texture{
+      .id = 0,
+      .format = replacement.format,
       .size = size,
-      .format = replacement.format,
-      .mipLevelCount = replacement.mips,
-      .sampleCount = 1,
+      .mips = replacement.mips,
   };
-  auto texture = g_device.CreateTexture(&textureDescriptor);
-  const auto viewLabel = fmt::format("{} view", label);
-  const wgpu::TextureViewDescriptor textureViewDescriptor{
-      .label = viewLabel.c_str(),
-      .format = replacement.format,
-      .dimension = wgpu::TextureViewDimension::e2D,
-      .mipLevelCount = replacement.mips,
-  };
-  auto textureView = texture.CreateView(&textureViewDescriptor);
-  auto handle = std::make_shared<aurora::gfx::TextureRef>(std::move(texture), std::move(textureView),
-                                                          wgpu::TextureView{}, size, replacement.format,
-                                                          replacement.mips, aurora::gfx::InvalidTextureFormat);
+  auto handle = std::make_shared<aurora::gfx::TextureRef>(texture, texture, aurora::gl::Texture{}, size,
+                                                          replacement.format, replacement.mips,
+                                                          aurora::gfx::InvalidTextureFormat);
   handle->isReplacement = true;
+  // Phase 2: upload replacement.data via glTexSubImage2D/glCompressedTexSubImage2D.
   aurora::gfx::write_texture(*handle, replacement.data);
   return handle;
 }
@@ -776,7 +736,7 @@ aurora::gfx::TextureHandle create_raw_texture_handle(const ReplacementEntry& ent
   }
 
   const auto label = entry.label.empty() ? fmt::format("{}", entry.id) : entry.label;
-  const auto format = aurora::gfx::to_wgpu(entry.gxFormat);
+  const auto format = aurora::gfx::to_gl(entry.gxFormat);
   if (is_unsupported_texture_format(format)) {
     Log.warn("texture_replacement: failed to load raw replacement {} due to unsupported format: {}", label,
              static_cast<uint32_t>(format));
@@ -936,8 +896,8 @@ bool dump_editable_texture_dds(const aurora::texture::TextureSourceKey& key, con
     pixels = aurora::gfx::convert_texture(obj.format(), texWidth, texHeight, 1, texData);
   }
 
-  const uint64_t rgbaBytes = aurora::gfx::calc_texture_size(wgpu::TextureFormat::RGBA8Unorm, texWidth, texHeight, 1);
-  if (pixels.data.empty() || pixels.format != wgpu::TextureFormat::RGBA8Unorm || pixels.data.size() != rgbaBytes) {
+  const uint64_t rgbaBytes = aurora::gfx::calc_texture_size(aurora::gfx::TextureFormat::RGBA8Unorm, texWidth, texHeight, 1);
+  if (pixels.data.empty() || pixels.format != aurora::gfx::TextureFormat::RGBA8Unorm || pixels.data.size() != rgbaBytes) {
     return false;
   }
 

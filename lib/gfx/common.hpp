@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <functional>
+#include <memory>
 #include <type_traits>
 #include <utility>
 
@@ -14,7 +15,6 @@
 #include <aurora/gfx.hpp>
 #include <aurora/math.hpp>
 #include <dolphin/gx/GXEnum.h>
-#include <webgpu/webgpu_cpp.h>
 #define XXH_STATIC_LINKING_ONLY
 #include <xxhash.h>
 
@@ -182,18 +182,14 @@ inline constexpr uint64_t TextureUploadSize = 25165824;  // 24mb
 extern AuroraStats g_stats;
 extern uint32_t g_drawCallCount;
 extern uint32_t g_mergedDrawCallCount;
-extern wgpu::Buffer g_vertexBuffer;
-extern wgpu::Buffer g_uniformBuffer;
-extern wgpu::Buffer g_indexBuffer;
-extern wgpu::Buffer g_storageBuffer;
+extern gl::Buffer g_vertexBuffer;
+extern gl::Buffer g_uniformBuffer;
+extern gl::Buffer g_indexBuffer;
+extern gl::Buffer g_storageBuffer;
 // Persistent cache for CPU-expanded native-fetch geometry; survives across frames
 // (unlike the per-frame staging rings above). Created lazily on first use.
-extern wgpu::Buffer g_nativeVertexCacheBuffer;
-extern wgpu::Buffer g_nativeIndexCacheBuffer;
-extern wgpu::BindGroupLayout g_staticBindGroupLayout;
-extern wgpu::BindGroup g_staticBindGroup;
-extern wgpu::BindGroupLayout g_uniformBindGroupLayout;
-extern wgpu::BindGroup g_uniformBindGroup;
+extern gl::Buffer g_nativeVertexCacheBuffer;
+extern gl::Buffer g_nativeIndexCacheBuffer;
 
 using BindGroupRef = HashType;
 using PipelineRef = HashType;
@@ -214,7 +210,9 @@ using webgpu::Viewport;
 
 struct TextureRef;
 using TextureHandle = std::shared_ptr<TextureRef>;
-using EndFrameCallback = std::function<void(wgpu::CommandEncoder&)>;
+// No WebGPU CommandEncoder on GL: aurora's own command list + the render worker
+// already sequence everything, so the present callback just issues GL directly.
+using EndFrameCallback = std::function<void()>;
 
 enum class ShaderType : uint8_t {
   Clear = 0,
@@ -229,7 +227,7 @@ bool begin_frame();
 void finish();
 void end_frame(EndFrameCallback callback);
 uint32_t current_frame() noexcept;
-void render_pass(const wgpu::RenderPassEncoder& pass, uint32_t idx);
+void render_pass(gl::PassEncoder& pass, uint32_t idx);
 void after_submit() noexcept;
 void gpu_synchronize();
 void after_present() noexcept;
@@ -239,30 +237,37 @@ void resolve_pass_into(TextureHandle texture, ClipRect rect, bool clearColor, bo
 
 struct ColorPassDescriptor {
   const char* label = nullptr;
-  wgpu::TextureView colorView;
-  wgpu::TextureView resolveView;
-  wgpu::TextureView depthStencilView;
-  wgpu::Extent3D targetSize;
+  gl::Texture colorView;
+  gl::Texture resolveView;
+  gl::Texture depthStencilView;
+  gl::Extent3D targetSize;
   uint32_t sampleCount = 1;
-  wgpu::LoadOp colorLoadOp = wgpu::LoadOp::Clear;
-  wgpu::StoreOp colorStoreOp = wgpu::StoreOp::Store;
-  wgpu::Color clearColor{0.f, 0.f, 0.f, 0.f};
+  gl::LoadOp colorLoadOp = gl::LoadOp::Clear;
+  gl::StoreOp colorStoreOp = gl::StoreOp::Store;
+  gl::Color clearColor{0.f, 0.f, 0.f, 0.f};
   bool hasDepth = false;
-  wgpu::LoadOp depthLoadOp = wgpu::LoadOp::Undefined;
-  wgpu::StoreOp depthStoreOp = wgpu::StoreOp::Undefined;
+  gl::LoadOp depthLoadOp = gl::LoadOp::Undefined;
+  gl::StoreOp depthStoreOp = gl::StoreOp::Undefined;
   float depthClearValue = 0.f;
   // Combined depth-stencil attachment whose depth aspect is present but unused (stencil-only passes
   // on a packed format). Marks the depth aspect read-only so no load/store op is required.
   bool depthReadOnly = false;
   bool hasStencil = false;
-  wgpu::LoadOp stencilLoadOp = wgpu::LoadOp::Undefined;
-  wgpu::StoreOp stencilStoreOp = wgpu::StoreOp::Undefined;
+  gl::LoadOp stencilLoadOp = gl::LoadOp::Undefined;
+  gl::StoreOp stencilStoreOp = gl::StoreOp::Undefined;
   uint32_t stencilClearValue = 0;
+};
+
+// A texture + subregion origin for a texture-to-texture copy (EFB copies). The
+// WebGPU TexelCopyTextureInfo/Extent3D pair collapses to gl handles.
+struct TextureCopyView {
+  gl::Texture texture;
+  gl::Origin3D origin;
 };
 
 void begin_color_pass(const ColorPassDescriptor& desc);
 void end_color_pass();
-void queue_texture_copy(wgpu::TexelCopyTextureInfo src, wgpu::TexelCopyTextureInfo dst, wgpu::Extent3D size);
+void queue_texture_copy(TextureCopyView src, TextureCopyView dst, gl::Extent3D size);
 
 void begin_offscreen(uint32_t width, uint32_t height);
 void end_offscreen();
@@ -321,12 +326,15 @@ DrawData* get_last_draw_command();
 
 template <typename PipelineConfig>
 PipelineRef pipeline_ref(const PipelineConfig& config);
-bool bind_pipeline(PipelineRef ref, const wgpu::RenderPassEncoder& pass);
+bool bind_pipeline(PipelineRef ref, gl::PassEncoder& pass);
 
-BindGroupRef bind_group_ref(const WGPUBindGroupDescriptor& descriptor);
-wgpu::BindGroup find_bind_group(BindGroupRef id);
+// The cached bind group is a POD gl::BindingSet (up to 8 texture+sampler pairs, or
+// a uniform buffer bound with a dynamic offset). Callers build the set and hand it
+// in; the cache keys on its content hash.
+BindGroupRef bind_group_ref(const gl::BindingSet& bindingSet);
+const gl::BindingSet& find_bind_group(BindGroupRef id);
 
-wgpu::Sampler sampler_ref(const wgpu::SamplerDescriptor& descriptor);
+gl::Sampler sampler_ref(const gl::SamplerDescriptor& descriptor);
 
 uint32_t align_uniform(uint32_t value);
 
