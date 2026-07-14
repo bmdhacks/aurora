@@ -65,6 +65,13 @@ if (AURORA_ENABLE_GX)
             lib/dawn/BackendBinding.cpp
             lib/dawn/TracyPlatform.cpp
     )
+    # Hand-rolled GLES backend (scaffolded beside Dawn; nothing calls it until the
+    # Phase 1 cutover flips webgpu::initialize over to gl::initialize).
+    target_sources(aurora_core PRIVATE
+            lib/gl/gl_loader.cpp
+            lib/gl/context.cpp
+            lib/gl/backend.cpp
+    )
     if (CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "GNU")
         set_source_files_properties(lib/dawn/TracyPlatform.cpp PROPERTIES COMPILE_FLAGS -fno-rtti)
     endif ()
