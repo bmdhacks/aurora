@@ -71,6 +71,7 @@ if (AURORA_ENABLE_GX)
             lib/gl/gl_loader.cpp
             lib/gl/context.cpp
             lib/gl/backend.cpp
+            lib/gl/pass.cpp
     )
     if (CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "GNU")
         set_source_files_properties(lib/dawn/TracyPlatform.cpp PROPERTIES COMPILE_FLAGS -fno-rtti)
