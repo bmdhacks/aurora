@@ -23,6 +23,11 @@ namespace aurora::gl {
 // frame start and after any out-of-band GL.
 void reset_state_cache() noexcept;
 
+// Forget only the shadowed texture-unit / active-unit bindings. Call after any
+// out-of-band glBindTexture (texture create/upload on the worker binds GL_TEXTURE_2D
+// directly); the next bind_texture_unit then re-issues the real bindings.
+void invalidate_texture_bindings() noexcept;
+
 // Apply a pipeline's baked fixed-function state (blend, depth, raster incl. the
 // S1a front-face flip, color mask, polygon offset, primitive restart, stencil
 // op/mask), skipping every value that already matches.

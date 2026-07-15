@@ -111,12 +111,10 @@ TextureHandle new_dynamic_texture_2d(uint32_t width, uint32_t height, uint32_t m
       .height = height,
       .depthOrArrayLayers = 1,
   };
-  // Phase 2 creates the real GL texture on the render worker via
-  // gl::create_texture(glFormat, size, mips, /*renderable=*/false) and applies the
-  // R8/RG8 component swizzle (glTexParameteri GL_TEXTURE_SWIZZLE_*) that to_gl()
-  // already folded into the format choice. Phase 1 carries only the metadata; the
-  // GL name stays 0 and no draw samples it yet.
-  gl::Texture texture{.format = glFormat, .size = size, .mips = mips};
+  // Sampleable texture: created on the render worker (marshaled). Base-game GX formats
+  // all decode to RGBA8 on the CPU; the R8/RG8 replacement-pack swizzle is a later
+  // concern (texture-replacement re-verify), not the Ordon path.
+  gl::Texture texture = create_gl_texture(glFormat, size, mips, /*renderable=*/false);
   return std::make_shared<TextureRef>(texture, texture, gl::Texture{}, size, glFormat, mips, gxFormat);
 }
 
@@ -133,10 +131,9 @@ TextureHandle new_render_texture(uint32_t width, uint32_t height, u32 gxFormat, 
       .height = height,
       .depthOrArrayLayers = 1,
   };
-  // Phase 2 creates the renderable GL texture (create_texture(..., /*renderable=*/true))
-  // on the worker; a render texture is both a sampleable texture and an FBO color
-  // attachment, so both "views" are the same GL name.
-  gl::Texture texture{.format = glFormat, .size = size, .mips = 1, .renderable = true};
+  // A render texture is both a sampleable texture and an FBO color attachment, so both
+  // "views" are the same GL name. Created renderable on the worker.
+  gl::Texture texture = create_gl_texture(glFormat, size, 1, /*renderable=*/true);
   return std::make_shared<TextureRef>(texture, texture, texture, size, glFormat, 1, gxFormat);
 }
 
@@ -153,8 +150,8 @@ TextureHandle new_conv_texture(uint32_t width, uint32_t height, u32 gxFormat, co
       .depthOrArrayLayers = 1,
   };
   // Conversion-target texture: sampled and used as an FBO color attachment (Phase 4
-  // EFB copies render into it). Phase 2 creates the real renderable GL texture.
-  gl::Texture texture{.format = glFormat, .size = size, .mips = 1, .renderable = true};
+  // EFB copies render into it). Created renderable on the worker.
+  gl::Texture texture = create_gl_texture(glFormat, size, 1, /*renderable=*/true);
   return std::make_shared<TextureRef>(texture, texture, texture, size, glFormat, 1, gxFormat);
 }
 

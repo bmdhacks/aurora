@@ -6,6 +6,7 @@
 #include "../gl/context.hpp"
 #include "../gl/fbo_cache.hpp"
 #include "../gl/state.hpp"
+#include "../gl/textures.hpp"
 #include "../webgpu/gpu.hpp"
 #include "../webgpu/gpu_prof.hpp"
 #include "../webgpu/sdl2shim_present.hpp"
@@ -1531,6 +1532,7 @@ static void upload_op_data(FramePacket& frame, const FrameOp& op) {
   done.uniforms = std::max(done.uniforms, hw.uniforms);
   done.indices = std::max(done.indices, hw.indices);
 
+  const size_t uploadStart = done.textureUploadCount;
   for (size_t i = done.textureUploadCount; i < hw.textureUploadCount && i < frame.textureUploads.size(); ++i) {
     const auto& up = frame.textureUploads[i];
     if (up.tex.id == 0) {
@@ -1538,6 +1540,10 @@ static void upload_op_data(FramePacket& frame, const FrameOp& op) {
     }
     const uint8_t* srcData = up.data != nullptr ? up.data : frame.textureUpload.data() + up.range.offset;
     gl::upload_texture(up.tex, up.level, up.origin, up.size, srcData, up.bytesPerRow);
+  }
+  if (hw.textureUploadCount > uploadStart) {
+    // upload_texture binds GL_TEXTURE_2D out-of-band; forget the shadowed texture units.
+    gl::invalidate_texture_bindings();
   }
   done.textureUploadCount = std::max(done.textureUploadCount, hw.textureUploadCount);
 }
@@ -1991,16 +1997,39 @@ const gl::BindingSet& find_bind_group(BindGroupRef id) {
   return it->second.bindGroup;
 }
 
+gl::Texture create_gl_texture(gl::TextureFormat format, gl::Extent3D size, uint32_t mips, bool renderable) {
+  gl::Texture result;
+  render_worker::enqueue_work([&] {
+    result = gl::create_texture(format, size, mips, renderable);
+    // create_texture binds GL_TEXTURE_2D directly; drop the state cache's texture-unit
+    // shadow so the next draw re-binds.
+    gl::invalidate_texture_bindings();
+  });
+  render_worker::synchronize();
+  return result;
+}
+
+gl::Sampler create_gl_sampler(const gl::SamplerDescriptor& descriptor) {
+  gl::Sampler result;
+  const bool anisotropySupported = webgpu::g_graphicsConfig.textureAnisotropy > 0;
+  render_worker::enqueue_work([&] { result = gl::create_sampler(descriptor, anisotropySupported); });
+  render_worker::synchronize();
+  return result;
+}
+
 gl::Sampler sampler_ref(const gl::SamplerDescriptor& descriptor) {
   const auto id = xxh3_hash_s(&descriptor, sizeof(descriptor));
-  std::lock_guard lock{g_samplerCacheMutex};
-  auto it = g_cachedSamplers.find(id);
-  if (it == g_cachedSamplers.end()) {
-    // Phase 3 creates the GL sampler object (gl::create_sampler) on the worker. Phase 1
-    // caches an empty handle: samplers are only consumed by draws, which are stubbed.
-    it = g_cachedSamplers.try_emplace(id, gl::Sampler{}).first;
+  {
+    std::lock_guard lock{g_samplerCacheMutex};
+    if (const auto it = g_cachedSamplers.find(id); it != g_cachedSamplers.end()) {
+      return it->second;
+    }
   }
-  return it->second;
+  // Create outside the lock (the worker marshal blocks); a rare create-create race just
+  // leaks one GL sampler, which is benign.
+  const gl::Sampler sampler = create_gl_sampler(descriptor);
+  std::lock_guard lock{g_samplerCacheMutex};
+  return g_cachedSamplers.try_emplace(id, sampler).first->second;
 }
 
 uint32_t align_uniform(uint32_t value) { return AURORA_ALIGN(value, webgpu::g_uniformBufferOffsetAlignment); }

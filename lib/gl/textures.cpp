@@ -2,6 +2,8 @@
 
 #include "../internal.hpp"
 
+#include <vector>
+
 namespace aurora::gl {
 namespace {
 Module Log("aurora::gl");
@@ -138,6 +140,18 @@ Texture create_texture(TextureFormat format, Extent3D size, uint32_t mips, bool 
   // full mip chain is declared but not necessarily uploaded, so clamp MAX_LEVEL.
   gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_BASE_LEVEL, 0);
   gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, static_cast<GLint>(levels - 1));
+  // glTexStorage2D leaves texel memory undefined. Renderable color targets (EFB-copy /
+  // offscreen textures) can be sampled before anything renders into them (a GX effect
+  // reads last frame's copy on the first frame, or a copy that hasn't run yet), and
+  // sampling undefined GPU memory is exactly the driver-dependent behavior the Normalcy
+  // Doctrine avoids — on desktop it surfaced as a red/magenta wash. Zero-fill level 0 so
+  // an unpopulated copy reads opaque black.
+  if (renderable && !info.depth && !info.compressed && info.bytesPerPixel > 0) {
+    std::vector<uint8_t> zeros(static_cast<size_t>(size.width) * size.height * info.bytesPerPixel, 0);
+    gl.PixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    gl.TexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, static_cast<GLsizei>(size.width), static_cast<GLsizei>(size.height),
+                     info.external, info.type, zeros.data());
+  }
   return Texture{
       .id = id,
       .format = format,

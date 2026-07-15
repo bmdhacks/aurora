@@ -78,9 +78,19 @@ GLenum compare_gl(CompareFunction f) {
   return GL_ALWAYS;
 }
 
-// S1a: we render GL-native (no projection Y-flip), so the rasterized image is
-// mirrored vs WebGPU and the winding parity inverts. Map CW->CCW and CCW->CW.
-GLenum front_face_gl(FrontFace f) { return f == FrontFace::CW ? GL_CCW : GL_CW; }
+// S1a: front-face winding. GX/WebGPU declares the front face as CW. The port originally
+// remapped that to GL_CCW to compensate for GL-native rasterization (no projection
+// Y-flip) — the standard "GL flips window-space winding vs WebGPU" argument. Empirically
+// that produced INVERTED back-face culling on screen: camera-facing surfaces were culled
+// and away-facing ones kept — a single-sided ground plane (its one face points up at the
+// camera) vanished to black, Link showed his face instead of the back of his head, and
+// walls showed their backsides. Mapping GX winding straight through (CW->GL_CW) makes the
+// front face the front face again.
+// NOTE: our hand-rolled backend does NOT do the internal projection Y-flip that Dawn's own
+// GL backend applies, so the winding parity vs the Dawn path differs by one reflection —
+// which is why the naive "map CW->CCW" S1a rule (written against Dawn's behavior) is wrong
+// here. The image is already upright, so this only touches facing, not orientation.
+GLenum front_face_gl(FrontFace f) { return f == FrontFace::CW ? GL_CW : GL_CCW; }
 
 constexpr GLuint kInvalidId = 0xFFFFFFFFu;
 constexpr int kUnknown = -1;
@@ -160,6 +170,14 @@ void apply_stencil_func() {
 } // namespace
 
 void reset_state_cache() noexcept { invalidate(); }
+
+void invalidate_texture_bindings() noexcept {
+  s.activeUnit = kInvalidId;
+  for (auto& u : s.textures) {
+    u.texture = kInvalidId;
+    u.sampler = kInvalidId;
+  }
+}
 
 void apply_baked_state(const BakedState& state) {
   // Blend

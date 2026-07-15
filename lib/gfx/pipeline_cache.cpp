@@ -2,6 +2,7 @@
 
 #include "clear.hpp"
 #include "../fs_helper.hpp"
+#include "../gl/context.hpp"
 #include "../gx/pipeline.hpp"
 #ifdef AURORA_ENABLE_RMLUI
 #include "../rmlui/pipeline.hpp"
@@ -999,6 +1000,18 @@ static void pipeline_worker() {
   tracy::SetThreadName("Pipeline compilation thread");
 #endif
 
+  // The dedicated compiler thread owns the share context for its whole life (Normalcy
+  // Doctrine rule 3): GLSL compile/link (glCreateShader/glLinkProgram) needs a current
+  // context, and objects it creates are shared with the render worker's context (a
+  // glFlush after link, in configure_gx_program, makes them visible). Runs once per
+  // thread entry (this function is the dedicated thread's body). In threadless mode it
+  // runs per-frame on the render worker, which already owns the render context.
+  if (g_hasPipelineThread) {
+    if (!gl::make_share_current()) {
+      Log.error("[pipeline-cache] compiler thread could not bind the share context; GLSL compile will fail");
+    }
+  }
+
   // DIAGNOSTIC (queuedPipelines stuck >0 with idle thread, observed G31 2026-07-10): announce
   // this thread's lifetime, dump the accounting whenever we sleep >10s with a nonzero counter,
   // and time each build. Remove once the leak is root-caused. (Lifetime logs are gated on
@@ -1194,7 +1207,9 @@ void initialize_pipeline_cache() {
   g_pipelineThreadEnd = false;
   g_gpuCachePrunePending = false;
 
-  if (webgpu::g_backendType == BACKEND_WEBGPU) {
+  // A dedicated compiler thread needs its own share context; without one, compile
+  // inline on the render worker (threadless) so GLSL compilation always has a context.
+  if (webgpu::g_backendType == BACKEND_WEBGPU || !gl::has_share_context()) {
     g_hasPipelineThread = false;
   } else {
     g_hasPipelineThread = true;

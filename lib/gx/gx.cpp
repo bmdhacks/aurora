@@ -653,10 +653,20 @@ gl::Pipeline build_pipeline(const PipelineConfig& config, uint32_t program, cons
       config.triangleStripTopology != 0 ? gfx::PrimitiveTopology::TriangleStrip : gfx::PrimitiveTopology::TriangleList;
   state.primitiveRestart = config.triangleStripTopology != 0;
 
+  // Native vertex layout as a present-attr bitmask over canonical GX attr order
+  // (GX_VA_PNMTXIDX..GX_VA_TEX7). The draw path (pass.cpp) decodes it into the VAO;
+  // bit positions == GXAttr values == the GLSL emitter's packed `layout(location)`.
+  uint32_t vertexLayout = 0;
+  for (int i = GX_VA_PNMTXIDX; i <= GX_VA_TEX7; ++i) {
+    if (config.shaderConfig.attrs[i].attrType != GX_NONE) {
+      vertexLayout |= (1u << i);
+    }
+  }
+
   return gl::Pipeline{
       .program = program,
       .state = state,
-      .vertexLayout = 0, // VAO-layout hash assigned by the draw path in Phase 3
+      .vertexLayout = vertexLayout,
   };
 }
 
@@ -792,12 +802,20 @@ GXBindGroups build_bind_groups(const ShaderInfo& info) noexcept {
 }
 
 void initialize() noexcept {
-  // GL has no bind-group-layout / pipeline-layout objects to build. The 1x1 empty
-  // texture + its sampler, and the empty bind group that fills unused slots, are
-  // GL objects created on the render worker in Phase 2 (initialize() runs on the
-  // main thread, which does not own the render context). No draw samples them yet.
-  sEmptySampler = {};
-  sEmptyTexture = {};
+  // GL has no bind-group-layout / pipeline-layout objects to build. But unused GX
+  // texture slots still need a *real* GL texture + sampler bound: a slot left at id 0
+  // binds the incomplete default texture, which shows up as glBindTexture(No Resource)
+  // in captures and which strict drivers (Mali/PowerVR) can reject on a draw whose
+  // GLSL declares that sampler. Build a 1x1 fill here. These are GL objects, so they
+  // must be created on the render worker (initialize() runs on the main thread, which
+  // does not own the render context); create_gl_texture/create_gl_sampler marshal the
+  // work to the worker and block. `renderable=true` makes create_texture zero-fill
+  // level 0, so the fill reads opaque black rather than sampling uninitialized GPU
+  // memory (Normalcy Doctrine) — the flag is otherwise inert for a 1x1 that is only
+  // ever bound as a sampler, never an FBO attachment.
+  sEmptyTexture = gfx::create_gl_texture(webgpu::g_graphicsConfig.surfaceConfiguration.format, gl::Extent3D{1, 1, 1}, 1,
+                                         /*renderable=*/true);
+  sEmptySampler = gfx::create_gl_sampler(gl::SamplerDescriptor{});
   g_emptyTextureBindGroup = gl::BindingSet{};
 }
 

@@ -336,6 +336,14 @@ const gl::BindingSet& find_bind_group(BindGroupRef id);
 
 gl::Sampler sampler_ref(const gl::SamplerDescriptor& descriptor);
 
+// GL resource objects must be created with the render context current (the worker
+// owns it), but callers (texture resolve, bind-group build) run on the recording
+// thread. These marshal gl::create_texture/create_sampler to the worker and block
+// for the result, so the returned handle's GL name is valid immediately. Cheap in
+// steady state (creation happens on cache miss, not per frame).
+gl::Texture create_gl_texture(gl::TextureFormat format, gl::Extent3D size, uint32_t mips, bool renderable);
+gl::Sampler create_gl_sampler(const gl::SamplerDescriptor& descriptor);
+
 uint32_t align_uniform(uint32_t value);
 
 Vec2<uint32_t> get_render_target_size() noexcept;

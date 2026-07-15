@@ -107,6 +107,13 @@ bool make_none_current() {
   return false; // Phase 6
 }
 
+bool has_share_context() {
+  if (g_mode == ContextMode::Desktop) {
+    return g_shareCtx != nullptr;
+  }
+  return false; // Phase 6 wires the device share context
+}
+
 void destroy_contexts() {
   if (g_mode == ContextMode::Desktop) {
     SDL_GL_MakeCurrent(g_window, nullptr);

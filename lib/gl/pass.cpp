@@ -3,14 +3,16 @@
 #include "gl_core.hpp"
 #include "state.hpp"
 
+#include <absl/container/flat_hash_map.h>
+
 // The PassEncoder issues GL directly against the render worker's current context
 // (aurora's own command list already provides the WebGPU CommandEncoder ordering).
+// All methods here run on the render worker.
 //
-// Phase 2 wires the fixed-function surface that the clear/present paths need:
-// pipeline+state application, viewport/scissor (with the S1b top-left -> bottom-left
-// Y-flip), blend constant, and attribute-less Draw. The bind-group + vertex/index
-// buffer setup and DrawIndexed stay Phase 3 stubs (GX geometry submission); the
-// clear draw is attribute-less so it does not need them.
+// Phase 3 adds GX geometry submission: the texture/uniform bind groups, the native
+// vertex layout (a VAO per present-attr set, S5 integer matrix indices) and the
+// indexed/non-indexed draws. Viewport/scissor (S1b Y-flip), blend constant and the
+// attribute-less clear/present Draw were wired in Phase 2.
 
 namespace aurora::gl {
 namespace {
@@ -29,7 +31,104 @@ GLenum topology_gl(PrimitiveTopology topology) {
   }
   return GL_TRIANGLES;
 }
+
+// Canonical GX native-fetch attribute order, mirrored from command_processor.cpp
+// build_native_layout()/canonical_attr_size(). These are GXAttr enum values; bit i of
+// gl::Pipeline::vertexLayout means "attr i is present". Present attrs get packed
+// `layout(location)` indices (0,1,2,... in this order) matching the GLSL emitter's
+// addInput() and the CPU vertex expansion. Kept as plain ints so pass.cpp needs no GX
+// headers; the enum numbering is load-bearing and fixed across the codebase.
+namespace canon {
+constexpr int kPnMtxIdx = 0;   // GX_VA_PNMTXIDX
+constexpr int kTexMtxIdx0 = 1; // GX_VA_TEX0MTXIDX
+constexpr int kTexMtxIdx7 = 8; // GX_VA_TEX7MTXIDX
+constexpr int kPos = 9;        // GX_VA_POS
+constexpr int kNrm = 10;       // GX_VA_NRM
+constexpr int kClr0 = 11;      // GX_VA_CLR0
+constexpr int kClr1 = 12;      // GX_VA_CLR1
+constexpr int kTex0 = 13;      // GX_VA_TEX0
+constexpr int kCount = 21;     // through GX_VA_TEX7
+} // namespace canon
+
+struct AttrSpec {
+  GLint comps;
+  GLenum type;
+  bool normalized;
+  bool integer;
+  uint32_t size; // bytes in the expanded vertex record (canonical_attr_size)
+};
+
+AttrSpec attr_spec(int attr) {
+  if (attr == canon::kPnMtxIdx || (attr >= canon::kTexMtxIdx0 && attr <= canon::kTexMtxIdx7)) {
+    return {1, GL_UNSIGNED_INT, false, true, 4}; // Uint32 matrix index (S5)
+  }
+  if (attr == canon::kPos || attr == canon::kNrm) {
+    return {3, GL_FLOAT, false, false, 12};
+  }
+  if (attr == canon::kClr0 || attr == canon::kClr1) {
+    return {4, GL_UNSIGNED_BYTE, true, false, 4}; // Unorm8x4, byte0=R
+  }
+  return {2, GL_FLOAT, false, false, 8}; // TEXn Float32x2
+}
+
+// VAO per present-attr layout (worker-only; VAOs are container objects, not shared
+// across contexts). Enable-mask + attrib formats live in the VAO; the per-draw base
+// offset is re-specified each draw (the vertex data sits at a dynamic ring offset).
+absl::flat_hash_map<uint32_t, GLuint> g_vaoCache;
+
+GLuint get_or_create_vao(uint32_t mask, bool& created) {
+  const auto it = g_vaoCache.find(mask);
+  if (it != g_vaoCache.end()) {
+    created = false;
+    return it->second;
+  }
+  GLuint vao = 0;
+  gl.GenVertexArrays(1, &vao);
+  g_vaoCache.emplace(mask, vao);
+  created = true;
+  return vao;
+}
+
+// Bind the layout VAO and (re)point its attributes at `vbuf` + `baseOffset`, then bind
+// `ibuf` as the element array (VAO state). Mirrors the CPU vertex record exactly.
+void bind_gx_layout(uint32_t mask, const Buffer& vbuf, uint64_t baseOffset, const Buffer& ibuf) {
+  bool created = false;
+  const GLuint vao = get_or_create_vao(mask, created);
+  bind_vertex_array(vao);
+
+  uint32_t stride = 0;
+  for (int i = 0; i < canon::kCount; ++i) {
+    if ((mask & (1u << i)) != 0) {
+      stride += attr_spec(i).size;
+    }
+  }
+
+  gl.BindBuffer(GL_ARRAY_BUFFER, vbuf.id);
+  uint32_t offset = 0;
+  GLuint location = 0;
+  for (int i = 0; i < canon::kCount; ++i) {
+    if ((mask & (1u << i)) == 0) {
+      continue;
+    }
+    const auto spec = attr_spec(i);
+    if (created) {
+      gl.EnableVertexAttribArray(location);
+    }
+    const auto* ptr = reinterpret_cast<const void*>(static_cast<uintptr_t>(baseOffset + offset));
+    if (spec.integer) {
+      gl.VertexAttribIPointer(location, spec.comps, spec.type, static_cast<GLsizei>(stride), ptr);
+    } else {
+      gl.VertexAttribPointer(location, spec.comps, spec.type, spec.normalized ? GL_TRUE : GL_FALSE,
+                             static_cast<GLsizei>(stride), ptr);
+    }
+    offset += spec.size;
+    ++location;
+  }
+  gl.BindBuffer(GL_ELEMENT_ARRAY_BUFFER, ibuf.id);
+}
 } // namespace
+
+void reset_pass_vao_cache() noexcept { g_vaoCache.clear(); }
 
 void PassEncoder::SetPipeline(const Pipeline& pipeline) {
   m_pipeline = pipeline;
@@ -40,11 +139,25 @@ void PassEncoder::SetPipeline(const Pipeline& pipeline) {
 
 void PassEncoder::SetBindGroup(uint32_t index, const BindingSet& set, size_t dynamicOffsetCount,
                                const uint32_t* dynamicOffsets) {
-  // Phase 3: apply texture units + glBindBufferRange with the dynamic offset.
   (void)index;
-  (void)set;
-  (void)dynamicOffsetCount;
-  (void)dynamicOffsets;
+  if (set.bufferCount == 0) {
+    // Texture group (GX group 2 / RmlUi): unit i == GX slot i (S3). Sampler uniforms
+    // were bound to these units at link time.
+    for (uint32_t i = 0; i < kMaxTextureBindings; ++i) {
+      bind_texture_unit(i, set.textures[i].texture, set.textures[i].sampler);
+    }
+    return;
+  }
+  // Uniform group (GX group 1): one buffer bound with a per-draw dynamic offset.
+  size_t dynIdx = 0;
+  for (uint8_t j = 0; j < set.bufferCount; ++j) {
+    const auto& b = set.buffers[j];
+    uint32_t offset = b.offset;
+    if (b.dynamic && dynIdx < dynamicOffsetCount) {
+      offset += dynamicOffsets[dynIdx++];
+    }
+    bind_uniform_range(b.binding, b.buffer, offset, b.size);
+  }
 }
 
 void PassEncoder::SetVertexBuffer(uint32_t slot, const Buffer& buffer, uint64_t offset, uint64_t size) {
@@ -93,6 +206,14 @@ void PassEncoder::Draw(uint32_t vertexCount, uint32_t instanceCount, uint32_t fi
   if (!m_hasPipeline || m_pipeline.program == 0 || vertexCount == 0) {
     return;
   }
+  if (m_pipeline.vertexLayout != 0) {
+    // Native non-indexed GX draw: base offset is folded into the attrib pointers, so
+    // firstVertex stays 0 relative to that base.
+    bind_gx_layout(m_pipeline.vertexLayout, m_vertexBuffer, m_vertexOffset, m_indexBuffer);
+  } else {
+    // Attribute-less draw (clear / present fullscreen triangle via gl_VertexID).
+    bind_vertex_array(0);
+  }
   const GLenum mode = topology_gl(m_pipeline.state.topology);
   if (instanceCount > 1) {
     gl.DrawArraysInstanced(mode, static_cast<GLint>(firstVertex), static_cast<GLsizei>(vertexCount),
@@ -104,12 +225,24 @@ void PassEncoder::Draw(uint32_t vertexCount, uint32_t instanceCount, uint32_t fi
 
 void PassEncoder::DrawIndexed(uint32_t indexCount, uint32_t instanceCount, uint32_t firstIndex, int32_t baseVertex,
                               uint32_t firstInstance) {
-  // Phase 3: glDrawElements(Instanced) over the GX vertex/index buffers + VAO.
-  (void)indexCount;
-  (void)instanceCount;
-  (void)firstIndex;
-  (void)baseVertex;
+  (void)baseVertex; // native fetch bakes the vertex base into the attrib pointers
   (void)firstInstance;
+  if (!m_hasPipeline || m_pipeline.program == 0 || indexCount == 0) {
+    return;
+  }
+  bind_gx_layout(m_pipeline.vertexLayout, m_vertexBuffer, m_vertexOffset, m_indexBuffer);
+  const GLenum mode = topology_gl(m_pipeline.state.topology);
+  const bool u32 = m_indexFormat == IndexFormat::Uint32;
+  const GLenum idxType = u32 ? GL_UNSIGNED_INT : GL_UNSIGNED_SHORT;
+  // glDrawElements' last arg is a byte offset into the element buffer bound in the VAO.
+  const uintptr_t idxBytes = m_indexOffset + static_cast<uintptr_t>(firstIndex) * (u32 ? 4u : 2u);
+  const auto* idxPtr = reinterpret_cast<const void*>(idxBytes);
+  if (instanceCount > 1) {
+    gl.DrawElementsInstanced(mode, static_cast<GLsizei>(indexCount), idxType, idxPtr,
+                             static_cast<GLsizei>(instanceCount));
+  } else {
+    gl.DrawElements(mode, static_cast<GLsizei>(indexCount), idxType, idxPtr);
+  }
 }
 
 void PassEncoder::End() {

@@ -24,6 +24,10 @@ namespace aurora::gl {
 
 inline constexpr uint64_t kWholeSize = ~uint64_t{0};
 
+// Drop the cached native-layout VAOs. Call on the render worker before the GL
+// context goes away (shutdown / context loss); the GL names become invalid then.
+void reset_pass_vao_cache() noexcept;
+
 // The framebuffer a pass renders into. width/height drive the top-left ->
 // bottom-left origin conversion for viewport/scissor (seam S1b).
 struct PassTarget {

@@ -2,8 +2,14 @@
 
 #include "../internal.hpp"
 
+#include <fmt/format.h>
+
 #include <string>
 #include <vector>
+
+namespace {
+constexpr aurora::gl::GLuint kInvalidBlockIndex = 0xFFFFFFFFu; // GL_INVALID_INDEX
+} // namespace
 
 namespace aurora::gl {
 namespace {
@@ -67,6 +73,39 @@ GLuint compile_program(const char* vertexSource, const char* fragmentSource, con
     return 0;
   }
   return program;
+}
+
+void configure_gx_program(GLuint program, uint32_t expectedUniformSize) {
+  // GX uniform block -> GL binding point 0. GLSL ES 3.00 has no layout(binding=) on
+  // uniform blocks, so we set it after link.
+  const GLuint blockIndex = gl.GetUniformBlockIndex(program, "Uniform");
+  if (blockIndex != kInvalidBlockIndex) {
+    gl.UniformBlockBinding(program, blockIndex, 0);
+    // std140 sanity: the driver's block size (16-aligned) must fit inside the CPU
+    // uniform range we allocate (expectedUniformSize is that range, aligned up to the
+    // UBO offset alignment). A block LARGER than the range means a real layout bug
+    // (mis-declared field) and would read past the range at draw time.
+    GLint blockSize = 0;
+    gl.GetActiveUniformBlockiv(program, blockIndex, GL_UNIFORM_BLOCK_DATA_SIZE, &blockSize);
+    if (blockSize > 0 && static_cast<uint32_t>(blockSize) > expectedUniformSize) {
+      Log.warn("configure_gx_program: GL uniform block size {} exceeds CPU uniform range {} (std140 layout bug)",
+               blockSize, expectedUniformSize);
+    }
+  }
+  // texN sampler uniforms -> texture unit N. glUniform1i needs the program current;
+  // this runs on the compiler thread's share context (not the render worker), so it
+  // does not disturb the render worker's state cache.
+  gl.UseProgram(program);
+  for (uint32_t i = 0; i < 8; ++i) {
+    const auto name = fmt::format("tex{}", i);
+    const GLint loc = gl.GetUniformLocation(program, name.c_str());
+    if (loc >= 0) {
+      gl.Uniform1i(loc, static_cast<GLint>(i));
+    }
+  }
+  gl.UseProgram(0);
+  // Make the linked program + its uniform setup visible to the render worker's context.
+  gl.Flush();
 }
 
 } // namespace aurora::gl

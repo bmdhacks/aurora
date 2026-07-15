@@ -38,6 +38,10 @@ bool make_render_current();
 bool make_share_current();
 bool make_none_current();
 
+// True if a share context exists (compiler-thread GLSL compile is possible). When
+// false, the pipeline cache must compile inline on the render worker (threadless).
+bool has_share_context();
+
 void destroy_contexts();
 
 ContextMode current_mode();

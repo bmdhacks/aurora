@@ -22,4 +22,12 @@ namespace aurora::gl {
 // through `bindAttribs` (name -> location), applied between attach and link.
 GLuint compile_program(const char* vertexSource, const char* fragmentSource, const char* label);
 
+// Post-link setup for a GX program: bind its `Uniform` std140 block to GL binding
+// point 0 (SetBindGroup(1) glBindBufferRange's here) and its `texN` sampler uniforms
+// to texture units 0..7 (GX slot i == unit i, S3). `expectedUniformSize` is the CPU
+// build_uniform size; a mismatch vs GL_UNIFORM_BLOCK_DATA_SIZE is logged (catches every
+// std140 layout bug at first compile). Ends with glFlush so a program linked on the
+// compiler thread's share context is visible to the render worker's context.
+void configure_gx_program(GLuint program, uint32_t expectedUniformSize);
+
 } // namespace aurora::gl
