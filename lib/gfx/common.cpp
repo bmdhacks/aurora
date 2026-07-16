@@ -293,6 +293,36 @@ struct FramePacket {
   uint32_t frameIndex = 0;
   StagingHighWater copied;
   AuroraStats stats{};
+
+  // Reset for a fresh recording WITHOUT freeing the ByteBuffer storage. The render worker
+  // reads these buffers (per-op glBufferSubData/glTexSubImage uploads) concurrently with the
+  // recording thread appending to them -- EFB-copy / offscreen pass boundaries (shadows,
+  // minimap, effects) enqueue passes mid-frame, so the worker starts consuming this packet
+  // while recording is still in progress. A `frame = {}` reset frees the storage, forcing the
+  // buffers to regrow via realloc() every frame; a realloc that lands while the worker is
+  // mid-read frees the pointer out from under it -> use-after-free -> a torn upload. That
+  // manifests as intermittent geometry/texture corruption (weird shadows, black minimap) that
+  // *vanishes under RenderDoc*, which replays the settled final buffer contents single-threaded.
+  // Retaining capacity and reserving the fixed ring ceilings means recording never reallocs, so
+  // the worker's in-flight reads always see stable storage. Reallocating here is safe: begin_frame
+  // only reuses a slot the worker has already released (FrameSlotPool), so nothing reads it now.
+  void reset() {
+    renderPasses.clear();
+    textureCopies.clear();
+    encoderTasks.clear();
+    ops.clear();
+    textureUploads.clear();
+    verts.clear();
+    uniforms.clear();
+    indices.clear();
+    storage.clear();
+    textureUpload.clear();
+    verts.reserve_extra(VertexBufferSize);
+    uniforms.reserve_extra(UniformBufferSize);
+    indices.reserve_extra(IndexBufferSize);
+    copied = {};
+    stats = {};
+  }
 };
 
 static std::array<FramePacket, FrameSlotCount> g_framePackets;
@@ -462,18 +492,23 @@ struct PassSnapshotPool {
 static std::array<PassSnapshotPool, FrameSlotCount> g_passSnapshotPools;
 
 static PassSnapshotEntry& acquire_pass_snapshot(uint32_t width, uint32_t height, bool wantColor, bool wantDepth) {
-  // Phase 4 (EFB copy machinery) creates the snapshot color/depth gl::Textures here on
-  // the worker. Phase 1 hands back an (empty) pooled entry: resolve_pass is stubbed and
-  // no draw samples a snapshot yet, so nothing consumes these.
-  (void)width;
-  (void)height;
-  (void)wantColor;
+  // Full-target color snapshot for the public resolve_pass API (unused on the live TP
+  // path). Create/resize the color texture on demand; the R32Float depth snapshot stays
+  // gated off (tex_copy_conv::snapshot_depth is a stub), so wantDepth is ignored.
   (void)wantDepth;
   auto& pool = g_passSnapshotPools[g_recordingFrameSlot];
   if (pool.used == pool.entries.size()) {
     pool.entries.emplace_back();
   }
-  return pool.entries[pool.used++];
+  auto& entry = pool.entries[pool.used++];
+  if (wantColor &&
+      (entry.color.texture.id == 0 || entry.color.size.width != width || entry.color.size.height != height)) {
+    const auto colorFormat = webgpu::g_graphicsConfig.surfaceConfiguration.format;
+    const gl::Extent3D size{width, height, 1};
+    const gl::Texture color = create_gl_texture(colorFormat, size, 1, /*renderable=*/true);
+    entry.color = webgpu::TextureWithSampler{.texture = color, .view = color, .size = size, .format = colorFormat};
+  }
+  return entry;
 }
 
 static FramePacket& current_frame_packet() {
@@ -899,15 +934,26 @@ static OffscreenCacheEntry get_offscreen_textures(uint32_t width, uint32_t heigh
   if (const auto it = g_offscreenCache.find(key); it != g_offscreenCache.end()) {
     return it->second;
   }
-  // Phase 4 (EFB copy / offscreen) creates the color + depth gl::Textures here on the
-  // worker (via gl::create_texture) and caches them. Phase 1 caches an empty entry:
-  // offscreen passes still open/close and stay balanced, but draws into them are inert.
+  // Real GL color + depth textures, created on the worker (create_gl_texture marshals and
+  // blocks -- begin_offscreen runs on the recording thread). Cached by size, so this fires
+  // only on the first offscreen pass of each size. Color is both sampleable and an FBO
+  // color attachment; depth is the FBO depth attachment (linear color sampling for the
+  // scaled reads effects take).
   const auto colorFormat = webgpu::g_graphicsConfig.surfaceConfiguration.format;
   const auto depthFormat = webgpu::g_graphicsConfig.depthFormat;
   const gl::Extent3D size{width, height, 1};
+  gl::SamplerDescriptor colorSamplerDesc{};
+  colorSamplerDesc.magFilter = gl::FilterMode::Linear;
+  colorSamplerDesc.minFilter = gl::FilterMode::Linear;
+  const gl::Texture color = create_gl_texture(colorFormat, size, 1, /*renderable=*/true);
+  const gl::Texture depth = create_gl_texture(depthFormat, size, 1, /*renderable=*/true);
   OffscreenCacheEntry entry{
-      .color = webgpu::TextureWithSampler{.size = size, .format = colorFormat},
-      .depth = webgpu::TextureWithSampler{.size = size, .format = depthFormat},
+      .color = webgpu::TextureWithSampler{.texture = color,
+                                          .view = color,
+                                          .size = size,
+                                          .format = colorFormat,
+                                          .sampler = create_gl_sampler(colorSamplerDesc)},
+      .depth = webgpu::TextureWithSampler{.texture = depth, .view = depth, .size = size, .format = depthFormat},
   };
   auto [insertIt, _] = g_offscreenCache.emplace(key, std::move(entry));
   return insertIt->second;
@@ -1333,7 +1379,7 @@ bool begin_frame() {
   const size_t frameSlot = acquire_frame_slot();
 
   auto& frame = g_framePackets[frameSlot];
-  frame = {};
+  frame.reset();
   frame.frameId = g_nextFrameId++;
   frame.frameIndex = g_frameIndex;
   g_recordingFrame = &frame;
@@ -1350,14 +1396,9 @@ bool begin_frame() {
     ++s_nativeGeomCacheGeneration;
   }
 
-  // Phase 1: per-frame data goes into owned ByteBuffers (grown on demand) instead of a
-  // mapped staging buffer. Phase 2 uploads the dirty ranges to GL ring buffers with
-  // glBufferSubData on the worker; for now draws are stubbed and the data is discarded.
-  frame.verts = {};
-  frame.uniforms = {};
-  frame.indices = {};
-  frame.storage = {};
-  frame.textureUpload = {};
+  // Per-frame data goes into the packet's ByteBuffers, uploaded to the GL ring buffers with
+  // glBufferSubData on the worker. FramePacket::reset() (above) clears them while retaining
+  // their fixed-ceiling storage so recording never reallocs under the worker's concurrent reads.
 
   g_drawCallCount = 0;
   g_mergedDrawCallCount = 0;
@@ -1548,6 +1589,30 @@ static void upload_op_data(FramePacket& frame, const FrameOp& op) {
   done.textureUploadCount = std::max(done.textureUploadCount, hw.textureUploadCount);
 }
 
+// FBO-to-FBO region copy via glBlitFramebuffer (worker, context current). Both textures
+// are attached to cache FBOs as COLOR_ATTACHMENT0. NEAREST + equal src/dst extents == an
+// exact texel copy. NOTE (Phase 5): the RmlUi copy path passes top-left origins; GL blit
+// is bottom-left, so that path will need a Y conversion when RmlUi lands. Full-target
+// snapshots (origin 0, whole texture) are orientation-neutral and correct today.
+static void blit_texture_region(const gl::Texture& src, gl::Origin3D srcOrigin, const gl::Texture& dst,
+                                gl::Origin3D dstOrigin, const gl::Extent3D& size) {
+  if (src.id == 0 || dst.id == 0 || size.width == 0 || size.height == 0) {
+    return;
+  }
+  const gl::GLuint readFbo = gl::get_framebuffer(src);
+  const gl::GLuint drawFbo = gl::get_framebuffer(dst);
+  gl::gl.BindFramebuffer(gl::GL_READ_FRAMEBUFFER, readFbo);
+  gl::gl.BindFramebuffer(gl::GL_DRAW_FRAMEBUFFER, drawFbo);
+  gl::gl.Disable(gl::GL_SCISSOR_TEST);
+  gl::gl.BlitFramebuffer(static_cast<gl::GLint>(srcOrigin.x), static_cast<gl::GLint>(srcOrigin.y),
+                         static_cast<gl::GLint>(srcOrigin.x + size.width),
+                         static_cast<gl::GLint>(srcOrigin.y + size.height), static_cast<gl::GLint>(dstOrigin.x),
+                         static_cast<gl::GLint>(dstOrigin.y), static_cast<gl::GLint>(dstOrigin.x + size.width),
+                         static_cast<gl::GLint>(dstOrigin.y + size.height), gl::GL_COLOR_BUFFER_BIT, gl::GL_NEAREST);
+  gl::gl.Enable(gl::GL_SCISSOR_TEST);
+  gl::gl.BindFramebuffer(gl::GL_FRAMEBUFFER, drawFbo);
+}
+
 static void encode_op(FramePacket& frame, const FrameOp& op) {
   upload_op_data(frame, op);
   switch (op.type) {
@@ -1557,7 +1622,10 @@ static void encode_op(FramePacket& frame, const FrameOp& op) {
     }
     break;
   case FrameOpType::TextureCopy:
-    // Phase 4: FBO-to-FBO glBlitFramebuffer(op.textureCopy->{src,dst,size}).
+    if (op.textureCopy != nullptr) {
+      blit_texture_region(op.textureCopy->src.texture, op.textureCopy->src.origin, op.textureCopy->dst.texture,
+                          op.textureCopy->dst.origin, op.textureCopy->size);
+    }
     break;
   case FrameOpType::EncoderTask:
     if (op.encoderTask != nullptr) {
@@ -1570,12 +1638,20 @@ static void encode_op(FramePacket& frame, const FrameOp& op) {
 static void render(FramePacket& frame, RenderPass& passInfo, uint32_t passIndex) {
   ZoneScoped;
   (void)passIndex;
-  if (!passInfo.sealed || passInfo.discardable) {
+  if (!passInfo.sealed) {
     return;
   }
-  // Offscreen / EFB-copy targets are created by the Phase 4 copy machinery; their
-  // attachments are still empty here, so a pass without a real color attachment has
-  // nothing to render into yet. The main EFB pass always has one (g_frameBuffer).
+  // Palette conversions render into their own destination textures (a later draw in THIS
+  // pass may sample them), so they run before -- and independently of -- this pass's own
+  // attachment, even for a discardable pass.
+  for (const auto& conv : passInfo.paletteConvs) {
+    tex_palette_conv::run(conv);
+  }
+  if (passInfo.discardable) {
+    return;
+  }
+  // A pass with no color attachment is a genuinely empty EFB segment (offscreen / EFB-copy
+  // targets now carry real attachments); nothing to render into.
   if (passInfo.colorView.id == 0) {
     return;
   }
@@ -1633,7 +1709,42 @@ static void render(FramePacket& frame, RenderPass& passInfo, uint32_t passIndex)
   if (invalidateCount > 0 && gl::gl.InvalidateFramebuffer != nullptr) {
     gl::gl.InvalidateFramebuffer(gl::GL_FRAMEBUFFER, invalidateCount, invalidate.data());
   }
-  // Phase 4: EFB resolve / snapshot copies + palette conversions for this pass.
+
+  // EFB resolve: copy (and format-convert / scale) this pass's color into the GX texture
+  // the game asked for. The crop UV transform lives in resolveUniformRange (S1c); the
+  // conversion / passthrough shaders render into resolveTarget's FBO.
+  if (passInfo.resolveTarget) {
+    const auto& dstSize = passInfo.resolveTarget->size;
+    const bool needsConversion = tex_copy_conv::needs_conversion(passInfo.resolveFormat);
+    const bool needsScaling = dstSize.width != static_cast<uint32_t>(passInfo.resolveRect.width) ||
+                              dstSize.height != static_cast<uint32_t>(passInfo.resolveRect.height);
+    const bool isDepth = gx::is_depth_format(passInfo.resolveFormat);
+    if (isDepth && passInfo.msaaSamples > 1) {
+      Log.fatal("Depth tex copies from multisampled EFB targets are not supported");
+    }
+    const tex_copy_conv::ConvRequest convReq{
+        .fmt = passInfo.resolveFormat,
+        .srcView = isDepth ? passInfo.copySourceDepthView : passInfo.copySourceView,
+        .uniformRange = passInfo.resolveUniformRange,
+        .dst = passInfo.resolveTarget,
+        .sampleFilter = needsScaling ? tex_copy_conv::SampleFilter::Linear : tex_copy_conv::SampleFilter::Nearest,
+    };
+    if (needsConversion) {
+      tex_copy_conv::run(convReq);
+    } else {
+      // No format conversion: the passthrough blit handles both the scaled and the exact
+      // 1:1 case (Dawn special-cased 1:1 with CopyTextureToTexture; the shader blit is
+      // equivalent and keeps the crop/orientation handling in one place).
+      tex_copy_conv::blit(convReq);
+    }
+  }
+
+  // Full-target color snapshot for the public resolve_pass API (off the live TP path;
+  // depth snapshot stays gated in tex_copy_conv::snapshot_depth).
+  if (passInfo.snapshotColorDst.id != 0) {
+    blit_texture_region(passInfo.copySourceTexture, gl::Origin3D{}, passInfo.snapshotColorDst, gl::Origin3D{},
+                        passInfo.targetSize);
+  }
 }
 
 void after_submit() noexcept { depth_peek::after_submit(); }
