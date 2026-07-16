@@ -84,6 +84,11 @@ void set_resampler(AuroraSampler sampler) noexcept;
 AuroraSampler get_resampler() noexcept;
 Viewport calculate_present_viewport(uint32_t surface_width, uint32_t surface_height, uint32_t content_width,
                                     uint32_t content_height) noexcept;
+// The native present-destination size (window drawable in pixels), distinct from the possibly
+// internalResolutionScale-downscaled EFB render size in surfaceConfiguration. Used to size the UI
+// at native resolution regardless of the game's internal resolution scale.
+uint32_t present_surface_width() noexcept;
+uint32_t present_surface_height() noexcept;
 // Present the finished frame's scene. Runs on the render worker (owns the GL context).
 // Binds the default framebuffer, clears to black (letterbox bars) and blits the finished
 // EFB into the centered content rect. Does NOT swap -- the caller composites the RmlUi

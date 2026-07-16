@@ -194,12 +194,16 @@ void main() {
 }
 )"sv;
 
-// Fullscreen-triangle vertex shader (gl_VertexID; no vertex buffer).
+// Fullscreen-triangle vertex shader (gl_VertexID; no vertex buffer). Orientation-preserving in GL:
+// v=0 at NDC.y=-1 (dest row 0), so a fullscreen copy maps source row R -> dest row R. The whole GL
+// pipeline is bottom-left origin (GX scene target, every RmlUi render target, the window), so
+// preserving here keeps the entire chain -- scene seed, layer copies, blur/filter passes and the
+// final present composite -- consistently GL-native with no explicit V-flip anywhere.
 constexpr std::string_view fullscreenVertexSource = R"(#version 300 es
 out vec2 v_uv;
 void main() {
   const vec2 positions[3] = vec2[3](vec2(-1.0, 1.0), vec2(-1.0, -3.0), vec2(3.0, 1.0));
-  const vec2 uvs[3] = vec2[3](vec2(0.0, 0.0), vec2(0.0, 2.0), vec2(2.0, 0.0));
+  const vec2 uvs[3] = vec2[3](vec2(0.0, 1.0), vec2(0.0, -1.0), vec2(2.0, 1.0));
   gl_Position = vec4(positions[gl_VertexID], 0.0, 1.0);
   v_uv = uvs[gl_VertexID];
 }
@@ -228,7 +232,7 @@ vec2 blur_uv(vec2 uv, int index) {
 }
 void main() {
   const vec2 positions[3] = vec2[3](vec2(-1.0, 1.0), vec2(-1.0, -3.0), vec2(3.0, 1.0));
-  const vec2 uvs[3] = vec2[3](vec2(0.0, 0.0), vec2(0.0, 2.0), vec2(2.0, 0.0));
+  const vec2 uvs[3] = vec2[3](vec2(0.0, 1.0), vec2(0.0, -1.0), vec2(2.0, 1.0));
   vec2 uv = uvs[gl_VertexID];
   gl_Position = vec4(positions[gl_VertexID], 0.0, 1.0);
   v_uv0 = blur_uv(uv, 0);
@@ -308,6 +312,8 @@ vec4 sample_area(vec2 frag_position) {
 }
 
 void main() {
+  // Scene, RmlUi targets and window are all GL-native (bottom-left origin), so this seed just
+  // preserves orientation like every other fullscreen pass -- no V-flip needed.
   vec4 color = texture(t, v_uv);
   if (seed.sampler_mode == 1u) {
     color = sample_area(gl_FragCoord.xy);

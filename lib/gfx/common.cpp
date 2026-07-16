@@ -253,6 +253,10 @@ struct TextureCopy {
   TextureCopyView src;
   TextureCopyView dst;
   gl::Extent3D size;
+  // The RmlUi SaveLayerAsTexture path passes a top-left source origin into a GL (bottom-left)
+  // layer target and wants the result stored upright for later top-left geometry sampling; this
+  // converts the source band and vertically flips the blit. Full-target snapshots leave it off.
+  bool flipY = false;
 };
 
 struct EncoderTask {
@@ -610,7 +614,7 @@ void queue_texture_upload_data(const uint8_t* data, uint32_t bytesPerRow, uint32
   queue_texture_upload(TextureUpload{tex, origin, size, level, bytesPerRow, Range{offset, static_cast<uint32_t>(byteCount)}});
 }
 
-void queue_texture_copy(TextureCopyView src, TextureCopyView dst, gl::Extent3D size) {
+void queue_texture_copy(TextureCopyView src, TextureCopyView dst, gl::Extent3D size, bool flipY) {
   ZoneScoped;
   auto& frame = current_frame_packet();
   if (g_currentRenderPass != UINT32_MAX) {
@@ -623,6 +627,7 @@ void queue_texture_copy(TextureCopyView src, TextureCopyView dst, gl::Extent3D s
       .src = std::move(src),
       .dst = std::move(dst),
       .size = size,
+      .flipY = flipY,
   });
   const auto opIndex = static_cast<uint32_t>(frame.ops.size());
   frame.ops.emplace_back(capture_frame_op(frame, FrameOpType::TextureCopy, copyIndex));
@@ -1591,11 +1596,13 @@ static void upload_op_data(FramePacket& frame, const FrameOp& op) {
 
 // FBO-to-FBO region copy via glBlitFramebuffer (worker, context current). Both textures
 // are attached to cache FBOs as COLOR_ATTACHMENT0. NEAREST + equal src/dst extents == an
-// exact texel copy. NOTE (Phase 5): the RmlUi copy path passes top-left origins; GL blit
-// is bottom-left, so that path will need a Y conversion when RmlUi lands. Full-target
-// snapshots (origin 0, whole texture) are orientation-neutral and correct today.
+// exact texel copy. Full-target snapshots (origin 0, whole texture, flipY=false) are
+// orientation-neutral. When flipY is set (the RmlUi SaveLayerAsTexture path), srcOrigin is a
+// top-left origin into a GL (bottom-left) source: convert the source band to GL rows and blit
+// with a vertical flip so the destination stores the region upright (dst GL row 0 == the
+// region's visual-top row), which is what RmlUi's later top-left geometry sampling expects.
 static void blit_texture_region(const gl::Texture& src, gl::Origin3D srcOrigin, const gl::Texture& dst,
-                                gl::Origin3D dstOrigin, const gl::Extent3D& size) {
+                                gl::Origin3D dstOrigin, const gl::Extent3D& size, bool flipY) {
   if (src.id == 0 || dst.id == 0 || size.width == 0 || size.height == 0) {
     return;
   }
@@ -1604,11 +1611,25 @@ static void blit_texture_region(const gl::Texture& src, gl::Origin3D srcOrigin, 
   gl::gl.BindFramebuffer(gl::GL_READ_FRAMEBUFFER, readFbo);
   gl::gl.BindFramebuffer(gl::GL_DRAW_FRAMEBUFFER, drawFbo);
   gl::gl.Disable(gl::GL_SCISSOR_TEST);
-  gl::gl.BlitFramebuffer(static_cast<gl::GLint>(srcOrigin.x), static_cast<gl::GLint>(srcOrigin.y),
-                         static_cast<gl::GLint>(srcOrigin.x + size.width),
-                         static_cast<gl::GLint>(srcOrigin.y + size.height), static_cast<gl::GLint>(dstOrigin.x),
-                         static_cast<gl::GLint>(dstOrigin.y), static_cast<gl::GLint>(dstOrigin.x + size.width),
-                         static_cast<gl::GLint>(dstOrigin.y + size.height), gl::GL_COLOR_BUFFER_BIT, gl::GL_NEAREST);
+  const auto srcX0 = static_cast<gl::GLint>(srcOrigin.x);
+  const auto srcX1 = static_cast<gl::GLint>(srcOrigin.x + size.width);
+  const auto dstX0 = static_cast<gl::GLint>(dstOrigin.x);
+  const auto dstX1 = static_cast<gl::GLint>(dstOrigin.x + size.width);
+  gl::GLint srcY0, srcY1, dstY0, dstY1;
+  if (flipY) {
+    const auto srcHeight = static_cast<gl::GLint>(src.size.height);
+    srcY0 = srcHeight - static_cast<gl::GLint>(srcOrigin.y) - static_cast<gl::GLint>(size.height);
+    srcY1 = srcHeight - static_cast<gl::GLint>(srcOrigin.y);
+    dstY0 = static_cast<gl::GLint>(dstOrigin.y + size.height);
+    dstY1 = static_cast<gl::GLint>(dstOrigin.y);
+  } else {
+    srcY0 = static_cast<gl::GLint>(srcOrigin.y);
+    srcY1 = static_cast<gl::GLint>(srcOrigin.y + size.height);
+    dstY0 = static_cast<gl::GLint>(dstOrigin.y);
+    dstY1 = static_cast<gl::GLint>(dstOrigin.y + size.height);
+  }
+  gl::gl.BlitFramebuffer(srcX0, srcY0, srcX1, srcY1, dstX0, dstY0, dstX1, dstY1, gl::GL_COLOR_BUFFER_BIT,
+                         gl::GL_NEAREST);
   gl::gl.Enable(gl::GL_SCISSOR_TEST);
   gl::gl.BindFramebuffer(gl::GL_FRAMEBUFFER, drawFbo);
 }
@@ -1624,7 +1645,7 @@ static void encode_op(FramePacket& frame, const FrameOp& op) {
   case FrameOpType::TextureCopy:
     if (op.textureCopy != nullptr) {
       blit_texture_region(op.textureCopy->src.texture, op.textureCopy->src.origin, op.textureCopy->dst.texture,
-                          op.textureCopy->dst.origin, op.textureCopy->size);
+                          op.textureCopy->dst.origin, op.textureCopy->size, op.textureCopy->flipY);
     }
     break;
   case FrameOpType::EncoderTask:
@@ -1743,7 +1764,7 @@ static void render(FramePacket& frame, RenderPass& passInfo, uint32_t passIndex)
   // depth snapshot stays gated in tex_copy_conv::snapshot_depth).
   if (passInfo.snapshotColorDst.id != 0) {
     blit_texture_region(passInfo.copySourceTexture, gl::Origin3D{}, passInfo.snapshotColorDst, gl::Origin3D{},
-                        passInfo.targetSize);
+                        passInfo.targetSize, /*flipY=*/false);
   }
 }
 

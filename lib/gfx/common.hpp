@@ -267,7 +267,7 @@ struct TextureCopyView {
 
 void begin_color_pass(const ColorPassDescriptor& desc);
 void end_color_pass();
-void queue_texture_copy(TextureCopyView src, TextureCopyView dst, gl::Extent3D size);
+void queue_texture_copy(TextureCopyView src, TextureCopyView dst, gl::Extent3D size, bool flipY = false);
 
 void begin_offscreen(uint32_t width, uint32_t height);
 void end_offscreen();

@@ -829,14 +829,16 @@ void WebGPURenderInterface::RenderBlur(float sigma, const RenderTarget& sourceDe
     const int bottom = std::clamp(texCoordRegion.Bottom(), top, maxHeight);
     const Rml::Vector2f viewportOrigin{m_viewport.left, m_viewport.top};
     const Rml::Vector2f viewportSize{viewportWidth, viewportHeight};
+    const float minX = (static_cast<float>(left) - viewportOrigin.x) / viewportSize.x;
+    const float maxX = (static_cast<float>(right) - viewportOrigin.x) / viewportSize.x;
+    const float topY = (static_cast<float>(top) - viewportOrigin.y) / viewportSize.y;
+    const float bottomY = (static_cast<float>(bottom) - viewportOrigin.y) / viewportSize.y;
     const BlurUniformBlock uniform{
         .texelOffset = {},
         .radius = 0.f,
         .padding = 0.f,
-        .texCoordMin =
-            (Rml::Vector2f(static_cast<float>(left), static_cast<float>(top)) - viewportOrigin) / viewportSize,
-        .texCoordMax =
-            (Rml::Vector2f(static_cast<float>(right), static_cast<float>(bottom)) - viewportOrigin) / viewportSize,
+        .texCoordMin = {minX, topY},
+        .texCoordMax = {maxX, bottomY},
         .weights = weights,
     };
     return gfx::push_uniform(uniform);
@@ -1218,7 +1220,10 @@ Rml::TextureHandle WebGPURenderInterface::SaveLayerAsTexture() {
   const gfx::TextureCopyView dst{
       .texture = texData->m_texture,
   };
-  gfx::queue_texture_copy(src, dst, textureSize);
+  // The layer is a GL (bottom-left) target but src.origin is a top-left scissor origin, and the
+  // saved texture is later sampled by top-left RmlUi geometry (e.g. box-shadow selection
+  // highlights); flipY converts the source band and stores the region upright.
+  gfx::queue_texture_copy(src, dst, textureSize, /*flipY=*/true);
 
   BeginLayerPass(layer, gl::LoadOp::Load, "RmlUi saved layer restore pass");
   return reinterpret_cast<Rml::TextureHandle>(texData);

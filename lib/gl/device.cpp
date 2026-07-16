@@ -331,16 +331,18 @@ void screenshot(const char* path) noexcept {
 }
 
 // Native drawable size (window pixels), NOT the EFB render size, for the present rects.
-static uint32_t present_surface_width() noexcept {
+uint32_t present_surface_width() noexcept {
   return g_presentWidth > 0 ? g_presentWidth : g_graphicsConfig.surfaceConfiguration.width;
 }
-static uint32_t present_surface_height() noexcept {
+uint32_t present_surface_height() noexcept {
   return g_presentHeight > 0 ? g_presentHeight : g_graphicsConfig.surfaceConfiguration.height;
 }
 
-// Fullscreen-triangle textured-quad program for the UI overlay composite. GL-native UV
-// mapping: uv(0,0) at NDC(-1,-1) (window bottom = texel row 0), so sampling the UI target
-// aligns with the scene blit (both put memory row 0 at the content-rect bottom -> upright).
+// Fullscreen-triangle textured-quad program for the UI overlay composite. Every RmlUi pass now
+// preserves orientation (rmlui/pipeline.cpp), so the finished UI target lands GL-native (row 0 =
+// content bottom), the same layout as the GX scene target. This composite therefore samples it
+// straight, exactly like the scene blit: uv(0,0) at NDC(-1,-1) (window bottom = texel row 0), so
+// both put memory row 0 at the content-rect bottom -> upright and mutually aligned.
 constexpr char kPresentUiVertex[] = R"(#version 300 es
 out vec2 v_uv;
 void main() {

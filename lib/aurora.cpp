@@ -215,8 +215,13 @@ void end_frame() noexcept {
   auto imguiDrawData = imgui::freeze();
 
   const auto& presentSource = webgpu::present_source();
-  const auto viewport = webgpu::calculate_present_viewport(webgpu::g_graphicsConfig.surfaceConfiguration.width,
-                                                           webgpu::g_graphicsConfig.surfaceConfiguration.height,
+  // Size the UI from the NATIVE present surface (window drawable), not surfaceConfiguration (the
+  // internalResolutionScale-downscaled EFB). Otherwise the UI would render at the game's internal
+  // resolution and get upscaled with the scene -- at 0.5x that made the UI huge and cramped. This
+  // is the same centered content rect composite_ui_overlay/present_frame blit into, so the UI
+  // target maps 1:1 and stays crisp and correctly-sized at any internal resolution scale.
+  const auto viewport = webgpu::calculate_present_viewport(webgpu::present_surface_width(),
+                                                           webgpu::present_surface_height(),
                                                            presentSource.size.width, presentSource.size.height);
 
   gl::Texture rmlTexture{};
