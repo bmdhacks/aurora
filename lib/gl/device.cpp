@@ -19,6 +19,7 @@
 #include "context.hpp"
 #include "fbo_cache.hpp"
 #include "gl_core.hpp"
+#include "program.hpp"
 #include "state.hpp"
 #include "textures.hpp"
 
@@ -151,28 +152,36 @@ bool refresh_surface(bool recreate) {
 }
 
 TextureWithSampler create_render_texture(uint32_t width, uint32_t height, bool multisampled) {
-  // GL objects must be created with the render context current. If we are called off the
-  // worker while it is running (e.g. RmlUi's ensure_render_target on the recording thread,
-  // Phase 5 territory), return an empty handle rather than issuing GL on a context-less
-  // thread -- the caller keeps its Phase-1 behavior until that path moves to the worker.
-  if (gfx::render_worker::is_running() && !gfx::render_worker::is_worker_thread()) {
-    return {};
-  }
   (void)multisampled; // MSAA > 1 is out of scope (config clamps to 1); single-sample only.
   const gl::Extent3D size{width, height, 1};
   const auto format = g_graphicsConfig.surfaceConfiguration.format;
-  gl::Texture texture = gl::create_texture(format, size, 1, /*renderable=*/true);
-  gl::SamplerDescriptor samplerDesc{};
-  samplerDesc.magFilter = gl::FilterMode::Linear;
-  samplerDesc.minFilter = gl::FilterMode::Linear;
-  gl::Sampler sampler = gl::create_sampler(samplerDesc, g_graphicsConfig.textureAnisotropy > 0);
-  return TextureWithSampler{
-      .texture = texture,
-      .view = texture, // WebGPU's separate view collapses into the texture on GL
-      .size = size,
-      .format = format,
-      .sampler = sampler,
+  TextureWithSampler result{};
+  // GL objects must be created with the render context current. RmlUi's ensure_render_target calls
+  // this from the recording thread, so marshal the create to the worker and block (like
+  // gfx::create_gl_texture) rather than returning an empty handle.
+  const auto build = [&] {
+    gl::Texture texture = gl::create_texture(format, size, 1, /*renderable=*/true);
+    // create_texture binds GL_TEXTURE_2D directly; drop the state cache's texture-unit shadow.
+    gl::invalidate_texture_bindings();
+    gl::SamplerDescriptor samplerDesc{};
+    samplerDesc.magFilter = gl::FilterMode::Linear;
+    samplerDesc.minFilter = gl::FilterMode::Linear;
+    gl::Sampler sampler = gl::create_sampler(samplerDesc, g_graphicsConfig.textureAnisotropy > 0);
+    result = TextureWithSampler{
+        .texture = texture,
+        .view = texture, // WebGPU's separate view collapses into the texture on GL
+        .size = size,
+        .format = format,
+        .sampler = sampler,
+    };
   };
+  if (!gfx::render_worker::is_running() || gfx::render_worker::is_worker_thread()) {
+    build();
+  } else {
+    gfx::render_worker::enqueue_work(build);
+    gfx::render_worker::synchronize();
+  }
+  return result;
 }
 
 static TextureWithSampler create_depth_texture(uint32_t width, uint32_t height) {
@@ -321,12 +330,58 @@ void screenshot(const char* path) noexcept {
   Log.info("[gl] screenshot written: {} ({}x{})", path, w, h);
 }
 
+// Native drawable size (window pixels), NOT the EFB render size, for the present rects.
+static uint32_t present_surface_width() noexcept {
+  return g_presentWidth > 0 ? g_presentWidth : g_graphicsConfig.surfaceConfiguration.width;
+}
+static uint32_t present_surface_height() noexcept {
+  return g_presentHeight > 0 ? g_presentHeight : g_graphicsConfig.surfaceConfiguration.height;
+}
+
+// Fullscreen-triangle textured-quad program for the UI overlay composite. GL-native UV
+// mapping: uv(0,0) at NDC(-1,-1) (window bottom = texel row 0), so sampling the UI target
+// aligns with the scene blit (both put memory row 0 at the content-rect bottom -> upright).
+constexpr char kPresentUiVertex[] = R"(#version 300 es
+out vec2 v_uv;
+void main() {
+  const vec2 positions[3] = vec2[3](vec2(-1.0, -1.0), vec2(3.0, -1.0), vec2(-1.0, 3.0));
+  const vec2 uvs[3] = vec2[3](vec2(0.0, 0.0), vec2(2.0, 0.0), vec2(0.0, 2.0));
+  gl_Position = vec4(positions[gl_VertexID], 0.0, 1.0);
+  v_uv = uvs[gl_VertexID];
+}
+)";
+constexpr char kPresentUiFragment[] = R"(#version 300 es
+precision highp float;
+uniform sampler2D tex;
+in vec2 v_uv;
+out vec4 out_color;
+void main() { out_color = texture(tex, v_uv); }
+)";
+gl::GLuint g_presentUiProgram = 0;
+
+// Compile the present-UI program on demand (worker context current).
+static gl::GLuint present_ui_program() {
+  if (g_presentUiProgram == 0) {
+    g_presentUiProgram = gl::compile_program(kPresentUiVertex, kPresentUiFragment, "Present UI Composite");
+    if (g_presentUiProgram != 0) {
+      gl::gl.UseProgram(g_presentUiProgram);
+      const gl::GLint loc = gl::gl.GetUniformLocation(g_presentUiProgram, "tex");
+      if (loc >= 0) {
+        gl::gl.Uniform1i(loc, 0);
+      }
+      gl::gl.UseProgram(0);
+    }
+  }
+  return g_presentUiProgram;
+}
+
 void present_frame() noexcept {
   // Runs on the render worker (owns the GL context). Desktop present: clear the window's
   // default framebuffer to black (letterbox bars) and blit the finished color target into
   // the centered content rect with a linear filter. No Y-flip -- both the source EFB and
-  // the default framebuffer are GL bottom-left origin (S1c). Phase 6 replaces this with the
-  // SDL2-shim EFB slot hand-off on the device path.
+  // the default framebuffer are GL bottom-left origin (S1c). Does NOT swap; the caller
+  // composites the UI overlay + imgui, then calls present_swap(). Phase 6 replaces this with
+  // the SDL2-shim EFB slot hand-off on the device path.
   gl::gl.BindFramebuffer(gl::GL_FRAMEBUFFER, 0);
   gl::gl.Disable(gl::GL_SCISSOR_TEST);
   gl::gl.ColorMask(gl::GL_TRUE, gl::GL_TRUE, gl::GL_TRUE, gl::GL_TRUE);
@@ -334,9 +389,8 @@ void present_frame() noexcept {
   gl::gl.Clear(gl::GL_COLOR_BUFFER_BIT);
 
   const auto& source = present_source();
-  // Destination is the window drawable (native pixel size), NOT the EFB render size.
-  const uint32_t surfaceWidth = g_presentWidth > 0 ? g_presentWidth : g_graphicsConfig.surfaceConfiguration.width;
-  const uint32_t surfaceHeight = g_presentHeight > 0 ? g_presentHeight : g_graphicsConfig.surfaceConfiguration.height;
+  const uint32_t surfaceWidth = present_surface_width();
+  const uint32_t surfaceHeight = present_surface_height();
   if (source.texture.id != 0 && surfaceWidth > 0 && surfaceHeight > 0) {
     const auto viewport = calculate_present_viewport(surfaceWidth, surfaceHeight, source.size.width, source.size.height);
     const gl::GLuint readFbo = gl::get_framebuffer(source.texture);
@@ -350,11 +404,50 @@ void present_frame() noexcept {
                            dstX0, dstY0, dstX1, dstY1, gl::GL_COLOR_BUFFER_BIT, gl::GL_LINEAR);
     gl::gl.BindFramebuffer(gl::GL_FRAMEBUFFER, 0);
   }
+}
 
-  // The clear + blit touched GL (framebuffer binds, scissor, color mask) outside the
-  // state cache; forget the shadow so the next frame's first pass re-issues everything.
+void composite_ui_overlay(const gl::Texture& texture, const gl::Sampler& sampler, bool overlay) noexcept {
+  const gl::GLuint program = present_ui_program();
+  if (program == 0 || texture.id == 0) {
+    return;
+  }
+  const auto& source = present_source();
+  const uint32_t surfaceWidth = present_surface_width();
+  const uint32_t surfaceHeight = present_surface_height();
+  if (source.texture.id == 0 || surfaceWidth == 0 || surfaceHeight == 0) {
+    return;
+  }
+  // Same centered content rect the scene was blitted into (letterbox preserved).
+  const auto viewport = calculate_present_viewport(surfaceWidth, surfaceHeight, source.size.width, source.size.height);
+
+  gl::gl.BindFramebuffer(gl::GL_FRAMEBUFFER, 0);
+  gl::gl.Disable(gl::GL_SCISSOR_TEST);
+  gl::gl.ColorMask(gl::GL_TRUE, gl::GL_TRUE, gl::GL_TRUE, gl::GL_TRUE);
+  gl::gl.Viewport(static_cast<gl::GLint>(viewport.left), static_cast<gl::GLint>(viewport.top),
+                  static_cast<gl::GLsizei>(viewport.width), static_cast<gl::GLsizei>(viewport.height));
+  if (overlay) {
+    // Premultiplied-alpha blend: UI (src) over the scene already in the framebuffer.
+    gl::gl.Enable(gl::GL_BLEND);
+    gl::gl.BlendEquationSeparate(gl::GL_FUNC_ADD, gl::GL_FUNC_ADD);
+    gl::gl.BlendFuncSeparate(gl::GL_ONE, gl::GL_ONE_MINUS_SRC_ALPHA, gl::GL_ONE, gl::GL_ONE_MINUS_SRC_ALPHA);
+  } else {
+    // Backdrop case: the UI target already contains the scene, so draw it opaque.
+    gl::gl.Disable(gl::GL_BLEND);
+  }
+  gl::gl.UseProgram(program);
+  gl::gl.ActiveTexture(gl::GL_TEXTURE0);
+  gl::gl.BindTexture(gl::GL_TEXTURE_2D, texture.id);
+  gl::gl.BindSampler(0, sampler.id);
+  gl::gl.BindVertexArray(0);
+  gl::gl.DrawArrays(gl::GL_TRIANGLES, 0, 3);
+  gl::gl.BindSampler(0, 0);
+  gl::gl.Disable(gl::GL_BLEND);
+}
+
+void present_swap() noexcept {
+  // The clear + blit + composite + imgui all touched GL outside the state cache; forget the
+  // shadow so the next frame's first pass re-issues everything.
   gl::reset_state_cache();
-
   if (g_sdlWindow != nullptr) {
     SDL_GL_SwapWindow(g_sdlWindow);
   }

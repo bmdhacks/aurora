@@ -451,9 +451,11 @@ Rml::TextureHandle WebGPURenderInterface::GenerateTexture(Rml::Span<const Rml::b
       .height = static_cast<uint32_t>(source_dimensions.y),
       .depthOrArrayLayers = 1,
   };
-  // Phase 5: create an immutable RGBA8 2D texture (gl::create_texture) and keep its handle.
-  // The view collapses into the texture handle on GL.
-  texData->m_texture = gl::Texture{};
+  // Immutable RGBA8 2D texture (sampled only, so not renderable); create_gl_texture marshals
+  // the GL create to the render worker and blocks, so the handle is valid on this recording
+  // thread. queue_texture_upload_if_needed then fills it via glTexSubImage2D. The view
+  // collapses into the texture handle on GL.
+  texData->m_texture = gfx::create_gl_texture(gl::TextureFormat::RGBA8Unorm, size, 1, /*renderable=*/false);
   texData->m_textureView = texData->m_texture;
 
   constexpr uint32_t BytesPerPixel = 4;
@@ -583,13 +585,15 @@ void WebGPURenderInterface::EnsureRenderTarget(RenderTarget& target, const char*
 
   target = {};
   target.size = size;
-  // Phase 5: allocate the renderable m_renderTargetFormat color texture (+ FBO). View == texture on GL.
-  target.texture = gl::Texture{};
+  // Renderable color target (the FBO cache picks it up as the attachment in begin_color_pass).
+  // View == texture on GL. create_gl_texture marshals to the worker and blocks.
+  target.texture = gfx::create_gl_texture(m_renderTargetFormat, size, 1, /*renderable=*/true);
   target.view = target.texture;
 
   if (useMultisampling) {
-    // Phase 5: allocate the multisampled render-attachment texture (LayerSampleCount samples).
-    target.multisampleTexture = gl::Texture{};
+    // MSAA is out of scope (EnableMsaa == false => LayerSampleCount == 1 => useMultisampling is
+    // always false), so this never executes; kept for when a multisampled layer path returns.
+    target.multisampleTexture = gfx::create_gl_texture(m_renderTargetFormat, size, 1, /*renderable=*/true);
     target.multisampleView = target.multisampleTexture;
   }
 }
@@ -991,10 +995,12 @@ size_t WebGPURenderInterface::RenderFilters(Rml::Span<const Rml::CompiledFilterH
       break;
     }
     case FilterType::MaskImage: {
-      CompositeToTarget(texture_bind_group_ref(m_postprocessTargets[sourceIndex].view),
+      // maskImage samples the source image (`t`, unit 0) and the mask (`mask_t`, unit 1) in one
+      // draw, so both go in a single texture bind group -- a separate mask group would rebind
+      // unit 0 and clobber the image (GL texture groups bind every unit from the array).
+      CompositeToTarget(mask_bind_group_ref(m_postprocessTargets[sourceIndex].view, m_blendMaskTarget.view),
                         m_postprocessTargets[scratchIndex].view, gl::LoadOp::Clear,
-                        filter_pipeline(PipelineKind::MaskImage, m_renderTargetFormat), "RmlUi mask image pass",
-                        texture_bind_group_ref(m_blendMaskTarget.view), {}, false);
+                        filter_pipeline(PipelineKind::MaskImage, m_renderTargetFormat), "RmlUi mask image pass");
       sourceIndex = scratchIndex;
       break;
     }
@@ -1190,8 +1196,9 @@ Rml::TextureHandle WebGPURenderInterface::SaveLayerAsTexture() {
       .height = static_cast<uint32_t>(bottom - top),
       .depthOrArrayLayers = 1,
   };
-  // Phase 5: allocate the saved-layer color texture (m_renderTargetFormat). View == texture on GL.
-  texData->m_texture = gl::Texture{};
+  // Renderable saved-layer color target (the queue_texture_copy below blits the layer subregion
+  // into it via glBlitFramebuffer, so it must be FBO-attachable). View == texture on GL.
+  texData->m_texture = gfx::create_gl_texture(m_renderTargetFormat, textureSize, 1, /*renderable=*/true);
   texData->m_textureView = texData->m_texture;
   texData->m_size = textureSize;
   texData->m_rowBytes = textureSize.width * 4;
@@ -1199,7 +1206,7 @@ Rml::TextureHandle WebGPURenderInterface::SaveLayerAsTexture() {
 
   EndActivePass();
 
-  // Phase 5: texture-to-texture copy (layer subregion -> saved texture) via glBlitFramebuffer/copy.
+  // Texture-to-texture copy (layer subregion -> saved texture) via glBlitFramebuffer.
   const gfx::TextureCopyView src{
       .texture = m_layers[layer].texture,
       .origin =
@@ -1506,9 +1513,10 @@ gl::Texture WebGPURenderInterface::GetClipMaskStencilView(const gl::Extent3D& si
   }
 
   m_clipMaskStencilSize = size;
-  // Phase 5: allocate the DEPTH24_STENCIL8 clip-mask attachment (LayerSampleCount samples). The
-  // view exposes all aspects of the combined format; on GL the view collapses into the texture.
-  m_clipMaskStencilTexture = gl::Texture{};
+  // DEPTH24_STENCIL8 clip-mask attachment. The depth aspect is unused; only the stencil aspect
+  // drives clipping. On GL the view collapses into the texture. create_gl_texture marshals the
+  // create to the worker and blocks so the handle is valid here.
+  m_clipMaskStencilTexture = gfx::create_gl_texture(ClipMaskStencilFormat, size, 1, /*renderable=*/true);
   m_clipMaskStencilView = m_clipMaskStencilTexture;
   return m_clipMaskStencilView;
 }

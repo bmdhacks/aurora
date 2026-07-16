@@ -38,7 +38,6 @@ uint32_t s_pressedMouseButtons = 0;
 std::array<TrackedTouch, MaxTrackedTouches> s_trackedTouches{};
 float s_uiScale = 0.0f;
 webgpu::TextureWithSampler s_renderTarget;
-gfx::BindGroupRef s_renderTargetCopyBindGroup = 0;
 
 WebGPURenderInterface* get_render_interface() noexcept {
   return static_cast<WebGPURenderInterface*>(Backend::GetRenderInterface()); // NOLINT(*-pro-type-static-cast-downcast)
@@ -80,10 +79,6 @@ void ensure_render_target(Rml::Vector2i dimensions) noexcept {
     return;
   }
   s_renderTarget = webgpu::create_render_texture(width, height, false);
-  // Phase 5: build the bind group that samples the UI render target for the present
-  // composite. Phase 1 has no overlay compositing yet, so leave it empty (0); the
-  // present path treats bindGroup==0 as "no UI overlay".
-  s_renderTargetCopyBindGroup = 0;
 }
 
 bool element_has_visible_backdrop_filter(const Rml::Element* element) noexcept {
@@ -468,7 +463,8 @@ RecordedFrame record_frame(const webgpu::Viewport& presentViewport) noexcept {
     return {};
   }
   return {
-      .bindGroup = s_renderTargetCopyBindGroup,
+      .texture = s_renderTarget.view,
+      .sampler = s_renderTarget.sampler,
       .overlay = !needsBackdrop,
   };
 }
@@ -482,6 +478,5 @@ void shutdown() noexcept {
   Backend::Shutdown();
   g_context = nullptr;
   s_renderTarget = {};
-  s_renderTargetCopyBindGroup = {};
 }
 } // namespace aurora::rmlui

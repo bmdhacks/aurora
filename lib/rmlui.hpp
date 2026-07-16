@@ -10,8 +10,9 @@
 namespace aurora::rmlui {
 
 struct RecordedFrame {
-  gfx::BindGroupRef bindGroup = 0; // 0 = no overlay recorded
-  bool overlay = false;
+  gl::Texture texture;   // the composited UI target sampled by the present overlay (id 0 = nothing recorded)
+  gl::Sampler sampler;   // its filtering sampler
+  bool overlay = false;  // true = blend the UI over the scene; false = UI already seeded the scene (opaque)
 };
 
 void initialize(const AuroraWindowSize& size) noexcept;

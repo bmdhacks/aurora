@@ -126,6 +126,34 @@ void bind_gx_layout(uint32_t mask, const Buffer& vbuf, uint64_t baseOffset, cons
   }
   gl.BindBuffer(GL_ELEMENT_ARRAY_BUFFER, ibuf.id);
 }
+
+// RmlUi geometry VAO: interleaved Rml::Vertex records (stride 20) with position
+// (Float32x2 @0, loc0), tex_coord (Float32x2 @12, loc1) and colour (Unorm8x4 @8, loc2) --
+// byte-identical to the WebGPU VertexBufferLayout it replaces (offsets are offsetof on
+// Rml::Vertex, which orders position, colour, tex_coord). Attributes are re-pointed each
+// draw because the geometry sits at a dynamic vertex-ring offset.
+void bind_rml_layout(const Buffer& vbuf, uint64_t baseOffset, const Buffer& ibuf) {
+  constexpr uint32_t kRmlStride = 20; // sizeof(Rml::Vertex)
+  constexpr uintptr_t kPosOffset = 0;
+  constexpr uintptr_t kColourOffset = 8;
+  constexpr uintptr_t kTexCoordOffset = 12;
+  bool created = false;
+  const GLuint vao = get_or_create_vao(kRmlGeometryVertexLayout, created);
+  bind_vertex_array(vao);
+  gl.BindBuffer(GL_ARRAY_BUFFER, vbuf.id);
+  if (created) {
+    gl.EnableVertexAttribArray(0);
+    gl.EnableVertexAttribArray(1);
+    gl.EnableVertexAttribArray(2);
+  }
+  gl.VertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, kRmlStride,
+                         reinterpret_cast<const void*>(baseOffset + kPosOffset));
+  gl.VertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, kRmlStride,
+                         reinterpret_cast<const void*>(baseOffset + kTexCoordOffset));
+  gl.VertexAttribPointer(2, 4, GL_UNSIGNED_BYTE, GL_TRUE, kRmlStride,
+                         reinterpret_cast<const void*>(baseOffset + kColourOffset));
+  gl.BindBuffer(GL_ELEMENT_ARRAY_BUFFER, ibuf.id);
+}
 } // namespace
 
 void reset_pass_vao_cache() noexcept { g_vaoCache.clear(); }
@@ -206,12 +234,14 @@ void PassEncoder::Draw(uint32_t vertexCount, uint32_t instanceCount, uint32_t fi
   if (!m_hasPipeline || m_pipeline.program == 0 || vertexCount == 0) {
     return;
   }
-  if (m_pipeline.vertexLayout != 0) {
+  if (m_pipeline.vertexLayout == kRmlGeometryVertexLayout) {
+    bind_rml_layout(m_vertexBuffer, m_vertexOffset, m_indexBuffer);
+  } else if (m_pipeline.vertexLayout != 0) {
     // Native non-indexed GX draw: base offset is folded into the attrib pointers, so
     // firstVertex stays 0 relative to that base.
     bind_gx_layout(m_pipeline.vertexLayout, m_vertexBuffer, m_vertexOffset, m_indexBuffer);
   } else {
-    // Attribute-less draw (clear / present fullscreen triangle via gl_VertexID).
+    // Attribute-less draw (clear / present / RmlUi fullscreen triangle via gl_VertexID).
     bind_vertex_array(0);
   }
   const GLenum mode = topology_gl(m_pipeline.state.topology);
@@ -230,7 +260,11 @@ void PassEncoder::DrawIndexed(uint32_t indexCount, uint32_t instanceCount, uint3
   if (!m_hasPipeline || m_pipeline.program == 0 || indexCount == 0) {
     return;
   }
-  bind_gx_layout(m_pipeline.vertexLayout, m_vertexBuffer, m_vertexOffset, m_indexBuffer);
+  if (m_pipeline.vertexLayout == kRmlGeometryVertexLayout) {
+    bind_rml_layout(m_vertexBuffer, m_vertexOffset, m_indexBuffer);
+  } else {
+    bind_gx_layout(m_pipeline.vertexLayout, m_vertexBuffer, m_vertexOffset, m_indexBuffer);
+  }
   const GLenum mode = topology_gl(m_pipeline.state.topology);
   const bool u32 = m_indexFormat == IndexFormat::Uint32;
   const GLenum idxType = u32 ? GL_UNSIGNED_INT : GL_UNSIGNED_SHORT;

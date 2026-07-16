@@ -3,8 +3,13 @@
 #include "../internal.hpp"
 #include "../webgpu/gpu.hpp"
 
+#include "../gl/gl_core.hpp"
+#include "../gl/program.hpp"
+#include "../gl/state.hpp"
+
 #include <algorithm>
 #include <array>
+#include <string>
 #include <string_view>
 
 #include <RmlUi/Core/Vertex.h>
@@ -22,468 +27,400 @@ gl::Sampler g_sampler;
 constexpr uint32_t DynamicGroup1 = 1u << 1u;
 constexpr uint32_t DynamicGroup2 = 1u << 2u;
 
+// GL uniform-block binding points (S4). The common vertex/gamma block sits at 0
+// (common_bind_group_ref); the per-effect block (gradient/blur/seed/filter/shadow) at
+// 1 (uniform_bind_group_ref). GL_INVALID_INDEX (0xFFFFFFFF) means the program does not
+// declare that block, which is fine -- the inert bind is ignored.
+constexpr gl::GLuint kCommonBlockBinding = 0;
+constexpr gl::GLuint kExtraBlockBinding = 1;
+constexpr gl::GLuint kInvalidBlockIndex = 0xFFFFFFFFu;
+// Texture units: the image sampler `t` is unit 0, the mask sampler `mask_t` unit 1.
+constexpr gl::GLint kImageTextureUnit = 0;
+constexpr gl::GLint kMaskTextureUnit = 1;
+
 constexpr uint64_t CommonUniformBindingSize = AURORA_ALIGN(sizeof(UniformBlock), 16);
 constexpr uint64_t ExtraUniformBindingSize =
     AURORA_ALIGN(std::max({sizeof(BlurUniformBlock), sizeof(DropShadowUniformBlock), sizeof(SimpleFilterUniformBlock),
                            sizeof(GradientUniformBlock), sizeof(SeedResampleUniformBlock)}),
                  16);
 
-constexpr std::string_view vertexSource = R"(
-struct VertexInput {
-    @location(0) position: vec2<f32>,
-    @location(1) uv: vec2<f32>,
-    @location(2) color: vec4<f32>,
-};
+// ---------------------------------------------------------------------------
+// GLSL (#version 300 es) ports of the RmlUi WGSL shaders. Translation rules
+// (mirrors the GX emitter): textureSample(t,s,uv) -> texture(t,uv) (combined
+// samplers, S3); textureLoad -> texelFetch; textureDimensions -> textureSize;
+// @builtin(position) fragment input -> gl_FragCoord; @builtin(vertex_index) ->
+// gl_VertexID; uniform blocks -> layout(std140) uniform Name {...} inst; (S4);
+// atan2(y,x) -> atan(y,x). The `Uniforms` block is declared identically in the
+// vertex and fragment stages (GLSL ES requires matching block declarations).
+// No projection Y-flip here: the MVP flip lives in SetupRenderState (S1d).
+// ---------------------------------------------------------------------------
 
-struct VertexOutput {
-    @builtin(position) position: vec4<f32>,
-    @location(0) color: vec4<f32>,
-    @location(1) uv: vec2<f32>,
-};
+// Geometry vertex shader (also used by the gradient pipeline). The `Uniforms` block is
+// repeated verbatim in every stage that references it (GLSL ES requires the vertex and
+// fragment declarations of a shared block to match exactly).
 
-struct Uniforms {
-    mvp: mat4x4<f32>,
-    translation: vec4<f32>,
-    gamma: f32,
-};
-
-@group(0) @binding(0) var<uniform> uniforms: Uniforms;
-
-@vertex
-fn main(in: VertexInput) -> VertexOutput {
-    var out: VertexOutput;
-    var translatedPos = uniforms.translation.xy + in.position;
-
-    out.position = uniforms.mvp * vec4<f32>(translatedPos, 0.0, 1.0);
-    out.color = in.color;
-    out.uv = in.uv;
-    return out;
+constexpr std::string_view vertexSource = R"(#version 300 es
+layout(std140) uniform Uniforms {
+  mat4 mvp;
+  vec4 translation;
+  float gamma;
+} uniforms;
+layout(location = 0) in vec2 in_position;
+layout(location = 1) in vec2 in_uv;
+layout(location = 2) in vec4 in_color;
+out vec4 v_color;
+out vec2 v_uv;
+void main() {
+  vec2 translatedPos = uniforms.translation.xy + in_position;
+  gl_Position = uniforms.mvp * vec4(translatedPos, 0.0, 1.0);
+  v_color = in_color;
+  v_uv = in_uv;
 }
 )"sv;
 
-constexpr std::string_view fragmentSource = R"(
-struct VertexOutput {
-    @builtin(position) position: vec4<f32>,
-    @location(0) color: vec4<f32>,
-    @location(1) uv: vec2<f32>,
-};
+constexpr std::string_view fragmentSource = R"(#version 300 es
+precision highp float;
+layout(std140) uniform Uniforms {
+  mat4 mvp;
+  vec4 translation;
+  float gamma;
+} uniforms;
+uniform sampler2D t;
+in vec4 v_color;
+in vec2 v_uv;
+out vec4 out_color;
+void main() {
+  vec4 color = v_color * texture(t, v_uv);
+  if (uniforms.gamma == 1.0) {
+    out_color = color;
+  } else {
+    vec3 corrected = pow(color.rgb, vec3(uniforms.gamma));
+    out_color = vec4(corrected, color.a);
+  }
+}
+)"sv;
 
-struct Uniforms {
-    mvp: mat4x4<f32>,
-    translation: vec4<f32>,
-    gamma: f32,
-};
+constexpr std::string_view gradientFragmentSource = R"(#version 300 es
+precision highp float;
+precision highp int;
+layout(std140) uniform Uniforms {
+  mat4 mvp;
+  vec4 translation;
+  float gamma;
+} uniforms;
+layout(std140) uniform GradientUniforms {
+  int function;
+  int num_stops;
+  vec2 p;
+  vec2 v;
+  vec2 padding;
+  vec4 stop_colors[16];
+  vec4 stop_positions[4];
+} gradient;
+in vec4 v_color;
+in vec2 v_uv;
+out vec4 out_color;
 
-@group(0) @binding(0) var<uniform> uniforms: Uniforms;
-@group(0) @binding(1) var s: sampler;
-@group(1) @binding(0) var t: texture_2d<f32>;
+const int LINEAR = 0;
+const int RADIAL = 1;
+const int CONIC = 2;
+const int REPEATING_LINEAR = 3;
+const int REPEATING_RADIAL = 4;
+const int REPEATING_CONIC = 5;
+const float PI = 3.14159265;
 
-@fragment
-fn main(in: VertexOutput) -> @location(0) vec4<f32> {
-    let color = in.color * textureSample(t, s, in.uv);
-    if (uniforms.gamma == 1.0) {
-        return color;
+float bayer_dither(vec2 position) {
+  int bayer[64] = int[64](
+    0, 32, 8, 40, 2, 34, 10, 42,
+    48, 16, 56, 24, 50, 18, 58, 26,
+    12, 44, 4, 36, 14, 46, 6, 38,
+    60, 28, 52, 20, 62, 30, 54, 22,
+    3, 35, 11, 43, 1, 33, 9, 41,
+    51, 19, 59, 27, 49, 17, 57, 25,
+    15, 47, 7, 39, 13, 45, 5, 37,
+    63, 31, 55, 23, 61, 29, 53, 21);
+  int x = int(position.x) % 8;
+  int y = int(position.y) % 8;
+  return (float(bayer[x + y * 8]) / 64.0 - 0.5) / 255.0;
+}
+
+float stop_position(int index) {
+  int group_index = index / 4;
+  int component_index = index % 4;
+  return gradient.stop_positions[group_index][component_index];
+}
+
+vec4 stop_color_mix(float t) {
+  vec4 color = gradient.stop_colors[0];
+  for (int i = 1; i < 16; i++) {
+    if (i < gradient.num_stops) {
+      color = mix(color, gradient.stop_colors[i], smoothstep(stop_position(i - 1), stop_position(i), t));
     }
-    let corrected_color = pow(color.rgb, vec3<f32>(uniforms.gamma));
-    return vec4<f32>(corrected_color, color.a);
+  }
+  return color;
+}
+
+void main() {
+  float t = 0.0;
+  if (gradient.function == LINEAR || gradient.function == REPEATING_LINEAR) {
+    float dist_square = dot(gradient.v, gradient.v);
+    vec2 vv = v_uv - gradient.p;
+    t = dot(gradient.v, vv) / dist_square;
+  } else if (gradient.function == RADIAL || gradient.function == REPEATING_RADIAL) {
+    vec2 vv = v_uv - gradient.p;
+    t = length(gradient.v * vv);
+  } else if (gradient.function == CONIC || gradient.function == REPEATING_CONIC) {
+    vec2 vv = v_uv - gradient.p;
+    vec2 rotated = vec2(gradient.v.x * vv.x + gradient.v.y * vv.y,
+                        -gradient.v.y * vv.x + gradient.v.x * vv.y);
+    t = 0.5 + atan(-rotated.x, rotated.y) / (2.0 * PI);
+  }
+  if (gradient.function == REPEATING_LINEAR ||
+      gradient.function == REPEATING_RADIAL ||
+      gradient.function == REPEATING_CONIC) {
+    float t0 = stop_position(0);
+    float t1 = stop_position(gradient.num_stops - 1);
+    float span = t1 - t0;
+    t = t0 + (t - t0) - span * floor((t - t0) / span);
+  }
+  vec4 color = v_color * stop_color_mix(t);
+  if (uniforms.gamma == 1.0) {
+    out_color = color;
+  } else {
+    vec3 corrected = pow(color.rgb, vec3(uniforms.gamma));
+    vec3 dithered = clamp(corrected + vec3(bayer_dither(gl_FragCoord.xy)), vec3(0.0), vec3(1.0));
+    out_color = vec4(dithered, color.a);
+  }
 }
 )"sv;
 
-constexpr std::string_view gradientFragmentSource = R"(
-struct VertexOutput {
-    @builtin(position) position: vec4<f32>,
-    @location(0) color: vec4<f32>,
-    @location(1) uv: vec2<f32>,
-};
+// Fullscreen-triangle vertex shader (gl_VertexID; no vertex buffer).
+constexpr std::string_view fullscreenVertexSource = R"(#version 300 es
+out vec2 v_uv;
+void main() {
+  const vec2 positions[3] = vec2[3](vec2(-1.0, 1.0), vec2(-1.0, -3.0), vec2(3.0, 1.0));
+  const vec2 uvs[3] = vec2[3](vec2(0.0, 0.0), vec2(0.0, 2.0), vec2(2.0, 0.0));
+  gl_Position = vec4(positions[gl_VertexID], 0.0, 1.0);
+  v_uv = uvs[gl_VertexID];
+}
+)"sv;
 
-struct Uniforms {
-    mvp: mat4x4<f32>,
-    translation: vec4<f32>,
-    gamma: f32,
-};
+// Blur/region fullscreen vertex shader: pre-computes seven tap UVs from the texel offset.
+constexpr std::string_view blurVertexSource = R"(#version 300 es
+layout(std140) uniform BlurUniforms {
+  vec2 texel_offset;
+  float radius;
+  float padding;
+  vec2 tex_coord_min;
+  vec2 tex_coord_max;
+  vec4 weights;
+} blur;
+out vec2 v_uv0;
+out vec2 v_uv1;
+out vec2 v_uv2;
+out vec2 v_uv3;
+out vec2 v_uv4;
+out vec2 v_uv5;
+out vec2 v_uv6;
+const int BLUR_NUM_WEIGHTS = 4;
+vec2 blur_uv(vec2 uv, int index) {
+  return uv - float(index - BLUR_NUM_WEIGHTS + 1) * blur.texel_offset;
+}
+void main() {
+  const vec2 positions[3] = vec2[3](vec2(-1.0, 1.0), vec2(-1.0, -3.0), vec2(3.0, 1.0));
+  const vec2 uvs[3] = vec2[3](vec2(0.0, 0.0), vec2(0.0, 2.0), vec2(2.0, 0.0));
+  vec2 uv = uvs[gl_VertexID];
+  gl_Position = vec4(positions[gl_VertexID], 0.0, 1.0);
+  v_uv0 = blur_uv(uv, 0);
+  v_uv1 = blur_uv(uv, 1);
+  v_uv2 = blur_uv(uv, 2);
+  v_uv3 = blur_uv(uv, 3);
+  v_uv4 = blur_uv(uv, 4);
+  v_uv5 = blur_uv(uv, 5);
+  v_uv6 = blur_uv(uv, 6);
+}
+)"sv;
 
-struct GradientUniforms {
-    function: i32,
-    num_stops: i32,
-    p: vec2<f32>,
-    v: vec2<f32>,
-    padding: vec2<f32>,
-    stop_colors: array<vec4<f32>, 16>,
-    stop_positions: array<vec4<f32>, 4>,
-};
+constexpr std::string_view blitFragmentSource = R"(#version 300 es
+precision highp float;
+uniform sampler2D t;
+in vec2 v_uv;
+out vec4 out_color;
+void main() { out_color = texture(t, v_uv); }
+)"sv;
 
-@group(0) @binding(0) var<uniform> uniforms: Uniforms;
-@group(1) @binding(0) var<uniform> gradient: GradientUniforms;
+constexpr std::string_view opaqueBlitFragmentSource = R"(#version 300 es
+precision highp float;
+uniform sampler2D t;
+in vec2 v_uv;
+out vec4 out_color;
+void main() { out_color = vec4(texture(t, v_uv).rgb, 1.0); }
+)"sv;
 
-const LINEAR: i32 = 0;
-const RADIAL: i32 = 1;
-const CONIC: i32 = 2;
-const REPEATING_LINEAR: i32 = 3;
-const REPEATING_RADIAL: i32 = 4;
-const REPEATING_CONIC: i32 = 5;
-const PI: f32 = 3.14159265;
+constexpr std::string_view seedResampleFragmentSource = R"(#version 300 es
+precision highp float;
+precision highp int;
+uniform sampler2D t;
+layout(std140) uniform SeedUniforms {
+  uint sampler_mode;
+  float frame_width;
+  float frame_height;
+  uint pad;
+} seed;
+in vec2 v_uv;
+out vec4 out_color;
 
-fn bayer_dither(position: vec4<f32>) -> f32 {
-    let bayer = array<u32, 64>(
-        0u, 32u, 8u, 40u, 2u, 34u, 10u, 42u,
-        48u, 16u, 56u, 24u, 50u, 18u, 58u, 26u,
-        12u, 44u, 4u, 36u, 14u, 46u, 6u, 38u,
-        60u, 28u, 52u, 20u, 62u, 30u, 54u, 22u,
-        3u, 35u, 11u, 43u, 1u, 33u, 9u, 41u,
-        51u, 19u, 59u, 27u, 49u, 17u, 57u, 25u,
-        15u, 47u, 7u, 39u, 13u, 45u, 5u, 37u,
-        63u, 31u, 55u, 23u, 61u, 29u, 53u, 21u
-    );
-    let x = u32(position.x) % 8u;
-    let y = u32(position.y) % 8u;
-    return (f32(bayer[x + y * 8u]) / 64.0 - 0.5) / 255.0;
+vec4 sample_by_pixel(ivec2 pixel) {
+  ivec2 source_dims = textureSize(t, 0);
+  ivec2 max_coord = source_dims - ivec2(1, 1);
+  ivec2 coord = clamp(pixel, ivec2(0, 0), max_coord);
+  return texelFetch(t, coord, 0);
 }
 
-fn stop_position(index: i32) -> f32 {
-    let stop_index = u32(index);
-    let group_index = stop_index / 4u;
-    let component_index = stop_index % 4u;
-    return gradient.stop_positions[group_index][component_index];
-}
-
-fn stop_color_mix(t: f32) -> vec4<f32> {
-    var color = gradient.stop_colors[0];
-
-    for (var i = 1; i < 16; i = i + 1) {
-        if (i < gradient.num_stops) {
-            color = mix(color, gradient.stop_colors[u32(i)], smoothstep(stop_position(i - 1), stop_position(i), t));
+vec4 sample_area(vec2 frag_position) {
+  vec2 source_size = vec2(textureSize(t, 0));
+  vec2 target_size = max(vec2(seed.frame_width, seed.frame_height), vec2(1.0, 1.0));
+  vec2 source_min = clamp((frag_position - vec2(0.5, 0.5)) / target_size, vec2(0.0), vec2(1.0)) * source_size;
+  vec2 source_max = clamp((frag_position + vec2(0.5, 0.5)) / target_size, vec2(0.0), vec2(1.0)) * source_size;
+  ivec2 first_pixel = ivec2(floor(source_min));
+  ivec2 last_pixel = ivec2(ceil(source_max));
+  const int max_iterations = 16;
+  vec4 avg_color = vec4(0.0);
+  float total_weight = 0.0;
+  for (int iy = 0; iy < max_iterations; iy++) {
+    int source_y = first_pixel.y + iy;
+    if (source_y < last_pixel.y) {
+      float y0 = float(source_y);
+      float weight_y = max(min(source_max.y, y0 + 1.0) - max(source_min.y, y0), 0.0);
+      for (int ix = 0; ix < max_iterations; ix++) {
+        int source_x = first_pixel.x + ix;
+        if (source_x < last_pixel.x) {
+          float x0 = float(source_x);
+          float weight_x = max(min(source_max.x, x0 + 1.0) - max(source_min.x, x0), 0.0);
+          float weight = weight_x * weight_y;
+          avg_color += weight * sample_by_pixel(ivec2(source_x, source_y));
+          total_weight += weight;
         }
+      }
     }
-
-    return color;
+  }
+  return avg_color / max(total_weight, 0.000001);
 }
 
-@fragment
-fn main(in: VertexOutput) -> @location(0) vec4<f32> {
-    var t = 0.0;
-
-    if (gradient.function == LINEAR || gradient.function == REPEATING_LINEAR) {
-        let dist_square = dot(gradient.v, gradient.v);
-        let v = in.uv - gradient.p;
-        t = dot(gradient.v, v) / dist_square;
-    } else if (gradient.function == RADIAL || gradient.function == REPEATING_RADIAL) {
-        let v = in.uv - gradient.p;
-        t = length(gradient.v * v);
-    } else if (gradient.function == CONIC || gradient.function == REPEATING_CONIC) {
-        let v = in.uv - gradient.p;
-        let rotated = vec2<f32>(
-            gradient.v.x * v.x + gradient.v.y * v.y,
-            -gradient.v.y * v.x + gradient.v.x * v.y
-        );
-        t = 0.5 + atan2(-rotated.x, rotated.y) / (2.0 * PI);
-    }
-
-    if (gradient.function == REPEATING_LINEAR ||
-        gradient.function == REPEATING_RADIAL ||
-        gradient.function == REPEATING_CONIC) {
-        let t0 = stop_position(0);
-        let t1 = stop_position(gradient.num_stops - 1);
-        let span = t1 - t0;
-        t = t0 + (t - t0) - span * floor((t - t0) / span);
-    }
-
-    let color = in.color * stop_color_mix(t);
-    if (uniforms.gamma == 1.0) {
-        return color;
-    }
-    let corrected_color = pow(color.rgb, vec3<f32>(uniforms.gamma));
-    let dithered_color = clamp(corrected_color + vec3<f32>(bayer_dither(in.position)), vec3<f32>(0.0), vec3<f32>(1.0));
-    return vec4<f32>(dithered_color, color.a);
+void main() {
+  vec4 color = texture(t, v_uv);
+  if (seed.sampler_mode == 1u) {
+    color = sample_area(gl_FragCoord.xy);
+  }
+  out_color = vec4(color.rgb, 1.0);
 }
 )"sv;
 
-constexpr std::string_view fullscreenVertexSource = R"(
-struct VertexOutput {
-    @builtin(position) position: vec4<f32>,
-    @location(0) uv: vec2<f32>,
-};
-
-var<private> pos: array<vec2<f32>, 3> = array<vec2<f32>, 3>(
-    vec2(-1.0, 1.0),
-    vec2(-1.0, -3.0),
-    vec2(3.0, 1.0),
-);
-var<private> uvs: array<vec2<f32>, 3> = array<vec2<f32>, 3>(
-    vec2(0.0, 0.0),
-    vec2(0.0, 2.0),
-    vec2(2.0, 0.0),
-);
-
-@vertex
-fn main(@builtin(vertex_index) vtxIdx: u32) -> VertexOutput {
-    var out: VertexOutput;
-    out.position = vec4<f32>(pos[vtxIdx], 0.0, 1.0);
-    out.uv = uvs[vtxIdx];
-    return out;
+constexpr std::string_view simpleFilterFragmentSource = R"(#version 300 es
+precision highp float;
+uniform sampler2D t;
+layout(std140) uniform SimpleFilterUniforms {
+  mat4 matrix;
+  vec4 opacity;
+} simple_filter;
+in vec2 v_uv;
+out vec4 out_color;
+void main() {
+  vec4 tex_color = texture(t, v_uv);
+  vec4 transformed = simple_filter.matrix * tex_color;
+  out_color = vec4(transformed.rgb, tex_color.a) * simple_filter.opacity.x;
 }
 )"sv;
 
-constexpr std::string_view blurVertexSource = R"(
-struct BlurUniforms {
-    texel_offset: vec2<f32>,
-    radius: f32,
-    padding: f32,
-    tex_coord_min: vec2<f32>,
-    tex_coord_max: vec2<f32>,
-    weights: vec4<f32>,
-};
-
-struct VertexOutput {
-    @builtin(position) position: vec4<f32>,
-    @location(0) uv0: vec2<f32>,
-    @location(1) uv1: vec2<f32>,
-    @location(2) uv2: vec2<f32>,
-    @location(3) uv3: vec2<f32>,
-    @location(4) uv4: vec2<f32>,
-    @location(5) uv5: vec2<f32>,
-    @location(6) uv6: vec2<f32>,
-};
-
-@group(2) @binding(0) var<uniform> blur: BlurUniforms;
-
-const BLUR_NUM_WEIGHTS: i32 = 4;
-
-var<private> pos: array<vec2<f32>, 3> = array<vec2<f32>, 3>(
-    vec2(-1.0, 1.0),
-    vec2(-1.0, -3.0),
-    vec2(3.0, 1.0),
-);
-var<private> uvs: array<vec2<f32>, 3> = array<vec2<f32>, 3>(
-    vec2(0.0, 0.0),
-    vec2(0.0, 2.0),
-    vec2(2.0, 0.0),
-);
-
-fn blur_uv(uv: vec2<f32>, index: i32) -> vec2<f32> {
-    return uv - f32(index - BLUR_NUM_WEIGHTS + 1) * blur.texel_offset;
-}
-
-@vertex
-fn main(@builtin(vertex_index) vtxIdx: u32) -> VertexOutput {
-    let uv = uvs[vtxIdx];
-    var out: VertexOutput;
-    out.position = vec4<f32>(pos[vtxIdx], 0.0, 1.0);
-    out.uv0 = blur_uv(uv, 0);
-    out.uv1 = blur_uv(uv, 1);
-    out.uv2 = blur_uv(uv, 2);
-    out.uv3 = blur_uv(uv, 3);
-    out.uv4 = blur_uv(uv, 4);
-    out.uv5 = blur_uv(uv, 5);
-    out.uv6 = blur_uv(uv, 6);
-    return out;
+constexpr std::string_view maskImageFragmentSource = R"(#version 300 es
+precision highp float;
+uniform sampler2D t;
+uniform sampler2D mask_t;
+in vec2 v_uv;
+out vec4 out_color;
+void main() {
+  vec4 tex_color = texture(t, v_uv);
+  float mask_alpha = texture(mask_t, v_uv).a;
+  out_color = tex_color * mask_alpha;
 }
 )"sv;
 
-constexpr std::string_view blitFragmentSource = R"(
-@group(0) @binding(1) var s: sampler;
-@group(1) @binding(0) var t: texture_2d<f32>;
-
-@fragment
-fn main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
-    return textureSample(t, s, uv);
+constexpr std::string_view blurFragmentSource = R"(#version 300 es
+precision highp float;
+precision highp int;
+uniform sampler2D t;
+layout(std140) uniform BlurUniforms {
+  vec2 texel_offset;
+  float radius;
+  float padding;
+  vec2 tex_coord_min;
+  vec2 tex_coord_max;
+  vec4 weights;
+} blur;
+in vec2 v_uv0;
+in vec2 v_uv1;
+in vec2 v_uv2;
+in vec2 v_uv3;
+in vec2 v_uv4;
+in vec2 v_uv5;
+in vec2 v_uv6;
+out vec4 out_color;
+float get_weight(int index) { return blur.weights[abs(index)]; }
+vec4 sample_blur(vec2 sample_uv, int offset_index) {
+  vec2 in_region = step(blur.tex_coord_min, sample_uv) * step(sample_uv, blur.tex_coord_max);
+  return texture(t, sample_uv) * get_weight(offset_index) * in_region.x * in_region.y;
+}
+void main() {
+  vec4 color = sample_blur(v_uv0, -3);
+  color += sample_blur(v_uv1, -2);
+  color += sample_blur(v_uv2, -1);
+  color += sample_blur(v_uv3, 0);
+  color += sample_blur(v_uv4, 1);
+  color += sample_blur(v_uv5, 2);
+  color += sample_blur(v_uv6, 3);
+  out_color = color;
 }
 )"sv;
 
-constexpr std::string_view opaqueBlitFragmentSource = R"(
-@group(0) @binding(1) var s: sampler;
-@group(1) @binding(0) var t: texture_2d<f32>;
-
-@fragment
-fn main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
-    let color = textureSample(t, s, uv);
-    return vec4<f32>(color.rgb, 1.0);
+constexpr std::string_view regionBlitFragmentSource = R"(#version 300 es
+precision highp float;
+uniform sampler2D t;
+layout(std140) uniform BlurUniforms {
+  vec2 texel_offset;
+  float radius;
+  float padding;
+  vec2 tex_coord_min;
+  vec2 tex_coord_max;
+  vec4 weights;
+} blur;
+in vec2 v_uv;
+out vec4 out_color;
+void main() {
+  vec2 sample_uv = mix(blur.tex_coord_min, blur.tex_coord_max, v_uv);
+  out_color = texture(t, sample_uv);
 }
 )"sv;
 
-constexpr std::string_view seedResampleFragmentSource = R"(
-struct SeedUniforms {
-    sampler_mode: u32,
-    frame_width: f32,
-    frame_height: f32,
-    pad: u32,
-};
-
-@group(0) @binding(1) var s: sampler;
-@group(1) @binding(0) var t: texture_2d<f32>;
-@group(2) @binding(0) var<uniform> uniforms: SeedUniforms;
-
-fn sample_by_pixel(pixel: vec2<i32>) -> vec4<f32> {
-    let source_dims = textureDimensions(t);
-    let max_coord = vec2<i32>(source_dims) - vec2<i32>(1, 1);
-    let coord = clamp(pixel, vec2<i32>(0, 0), max_coord);
-    return textureLoad(t, coord, 0);
-}
-
-fn sample_area(frag_position: vec4<f32>) -> vec4<f32> {
-    let source_size = vec2<f32>(textureDimensions(t));
-    let target_size = max(vec2<f32>(uniforms.frame_width, uniforms.frame_height), vec2<f32>(1.0, 1.0));
-
-    let source_min = clamp((frag_position.xy - vec2<f32>(0.5, 0.5)) / target_size,
-                           vec2<f32>(0.0, 0.0), vec2<f32>(1.0, 1.0)) * source_size;
-    let source_max = clamp((frag_position.xy + vec2<f32>(0.5, 0.5)) / target_size,
-                           vec2<f32>(0.0, 0.0), vec2<f32>(1.0, 1.0)) * source_size;
-
-    let first_pixel = vec2<i32>(floor(source_min));
-    let last_pixel = vec2<i32>(ceil(source_max));
-    let max_iterations: i32 = 16;
-
-    var avg_color = vec4<f32>(0.0, 0.0, 0.0, 0.0);
-    var total_weight = 0.0;
-
-    for (var iy: i32 = 0; iy < max_iterations; iy = iy + 1) {
-        let source_y = first_pixel.y + iy;
-        if (source_y < last_pixel.y) {
-            let y0 = f32(source_y);
-            let weight_y = max(min(source_max.y, y0 + 1.0) - max(source_min.y, y0), 0.0);
-
-            for (var ix: i32 = 0; ix < max_iterations; ix = ix + 1) {
-                let source_x = first_pixel.x + ix;
-                if (source_x < last_pixel.x) {
-                    let x0 = f32(source_x);
-                    let weight_x = max(min(source_max.x, x0 + 1.0) - max(source_min.x, x0), 0.0);
-                    let weight = weight_x * weight_y;
-                    avg_color += weight * sample_by_pixel(vec2<i32>(source_x, source_y));
-                    total_weight += weight;
-                }
-            }
-        }
-    }
-
-    return avg_color / max(total_weight, 0.000001);
-}
-
-@fragment
-fn main(@builtin(position) position: vec4<f32>, @location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
-    var color = textureSample(t, s, uv);
-    if (uniforms.sampler_mode == 1u) {
-        color = sample_area(position);
-    }
-    return vec4(color.rgb, 1.0);
+constexpr std::string_view dropShadowFragmentSource = R"(#version 300 es
+precision highp float;
+uniform sampler2D t;
+layout(std140) uniform DropShadowUniforms {
+  vec4 color;
+  vec2 uv_offset;
+  vec2 tex_coord_min;
+  vec2 tex_coord_max;
+} shadow;
+in vec2 v_uv;
+out vec4 out_color;
+void main() {
+  vec2 sample_uv = v_uv - shadow.uv_offset;
+  vec2 in_region = step(shadow.tex_coord_min, sample_uv) * step(sample_uv, shadow.tex_coord_max);
+  float alpha = texture(t, sample_uv).a * in_region.x * in_region.y;
+  out_color = shadow.color * alpha;
 }
 )"sv;
 
-constexpr std::string_view simpleFilterFragmentSource = R"(
-struct SimpleFilterUniforms {
-    matrix: mat4x4<f32>,
-    opacity: vec4<f32>,
-};
-
-@group(0) @binding(1) var s: sampler;
-@group(1) @binding(0) var t: texture_2d<f32>;
-@group(2) @binding(0) var<uniform> simple_filter: SimpleFilterUniforms;
-
-@fragment
-fn main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
-    let tex_color = textureSample(t, s, uv);
-    let transformed_color = simple_filter.matrix * tex_color;
-    return vec4<f32>(transformed_color.rgb, tex_color.a) * simple_filter.opacity.x;
-}
-)"sv;
-
-constexpr std::string_view maskImageFragmentSource = R"(
-@group(0) @binding(1) var s: sampler;
-@group(1) @binding(0) var t: texture_2d<f32>;
-@group(2) @binding(0) var mask_t: texture_2d<f32>;
-
-@fragment
-fn main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
-    let tex_color = textureSample(t, s, uv);
-    let mask_alpha = textureSample(mask_t, s, uv).a;
-    return tex_color * mask_alpha;
-}
-)"sv;
-
-constexpr std::string_view blurFragmentSource = R"(
-struct BlurUniforms {
-    texel_offset: vec2<f32>,
-    radius: f32,
-    padding: f32,
-    tex_coord_min: vec2<f32>,
-    tex_coord_max: vec2<f32>,
-    weights: vec4<f32>,
-};
-
-@group(0) @binding(1) var s: sampler;
-@group(1) @binding(0) var t: texture_2d<f32>;
-@group(2) @binding(0) var<uniform> blur: BlurUniforms;
-
-fn get_weight(index: i32) -> f32 {
-    return blur.weights[u32(abs(index))];
-}
-
-fn sample_blur(sample_uv: vec2<f32>, offset_index: i32) -> vec4<f32> {
-    let in_region = step(blur.tex_coord_min, sample_uv) * step(sample_uv, blur.tex_coord_max);
-    return textureSample(t, s, sample_uv) * get_weight(offset_index) * in_region.x * in_region.y;
-}
-
-@fragment
-fn main(@location(0) uv0: vec2<f32>, @location(1) uv1: vec2<f32>, @location(2) uv2: vec2<f32>,
-        @location(3) uv3: vec2<f32>, @location(4) uv4: vec2<f32>, @location(5) uv5: vec2<f32>,
-        @location(6) uv6: vec2<f32>) -> @location(0) vec4<f32> {
-    var color = sample_blur(uv0, -3);
-    color += sample_blur(uv1, -2);
-    color += sample_blur(uv2, -1);
-    color += sample_blur(uv3, 0);
-    color += sample_blur(uv4, 1);
-    color += sample_blur(uv5, 2);
-    color += sample_blur(uv6, 3);
-    return color;
-}
-)"sv;
-
-constexpr std::string_view regionBlitFragmentSource = R"(
-struct BlurUniforms {
-    texel_offset: vec2<f32>,
-    radius: f32,
-    padding: f32,
-    tex_coord_min: vec2<f32>,
-    tex_coord_max: vec2<f32>,
-    weights: vec4<f32>,
-};
-
-@group(0) @binding(1) var s: sampler;
-@group(1) @binding(0) var t: texture_2d<f32>;
-@group(2) @binding(0) var<uniform> blur: BlurUniforms;
-
-@fragment
-fn main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
-    let sample_uv = mix(blur.tex_coord_min, blur.tex_coord_max, uv);
-    return textureSample(t, s, sample_uv);
-}
-)"sv;
-
-constexpr std::string_view dropShadowFragmentSource = R"(
-struct DropShadowUniforms {
-    color: vec4<f32>,
-    uv_offset: vec2<f32>,
-    tex_coord_min: vec2<f32>,
-    tex_coord_max: vec2<f32>,
-};
-
-@group(0) @binding(1) var s: sampler;
-@group(1) @binding(0) var t: texture_2d<f32>;
-@group(2) @binding(0) var<uniform> shadow: DropShadowUniforms;
-
-@fragment
-fn main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
-    let sample_uv = uv - shadow.uv_offset;
-    let in_region = step(shadow.tex_coord_min, sample_uv) * step(sample_uv, shadow.tex_coord_max);
-    let alpha = textureSample(t, s, sample_uv).a * in_region.x * in_region.y;
-    return shadow.color * alpha;
-}
-)"sv;
-
-// compile_shader / blend_state / create_pipeline_layout removed: WGSL module
-// compilation is Phase 3, and WebGPU BlendState / PipelineLayout descriptors have no
-// GL analogue (blend is baked into gl::BakedState in create_pipeline() below; GL has
-// no pipeline-layout object -- it binds by unit/block index at draw time).
-
-const std::string_view fragment_source(PipelineKind kind) {
+std::string_view fragment_source(PipelineKind kind) {
   switch (kind) {
   case PipelineKind::Geometry:
     return fragmentSource;
@@ -509,7 +446,7 @@ const std::string_view fragment_source(PipelineKind kind) {
   }
 }
 
-const std::string_view vertex_source(VertexLayoutKind kind) {
+std::string_view vertex_source(VertexLayoutKind kind) {
   switch (kind) {
   case VertexLayoutKind::Geometry:
     return vertexSource;
@@ -519,6 +456,44 @@ const std::string_view vertex_source(VertexLayoutKind kind) {
   default:
     return fullscreenVertexSource;
   }
+}
+
+// Compile + link the GLSL pair and wire fixed bindings: the `Uniforms` block -> point 0,
+// any per-effect block -> point 1, the `t`/`mask_t` samplers -> units 0/1. Runs on a
+// GL-context thread (the pipeline compiler share context or the render worker), so it
+// issues GL directly (no marshal), matching gx::create_pipeline and tex_copy_conv.
+gl::GLuint compile_rml_program(VertexLayoutKind vertexLayout, PipelineKind kind, const char* label) {
+  const std::string vs{vertex_source(vertexLayout)};
+  const std::string fs{fragment_source(kind)};
+  const gl::GLuint program = gl::compile_program(vs.c_str(), fs.c_str(), label);
+  if (program == 0) {
+    return 0;
+  }
+  const gl::GLuint commonIndex = gl::gl.GetUniformBlockIndex(program, "Uniforms");
+  if (commonIndex != kInvalidBlockIndex) {
+    gl::gl.UniformBlockBinding(program, commonIndex, kCommonBlockBinding);
+  }
+  for (const char* name :
+       {"GradientUniforms", "BlurUniforms", "SeedUniforms", "SimpleFilterUniforms", "DropShadowUniforms"}) {
+    const gl::GLuint index = gl::gl.GetUniformBlockIndex(program, name);
+    if (index != kInvalidBlockIndex) {
+      gl::gl.UniformBlockBinding(program, index, kExtraBlockBinding);
+    }
+  }
+  gl::gl.UseProgram(program);
+  const gl::GLint imageLoc = gl::gl.GetUniformLocation(program, "t");
+  if (imageLoc >= 0) {
+    gl::gl.Uniform1i(imageLoc, kImageTextureUnit);
+  }
+  const gl::GLint maskLoc = gl::gl.GetUniformLocation(program, "mask_t");
+  if (maskLoc >= 0) {
+    gl::gl.Uniform1i(maskLoc, kMaskTextureUnit);
+  }
+  gl::gl.UseProgram(0);
+  // A program linked on the compiler share context must be flushed to be visible on the
+  // render worker's context.
+  gl::gl.Flush();
+  return program;
 }
 
 } // namespace
@@ -545,10 +520,21 @@ void shutdown_pipeline() {
 
 gfx::BindGroupRef texture_bind_group_ref(const gl::Texture& view) {
   gl::BindingSet set{};
-  set.textures[0].texture = view.id;
+  set.textures[kImageTextureUnit].texture = view.id;
   // The common filtering sampler pairs with the image texture on GL (WebGPU kept the
   // sampler in group 0; GL binds texture+sampler together at the unit).
-  set.textures[0].sampler = g_sampler.id;
+  set.textures[kImageTextureUnit].sampler = g_sampler.id;
+  return gfx::bind_group_ref(set);
+}
+
+gfx::BindGroupRef mask_bind_group_ref(const gl::Texture& imageView, const gl::Texture& maskView) {
+  // maskImage samples two textures in one draw: `t` at unit 0 and `mask_t` at unit 1.
+  // A single bind group carries both so the second SetBindGroup does not clobber unit 0.
+  gl::BindingSet set{};
+  set.textures[kImageTextureUnit].texture = imageView.id;
+  set.textures[kImageTextureUnit].sampler = g_sampler.id;
+  set.textures[kMaskTextureUnit].texture = maskView.id;
+  set.textures[kMaskTextureUnit].sampler = g_sampler.id;
   return gfx::bind_group_ref(set);
 }
 
@@ -556,7 +542,7 @@ gfx::BindGroupRef common_bind_group_ref() {
   gl::BindingSet set{};
   set.buffers[0] = gl::BindingSet::BufferBinding{
       .buffer = gfx::g_uniformBuffer.id,
-      .binding = 0,
+      .binding = kCommonBlockBinding,
       .offset = 0,
       .size = static_cast<uint32_t>(CommonUniformBindingSize),
       .dynamic = true,
@@ -569,7 +555,7 @@ gfx::BindGroupRef uniform_bind_group_ref() {
   gl::BindingSet set{};
   set.buffers[0] = gl::BindingSet::BufferBinding{
       .buffer = gfx::g_uniformBuffer.id,
-      .binding = 0,
+      .binding = kExtraBlockBinding,
       .offset = 0,
       .size = static_cast<uint32_t>(ExtraUniformBindingSize),
       .dynamic = true,
@@ -585,11 +571,8 @@ gl::Pipeline create_pipeline(const PipelineConfig& config) {
   const auto stencilMode = static_cast<StencilMode>(config.stencilMode);
   const auto blendMode = static_cast<BlendMode>(config.blendMode);
 
-  // Phase 3: translate these WGSL sources to GLSL, then compile + link a GL program.
-  // Phase 1 keeps the source-selection wiring but produces no program; a zero program
-  // makes gfx::bind_pipeline early-out (gl::Pipeline::operator bool == program != 0).
-  (void)vertex_source(vertexLayoutKind);
-  (void)fragment_source(kind);
+  const std::string label = fmt::format("RmlUi Pipeline kind {} vtx {}", config.kind, config.vertexLayout);
+  const gl::GLuint program = compile_rml_program(vertexLayoutKind, kind, label.c_str());
 
   // Bake the fixed-function state from the backend-agnostic config. Blend and stencil
   // config survive the cutover; the colour/stencil formats and MSAA sample count are
@@ -616,28 +599,41 @@ gl::Pipeline create_pipeline(const PipelineConfig& config) {
 
   if (stencilMode != StencilMode::None) {
     state.stencilTest = true;
+    // failOp / depthFailOp are always Keep; only the compare and passOp vary by mode,
+    // mirroring the WebGPU StencilFaceState the Dawn path used.
+    state.stencilFail = gl::GL_KEEP;
+    state.stencilDepthFail = gl::GL_KEEP;
     switch (stencilMode) {
     case StencilMode::EqualKeep:
+      state.stencilCompare = gl::CompareFunction::Equal;
+      state.stencilPass = gl::GL_KEEP;
+      break;
     case StencilMode::ClipIntersect:
       state.stencilCompare = gl::CompareFunction::Equal;
+      state.stencilPass = gl::GL_INCR; // IncrementClamp
       break;
     case StencilMode::ClipReplace:
+      state.stencilCompare = gl::CompareFunction::Always;
+      state.stencilPass = gl::GL_REPLACE;
+      break;
     case StencilMode::AlwaysKeep:
     case StencilMode::None:
     default:
       state.stencilCompare = gl::CompareFunction::Always;
+      state.stencilPass = gl::GL_KEEP;
       break;
     }
     state.stencilReadMask = 0xFF;
     state.stencilWriteMask = 0xFF;
-    // Phase 5: translate the wgpu StencilOperation (Keep/Replace/IncrementClamp per
-    // StencilMode) into the raw GL enums for stencilFail/stencilDepthFail/stencilPass.
   }
 
   gl::Pipeline pipeline{};
-  pipeline.program = 0;                      // Phase 3: compiled+linked GL program
+  pipeline.program = program;
   pipeline.state = state;
-  pipeline.vertexLayout = config.vertexLayout; // Phase 3: index into the VAO-layout cache
+  // Geometry draws feed an interleaved Rml::Vertex buffer (its own VAO); fullscreen and
+  // blur pipelines are attribute-less (gl_VertexID), so they use vertexLayout 0.
+  pipeline.vertexLayout =
+      vertexLayoutKind == VertexLayoutKind::Geometry ? gl::kRmlGeometryVertexLayout : 0u;
   return pipeline;
 }
 

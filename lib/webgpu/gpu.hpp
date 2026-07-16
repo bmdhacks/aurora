@@ -84,10 +84,18 @@ void set_resampler(AuroraSampler sampler) noexcept;
 AuroraSampler get_resampler() noexcept;
 Viewport calculate_present_viewport(uint32_t surface_width, uint32_t surface_height, uint32_t content_width,
                                     uint32_t content_height) noexcept;
-// Present the finished frame. Runs on the render worker (owns the GL context).
+// Present the finished frame's scene. Runs on the render worker (owns the GL context).
 // Binds the default framebuffer, clears to black (letterbox bars) and blits the finished
-// EFB into the centered content rect, then swaps. Device EFB present is Phase 6.
+// EFB into the centered content rect. Does NOT swap -- the caller composites the RmlUi
+// overlay + imgui on top, then calls present_swap(). Device EFB present is Phase 6.
 void present_frame() noexcept;
+// Composite a UI overlay texture over the just-presented scene, into the same centered content
+// rect. overlay=true blends it premultiplied (UI over scene); overlay=false draws it opaque
+// (the UI already seeded the scene as its backdrop). Runs on the render worker.
+void composite_ui_overlay(const gl::Texture& texture, const gl::Sampler& sampler, bool overlay) noexcept;
+// Drop the state-cache shadow (present/composite/imgui all issued out-of-band GL) and swap the
+// window's back buffer. Runs on the render worker, after all overlays are composited.
+void present_swap() noexcept;
 // Read the window's default-framebuffer back buffer and write it as a binary PPM (the
 // desktop A/B screenshot tool). Must run on the render worker before the swap. Phase 5
 // wires it to an F12 key / console command.

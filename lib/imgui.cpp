@@ -13,13 +13,18 @@
 
 #include "internal.hpp"
 #include "gfx/render_worker.hpp"
+#include "gl/gl_core.hpp"
 #include "gl/pass.hpp"
+#include "gl/state.hpp"
+#include "gl/textures.hpp"
 #include "webgpu/gpu.hpp"
 #include "window.hpp"
 
-// Phase 5 wires the real GLES imgui backend (imgui_impl_opengl3 with a
-// "#version 300 es" init string). Phase 1 keeps only the SDL_Renderer path live;
-// the non-SDL-renderer branch is a no-op so the tree builds and boots.
+// The GLES imgui backend is imgui_impl_opengl3 driven with a "#version 300 es" init
+// string. Its GL objects live on the render worker's context, so init/shutdown/render
+// and user-texture uploads are all marshaled there. The SDL_Renderer path stays for the
+// headless/NULL backend (no GL context).
+#include "backends/imgui_impl_opengl3.h"
 #include "backends/imgui_impl_sdl3.h"
 #include "backends/imgui_impl_sdlrenderer3.h"
 #include "tracy/Tracy.hpp"
@@ -56,17 +61,15 @@ void initialize() noexcept {
   if (g_useSdlRenderer) {
     ImGui_ImplSDLRenderer3_Init(renderer);
   } else {
-    // Phase 5: ImGui_ImplOpenGL3_Init("#version 300 es") on the render worker.
-    // Until then no GL imgui backend renders, but ImGui::NewFrame() asserts unless
-    // the font atlas is built and a renderer backend is registered. Build a CPU
-    // atlas and register a null backend name so new_frame()/freeze() run harmlessly
-    // (our render() drops the draw data). Phase 5 replaces this with the real init.
-    ImGuiIO& io = ImGui::GetIO();
-    io.BackendRendererName = "aurora_gl_phase1_stub";
-    unsigned char* pixels = nullptr;
-    int atlasWidth = 0;
-    int atlasHeight = 0;
-    io.Fonts->GetTexDataAsRGBA32(&pixels, &atlasWidth, &atlasHeight); // forces Fonts->Build()
+    // The imgui GL objects (shaders + font atlas texture) must be created on the render
+    // worker's context, so init there and force device-object creation (NewFrame lazily
+    // builds them) before the first real frame renders on the worker.
+    gfx::render_worker::enqueue_work([] {
+      ImGui_ImplOpenGL3_Init("#version 300 es");
+      ImGui_ImplOpenGL3_NewFrame();
+      gl::invalidate_texture_bindings();
+    });
+    gfx::render_worker::synchronize();
   }
 }
 
@@ -75,7 +78,8 @@ void shutdown() noexcept {
   if (g_useSdlRenderer) {
     ImGui_ImplSDLRenderer3_Shutdown();
   } else {
-    // Phase 5: ImGui_ImplOpenGL3_Shutdown().
+    gfx::render_worker::enqueue_work([] { ImGui_ImplOpenGL3_Shutdown(); });
+    gfx::render_worker::synchronize();
   }
   ImGui_ImplSDL3_Shutdown();
   ImGui::DestroyContext();
@@ -149,7 +153,10 @@ void new_frame(const AuroraWindowSize& size) noexcept {
     ImGui_ImplSDLRenderer3_NewFrame();
     g_scale = size.scale;
   } else {
-    // Phase 5: rebuild font/device objects on scale change + ImGui_ImplOpenGL3_NewFrame().
+    // Device objects were created on the worker at init; once they exist NewFrame issues no
+    // GL, so it is safe to call from the main thread here (it only rebuilds the font atlas if
+    // it was invalidated, which the static UI never does).
+    ImGui_ImplOpenGL3_NewFrame();
     g_scale = size.scale;
   }
   ImGui_ImplSDL3_NewFrame();
@@ -193,9 +200,13 @@ void render(gl::PassEncoder& pass, const DrawData& drawData) noexcept {
     ImGui_ImplSDLRenderer3_RenderDrawData(data, renderer);
     SDL_RenderPresent(renderer);
   } else {
-    // Phase 5: pass.PushDebugGroup("Aurora: Dear Imgui");
-    //          ImGui_ImplOpenGL3_RenderDrawData(data); PopDebugGroup();
-    (void)pass;
+    // Runs on the render worker (end-frame callback). Draw over the bound framebuffer (the
+    // window's default framebuffer, on top of the presented scene + RmlUi overlay).
+    // ImGui_ImplOpenGL3_RenderDrawData sets its own viewport/program/blend from the draw data.
+    gl::gl.BindFramebuffer(gl::GL_FRAMEBUFFER, pass.target().fbo);
+    ImGui_ImplOpenGL3_RenderDrawData(data);
+    // imgui restored raw GL it does not track; drop the state-cache shadow.
+    gl::reset_state_cache();
   }
 }
 
@@ -207,13 +218,24 @@ ImTextureID add_texture(uint32_t width, uint32_t height, const uint8_t* data) no
     g_sdlTextures.push_back(texture);
     return reinterpret_cast<ImTextureID>(texture);
   }
-  // Phase 5: create a GL texture on the render worker (gl::create_texture RGBA8 +
-  // glTexSubImage2D upload) and return its GL name as the ImTextureID. Phase 1 has
-  // no imgui GL rendering, so no texture is created.
-  (void)width;
-  (void)height;
-  (void)data;
-  return ImTextureID{};
+  // Create + upload a GL texture on the render worker; imgui uses the GL texture name as the
+  // ImTextureID directly (ImGui_ImplOpenGL3 binds it with glBindTexture and sampler 0, so set
+  // linear filtering on the texture itself).
+  gl::Texture texture;
+  const gl::Extent3D size{width, height, 1};
+  gfx::render_worker::enqueue_work([&] {
+    texture = gl::create_texture(gl::TextureFormat::RGBA8Unorm, size, 1, /*renderable=*/false);
+    gl::gl.BindTexture(gl::GL_TEXTURE_2D, texture.id);
+    gl::gl.TexParameteri(gl::GL_TEXTURE_2D, gl::GL_TEXTURE_MIN_FILTER, gl::GL_LINEAR);
+    gl::gl.TexParameteri(gl::GL_TEXTURE_2D, gl::GL_TEXTURE_MAG_FILTER, gl::GL_LINEAR);
+    gl::gl.PixelStorei(gl::GL_UNPACK_ALIGNMENT, 4);
+    gl::gl.TexSubImage2D(gl::GL_TEXTURE_2D, 0, 0, 0, static_cast<gl::GLsizei>(width),
+                         static_cast<gl::GLsizei>(height), gl::GL_RGBA, gl::GL_UNSIGNED_BYTE, data);
+    gl::invalidate_texture_bindings();
+  });
+  gfx::render_worker::synchronize();
+  g_glTextures.push_back(texture);
+  return static_cast<ImTextureID>(texture.id);
 }
 } // namespace aurora::imgui
 

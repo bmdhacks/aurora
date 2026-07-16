@@ -80,10 +80,16 @@ struct BakedState {
   uint32_t stencilPass = 0;
 };
 
+// Sentinel `vertexLayout` value marking an RmlUi geometry pipeline (interleaved
+// Rml::Vertex: pos Float32x2, tex_coord Float32x2, colour Unorm8x4). GX layouts are
+// present-attr bitmasks over bits 0..20, so the top bit never collides; the draw path
+// (pass.cpp) binds the fixed RmlUi VAO instead of decoding a GX attr mask for it.
+inline constexpr uint32_t kRmlGeometryVertexLayout = 0x80000000u;
+
 struct Pipeline {
   GLuint program = 0;
   BakedState state{};
-  uint32_t vertexLayout = 0; // index/hash into the VAO-layout cache (Phase 3)
+  uint32_t vertexLayout = 0; // GX present-attr bitmask, kRmlGeometryVertexLayout, or 0 (attribute-less)
   explicit operator bool() const { return program != 0; }
 };
 

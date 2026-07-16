@@ -207,12 +207,13 @@ if (AURORA_ENABLE_GX)
     )
     target_include_directories(imgui PUBLIC ${imgui_SOURCE_DIR})
 
-    # Dawn WebGPU imgui backend removed. Phase 1 keeps only the SDL3 platform
-    # backend (input/timing); aurora's imgui.cpp no-ops rendering until Phase 5
-    # wires in imgui_impl_opengl3 (ES3).
+    # The Dawn WebGPU imgui backend is gone; the GLES backend renders via
+    # imgui_impl_opengl3 ("#version 300 es"). imgui_impl_sdl3 is the platform backend
+    # (input/timing); imgui_impl_sdlrenderer3 stays for the headless/NULL backend.
     add_library(imgui_backends STATIC
       ${imgui_SOURCE_DIR}/backends/imgui_impl_sdl3.cpp
       ${imgui_SOURCE_DIR}/backends/imgui_impl_sdlrenderer3.cpp
+      ${imgui_SOURCE_DIR}/backends/imgui_impl_opengl3.cpp
     )
     target_link_libraries(imgui_backends PRIVATE imgui ${AURORA_SDL3_TARGET})
     target_link_libraries(imgui PUBLIC imgui_backends)

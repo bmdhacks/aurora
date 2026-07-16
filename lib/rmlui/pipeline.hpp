@@ -90,6 +90,7 @@ void initialize_pipeline();
 void shutdown_pipeline();
 
 gfx::BindGroupRef texture_bind_group_ref(const gl::Texture& view);
+gfx::BindGroupRef mask_bind_group_ref(const gl::Texture& imageView, const gl::Texture& maskView);
 gfx::BindGroupRef common_bind_group_ref();
 gfx::BindGroupRef uniform_bind_group_ref();
 

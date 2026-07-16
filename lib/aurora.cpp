@@ -219,31 +219,37 @@ void end_frame() noexcept {
                                                            webgpu::g_graphicsConfig.surfaceConfiguration.height,
                                                            presentSource.size.width, presentSource.size.height);
 
-  gfx::BindGroupRef rmlBindGroup = 0;
+  gl::Texture rmlTexture{};
+  gl::Sampler rmlSampler{};
   bool rmlOverlay = false;
 #if AURORA_ENABLE_RMLUI
   if (rmlui::is_initialized()) {
     auto rmlFrame = rmlui::record_frame(viewport);
-    rmlBindGroup = rmlFrame.bindGroup;
+    rmlTexture = rmlFrame.texture;
+    rmlSampler = rmlFrame.sampler;
     rmlOverlay = rmlFrame.overlay;
   }
 #endif
-  // Phase 5 composites the RmlUi overlay into the present; Phase 1 records the UI
-  // frame (side effects) but does not blit it yet.
-  (void)rmlBindGroup;
-  (void)rmlOverlay;
 
-  gfx::end_frame([imguiDrawData = std::move(imguiDrawData)]() {
-    // Runs on the render worker (which owns the GL context). Phase 1 presents a
-    // cleared black frame and swaps. Later phases restore the real present here:
-    // Phase 2 the GL present-blit of the finished color target; Phase 5 the imgui +
-    // RmlUi overlay composite; Phase 6 the SDL2-shim EFB slot hand-off to the main
-    // thread (Mali's page flip is display-thread-bound). The whole wgpu Surface /
-    // CommandEncoder / CopyPipeline / resample machinery is gone.
+  gfx::end_frame([rmlTexture, rmlSampler, rmlOverlay, imguiDrawData = std::move(imguiDrawData)]() {
+    // Runs on the render worker (which owns the GL context). Present the finished scene into
+    // the window's content rect, composite the RmlUi overlay and the imgui overlay on top,
+    // then swap. (Device EFB slot hand-off to the main thread is Phase 6.)
     webgpu::present_frame();
+    if (rmlTexture.id != 0) {
+      webgpu::composite_ui_overlay(rmlTexture, rmlSampler, rmlOverlay);
+    }
+    {
+      gl::PassEncoder uiPass(gl::PassTarget{
+          .fbo = 0,
+          .width = webgpu::g_graphicsConfig.surfaceConfiguration.width,
+          .height = webgpu::g_graphicsConfig.surfaceConfiguration.height,
+      });
+      imgui::render(uiPass, imguiDrawData);
+    }
+    webgpu::present_swap();
     gfx::after_present();
     gfx::after_submit();
-    (void)imguiDrawData;
 
     TracyPlotConfig("aurora: lastVertSize", tracy::PlotFormatType::Memory, false, true, 0);
     TracyPlotConfig("aurora: lastUniformSize", tracy::PlotFormatType::Memory, false, true, 0);
