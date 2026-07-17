@@ -1587,7 +1587,13 @@ void end_frame(EndFrameCallback callback) {
   render_worker::enqueue_end_frame(frameId, [frameSlot, callback = std::move(callback)]() mutable {
     auto& packet = g_framePackets[frameSlot];
     const auto stats = packet.stats;
-    packet = {};
+    // Do NOT `packet = {}` here. Move-assigning a default frees this slot's per-frame ByteBuffers
+    // (verts/uniforms/indices, whose reset() pre-reserves 5+24+1 MB), so the next begin_frame's
+    // reset() would calloc + page-zero ~30 MB from scratch every frame -- pure memory-bandwidth
+    // churn (and heat) on the bandwidth-starved Mali handhelds, defeating the pool's whole point
+    // ("recording never reallocs"). The slot is released below and nothing reads the packet until
+    // the next begin_frame reset()s it for reuse, which clears the deques + rewinds the ByteBuffers
+    // while retaining their capacity. Leaving the stale data resident until then is harmless.
     g_stats.drawCallCount = stats.drawCallCount;
     g_stats.mergedDrawCallCount = stats.mergedDrawCallCount;
     g_stats.lastVertSize = stats.lastVertSize;
