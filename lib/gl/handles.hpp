@@ -23,6 +23,11 @@ struct Buffer {
   GLuint id = 0;
   uint32_t target = 0; // GL_ARRAY_BUFFER / GL_UNIFORM_BUFFER / ...
   uint64_t size = 0;
+  // Non-null when the buffer was created with a persistent-coherent mapping (GL_EXT_buffer_storage):
+  // upload_buffer memcpys straight into it, no glBufferSubData / driver copy. Null == mutable buffer
+  // updated with glBufferSubData. Owned by the create/destroy path; the handle is still trivially
+  // copyable (aliases the same mapping, same as it aliases the same GL name).
+  void* mapped = nullptr;
   explicit operator bool() const { return id != 0; }
   bool operator==(const Buffer& o) const { return id == o.id; }
 };

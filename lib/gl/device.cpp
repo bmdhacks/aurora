@@ -60,6 +60,15 @@ void query_caps() {
   g_astcTexturesSupported = has_gl_extension("GL_KHR_texture_compression_astc_ldr") ||
                             has_gl_extension("GL_OES_texture_compression_astc");
 
+  // Persistent-mapped write-combine buffers (the device upload fast path). Requires both the
+  // extension string and a resolved glBufferStorage entry point. Log the result: on the Mali/PowerVR
+  // targets this is the single biggest per-frame CPU lever (it removes libmali's copy-worker memcpy),
+  // so its presence must be visible in the device log when diagnosing upload-bound frames.
+  g_bufferStorageSupported = gl::gl.BufferStorage != nullptr &&
+                             (has_gl_extension("GL_EXT_buffer_storage") || has_gl_extension("GL_ARB_buffer_storage"));
+  Log.info("[gl] persistent-mapped buffers (GL_EXT_buffer_storage): {}",
+           g_bufferStorageSupported ? "yes" : "no (glBufferSubData fallback)");
+
   uint16_t anisotropy = 0;
   if (has_gl_extension("GL_EXT_texture_filter_anisotropic")) {
     gl::GLint maxAniso = 0;
@@ -83,6 +92,7 @@ bool g_hasCoreFeatures = false;
 bool g_bcTexturesSupported = false;
 bool g_astcTexturesSupported = false;
 bool g_textureComponentSwizzleSupported = false;
+bool g_bufferStorageSupported = false;
 uint32_t g_uniformBufferOffsetAlignment = 256;
 // True once the EFB color/depth render targets exist. Until then resize_swapchain only
 // records the surface size; gfx::initialize brings the worker online and creates them.

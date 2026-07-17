@@ -71,6 +71,11 @@ bool load(ProcAddressFn getProc) {
   OPT(UnmapBuffer, "glUnmapBuffer")
   OPT(FlushMappedBufferRange, "glFlushMappedBufferRange")
   OPT(CopyBufferSubData, "glCopyBufferSubData")
+  // GL_EXT_buffer_storage on GLES (libmali/PowerVR); the ARB/core name is the desktop spelling.
+  OPT(BufferStorage, "glBufferStorageEXT")
+  if (gl.BufferStorage == nullptr) {
+    OPT(BufferStorage, "glBufferStorage")
+  }
 
   // Vertex arrays
   REQ(GenVertexArrays, "glGenVertexArrays")

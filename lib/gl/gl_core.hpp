@@ -103,6 +103,15 @@ inline constexpr GLbitfield GL_MAP_INVALIDATE_RANGE_BIT = 0x0004;
 inline constexpr GLbitfield GL_MAP_INVALIDATE_BUFFER_BIT = 0x0008;
 inline constexpr GLbitfield GL_MAP_FLUSH_EXPLICIT_BIT = 0x0010;
 inline constexpr GLbitfield GL_MAP_UNSYNCHRONIZED_BIT = 0x0020;
+// glMapBufferRange + glBufferStorage(EXT) persistent-mapping bits (GL_EXT_buffer_storage /
+// ARB_buffer_storage). A buffer allocated with GL_MAP_PERSISTENT_BIT can stay mapped while the GPU
+// uses it; GL_MAP_COHERENT_BIT makes CPU writes visible with no glFlushMappedBufferRange.
+inline constexpr GLbitfield GL_MAP_PERSISTENT_BIT = 0x0040;
+inline constexpr GLbitfield GL_MAP_COHERENT_BIT = 0x0080;
+// glBufferStorage(EXT) storage flags. GL_DYNAMIC_STORAGE_BIT keeps glBufferSubData legal on the
+// immutable buffer (the fallback upload path when a persistent mapping could not be obtained).
+inline constexpr GLbitfield GL_DYNAMIC_STORAGE_BIT = 0x0100;
+inline constexpr GLbitfield GL_CLIENT_STORAGE_BIT = 0x0200;
 
 // Vertex attrib component types
 inline constexpr GLenum GL_BYTE = 0x1400;
@@ -305,6 +314,9 @@ struct GlProcTable {
   GLboolean (*UnmapBuffer)(GLenum) = nullptr;
   void (*FlushMappedBufferRange)(GLenum, GLintptr, GLsizeiptr) = nullptr;
   void (*CopyBufferSubData)(GLenum, GLenum, GLintptr, GLintptr, GLsizeiptr) = nullptr;
+  // GL_EXT_buffer_storage (glBufferStorageEXT) -- the device persistent-mapped write-combine fast
+  // path. Null when unsupported; callers fall back to glBufferData + glBufferSubData.
+  void (*BufferStorage)(GLenum, GLsizeiptr, const void*, GLbitfield) = nullptr;
 
   // Vertex arrays
   void (*GenVertexArrays)(GLsizei, GLuint*) = nullptr;

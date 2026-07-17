@@ -65,6 +65,10 @@ extern bool g_hasCoreFeatures;
 extern bool g_bcTexturesSupported;
 extern bool g_astcTexturesSupported;
 extern bool g_textureComponentSwizzleSupported;
+// GL_EXT_buffer_storage present AND glBufferStorage resolved: enables persistent-mapped
+// write-combine buffers (the device fast path that bypasses libmali's copy worker). When false,
+// gl::create_buffer/upload_buffer transparently fall back to glBufferData + glBufferSubData.
+extern bool g_bufferStorageSupported;
 // GL_UNIFORM_BUFFER_OFFSET_ALIGNMENT, queried at init (replaces Dawn's
 // minUniformBufferOffsetAlignment limit). Feeds gfx::align_uniform.
 extern uint32_t g_uniformBufferOffsetAlignment;

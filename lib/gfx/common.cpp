@@ -174,10 +174,62 @@ static const RuntimeEncoderTaskType* find_runtime_encoder_task_type(EncoderTaskI
   return &slot;
 }
 
+// The "active" per-frame ring buffers -- worker-only aliases pointed at the current frame slot's
+// FrameBufferSet by select_frame_buffers() each frame. Every draw/upload path reads these, so the
+// double-buffering is invisible below this point.
 gl::Buffer g_vertexBuffer;
 gl::Buffer g_uniformBuffer;
 gl::Buffer g_indexBuffer;
 gl::Buffer g_storageBuffer;
+
+// One owned set of per-frame ring buffers per frame slot. The per-frame vertex/uniform/index data is
+// rewritten from offset 0 every frame; with persistent-mapped (immutable) storage there is no
+// glBufferSubData implicit-sync to keep the worker from memcpy'ing over a range the GPU still reads,
+// so each slot gets its OWN set (double-buffering) and `fence` gates reuse: the worker waits slot
+// s's prior-frame fence before selecting the set for a new frame, guaranteeing the GPU finished
+// reading it. On the glBufferSubData fallback (no GL_EXT_buffer_storage) the fence is a harmless
+// extra ordering point. Created in initialize(), torn down in shutdown(); worker-owned throughout.
+struct FrameBufferSet {
+  gl::Buffer vertex;
+  gl::Buffer uniform;
+  gl::Buffer index;
+  gl::GLsync fence = nullptr; // GPU-done marker for this set's last frame; waited before reuse
+};
+static std::array<FrameBufferSet, FrameSlotCount> g_frameBufferSets;
+
+// Point the active per-frame ring aliases at slot `slot`'s owned buffer set. Worker thread only.
+static void select_frame_buffers(size_t slot) {
+  auto& set = g_frameBufferSets[slot];
+  g_vertexBuffer = set.vertex;
+  g_uniformBuffer = set.uniform;
+  g_indexBuffer = set.index;
+}
+
+// Block the worker until the GPU finished the frame that last used slot `slot`'s buffer set, so its
+// persistent mappings are safe to overwrite. Near-zero in steady state (fence already signalled);
+// natural backpressure if the GPU falls behind. Deletes the fence. Worker thread only.
+static void wait_frame_buffer_fence(size_t slot) {
+  auto& set = g_frameBufferSets[slot];
+  if (set.fence == nullptr || gl::gl.ClientWaitSync == nullptr) {
+    return;
+  }
+  // Flush on the first wait so the fence is guaranteed to be in the GPU pipe (cannot self-deadlock
+  // on unsubmitted commands). Bounded chunks with a diagnostic rather than an unbounded block.
+  constexpr uint64_t kChunkNs = 1'000'000'000ull; // 1 s
+  for (int attempt = 0; attempt < 5; ++attempt) {
+    const gl::GLenum r = gl::gl.ClientWaitSync(set.fence, gl::GL_SYNC_FLUSH_COMMANDS_BIT, kChunkNs);
+    if (r == gl::GL_ALREADY_SIGNALED || r == gl::GL_CONDITION_SATISFIED) {
+      break;
+    }
+    if (r == gl::GL_WAIT_FAILED) {
+      Log.warn("frame-buffer fence wait failed for slot {}", slot);
+      break;
+    }
+    Log.warn("frame-buffer fence for slot {} still pending after {}s", slot, attempt + 1);
+  }
+  gl::gl.DeleteSync(set.fence);
+  set.fence = nullptr;
+}
 // Persistent caches for CPU-expanded native-fetch geometry. Separate from the per-frame
 // staging rings so cached ranges can never be clobbered by ring uploads. Filled once per
 // unique mesh (by content hash) and referenced every subsequent frame.
@@ -1279,10 +1331,18 @@ void initialize() {
   // the EFB render targets here, all with the context freshly current.
   render_worker::enqueue_work([] {
     gl::make_render_current();
-    g_vertexBuffer = gl::create_buffer(gl::GL_ARRAY_BUFFER, VertexBufferSize, true);
-    g_uniformBuffer = gl::create_buffer(gl::GL_UNIFORM_BUFFER, UniformBufferSize, true);
-    g_indexBuffer = gl::create_buffer(gl::GL_ELEMENT_ARRAY_BUFFER, IndexBufferSize, true);
+    // Per-frame ring: one persistent-mapped set per frame slot (double-buffered, fenced on reuse --
+    // see FrameBufferSet). select_frame_buffers points the active aliases at slot 0 for the first frame.
+    for (auto& set : g_frameBufferSets) {
+      set.vertex = gl::create_buffer(gl::GL_ARRAY_BUFFER, VertexBufferSize, true, /*persistent=*/true);
+      set.uniform = gl::create_buffer(gl::GL_UNIFORM_BUFFER, UniformBufferSize, true, /*persistent=*/true);
+      set.index = gl::create_buffer(gl::GL_ELEMENT_ARRAY_BUFFER, IndexBufferSize, true, /*persistent=*/true);
+    }
+    select_frame_buffers(0);
     // The storage-fetch path is dead (native vertex fetch only); no g_storageBuffer.
+    // Native geom cache is a single shared buffer (all frames read the same hashed offsets, so it
+    // cannot be double-buffered) and is only ever appended at fresh offsets, so it stays on the
+    // glBufferSubData path -- no persistent-map reuse hazard to fence.
     g_nativeVertexCacheBuffer = gl::create_buffer(gl::GL_ARRAY_BUFFER, NativeGeomVertexCacheSize, true);
     g_nativeIndexCacheBuffer = gl::create_buffer(gl::GL_ELEMENT_ARRAY_BUFFER, NativeGeomIndexCacheSize, true);
     clear::init_program();
@@ -1340,6 +1400,12 @@ void shutdown() {
   }
   for (auto& pool : g_passSnapshotPools) {
     pool = {};
+  }
+  // The GL context is torn down with the worker (above), which reclaims the buffer objects, their
+  // persistent mappings, and the fence sync objects; matching the existing single-buffer teardown we
+  // only drop the handles here rather than issuing GL after the context is gone.
+  for (auto& set : g_frameBufferSets) {
+    set = {};
   }
   g_vertexBuffer = {};
   g_uniformBuffer = {};
@@ -1422,7 +1488,14 @@ bool begin_frame() {
   push_command(CommandType::SetViewport, Command::Data{.setViewport = g_cachedViewport});
   push_command(CommandType::SetScissor, Command::Data{.setScissor = g_cachedScissor});
   begin_pipeline_frame();
-  render_worker::enqueue_begin_frame(frame.frameId, [] { webgpu::gpu_prof::frame_begin(); });
+  render_worker::enqueue_begin_frame(frame.frameId, [frameSlot] {
+    // Reusing this slot's persistent ring buffers: wait until the GPU finished the frame that last
+    // used them before the worker starts memcpy'ing new data into the coherent mapping (immutable
+    // storage has no implicit orphaning). Then make this slot's set the active ring for the frame.
+    wait_frame_buffer_fence(frameSlot);
+    select_frame_buffers(frameSlot);
+    webgpu::gpu_prof::frame_begin();
+  });
   g_cpuFrameStart = PresentClock::now();
   return true;
 }
@@ -1526,6 +1599,17 @@ void end_frame(EndFrameCallback callback) {
     // buffer to submit. The callback (aurora.cpp) issues the present GL and swaps.
     if (callback) {
       callback();
+    }
+    // Fence this slot's persistent buffer set: it stays "busy" until the GPU finishes everything
+    // issued this frame (its GX draws read the vertex/uniform/index mappings). The next frame that
+    // reuses this slot waits this fence before overwriting the mappings (see wait_frame_buffer_fence).
+    // Created after the callback so it orders after every GL command this frame emitted.
+    if (gl::gl.FenceSync != nullptr) {
+      auto& set = g_frameBufferSets[frameSlot];
+      if (set.fence != nullptr) {
+        gl::gl.DeleteSync(set.fence); // paranoia: normally cleared by the matching wait
+      }
+      set.fence = gl::gl.FenceSync(gl::GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
     }
     g_frameSlots.release(frameSlot);
     expire_cached_bind_groups();
