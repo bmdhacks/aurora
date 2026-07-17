@@ -272,6 +272,21 @@ inline constexpr EGLint EGL_FOREVER_KHR = 0x7FFFFFFF;
 inline constexpr EGLenum EGL_CONTEXT_CLIENT_VERSION = 0x3098;
 inline constexpr EGLenum EGL_WIDTH = 0x3057;
 inline constexpr EGLenum EGL_HEIGHT = 0x3056;
+// Config selection for the device (sdl2-shim) render/share contexts' dummy pbuffers.
+inline constexpr EGLBoolean EGL_TRUE = 1;
+inline constexpr EGLBoolean EGL_FALSE = 0;
+inline constexpr EGLSurface EGL_NO_SURFACE = nullptr;
+inline constexpr EGLenum EGL_SURFACE_TYPE = 0x3033;
+inline constexpr EGLint EGL_PBUFFER_BIT = 0x0001;
+inline constexpr EGLenum EGL_RENDERABLE_TYPE = 0x3040;
+inline constexpr EGLint EGL_OPENGL_ES2_BIT = 0x0004;
+inline constexpr EGLint EGL_OPENGL_ES3_BIT = 0x0040; // == EGL_OPENGL_ES3_BIT_KHR
+inline constexpr EGLenum EGL_RED_SIZE = 0x3024;
+inline constexpr EGLenum EGL_GREEN_SIZE = 0x3023;
+inline constexpr EGLenum EGL_BLUE_SIZE = 0x3022;
+inline constexpr EGLenum EGL_ALPHA_SIZE = 0x3021;
+inline constexpr EGLenum EGL_DEPTH_SIZE = 0x3025;
+inline constexpr EGLenum EGL_STENCIL_SIZE = 0x3026;
 
 // The resolved entry-point table. Members are plain function pointers, filled
 // by gl::load(). Names match the GL/EGL entry points with the gl/egl prefix

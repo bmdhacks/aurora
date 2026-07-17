@@ -9,6 +9,7 @@
 #include "webgpu/gpu_prof.hpp"
 #include "webgpu/sdl2shim_present.hpp"
 #include "gl/pass.hpp"
+#include "gl/state.hpp"
 #include <optional>
 #endif
 
@@ -237,23 +238,52 @@ void end_frame() noexcept {
 #endif
 
   gfx::end_frame([rmlTexture, rmlSampler, rmlOverlay, imguiDrawData = std::move(imguiDrawData)]() {
-    // Runs on the render worker (which owns the GL context). Present the finished scene into
-    // the window's content rect, composite the RmlUi overlay and the imgui overlay on top,
-    // then swap. (Device EFB slot hand-off to the main thread is Phase 6.)
-    webgpu::present_frame();
-    if (rmlTexture.id != 0) {
-      webgpu::composite_ui_overlay(rmlTexture, rmlSampler, rmlOverlay);
+    // Runs on the render worker (which owns the GL context). Composite the finished scene, the
+    // RmlUi overlay and the imgui overlay into the present target, then swap (desktop) or hand the
+    // EFB slot to the main thread (device).
+    if (webgpu::sdl2shim_present::active()) {
+      // Device (SDL2-shim EFB path): acquire a slot, composite into its worker FBO, publish. The
+      // main thread scans it out via flush_present() and owns after_present(); the worker never
+      // swaps (Mali kmsdrm page flips are display-thread-bound -- a worker swap shows nothing).
+      auto frame = webgpu::sdl2shim_present::acquire();
+      if (frame) {
+        const uint32_t targetFbo = frame->fbo;
+        webgpu::present_frame(targetFbo);
+        if (rmlTexture.id != 0) {
+          webgpu::composite_ui_overlay(rmlTexture, rmlSampler, rmlOverlay, targetFbo);
+        }
+        {
+          gl::PassEncoder uiPass(gl::PassTarget{
+              .fbo = targetFbo,
+              .width = webgpu::present_surface_width(),
+              .height = webgpu::present_surface_height(),
+          });
+          imgui::render(uiPass, imguiDrawData);
+        }
+        // The present composite issued raw, out-of-band GL; drop the state-cache shadow so the next
+        // frame's first pass re-establishes everything (desktop does this inside present_swap()).
+        gl::reset_state_cache();
+        webgpu::sdl2shim_present::publish(frame->slot);
+      } else {
+        webgpu::sdl2shim_present::publish_empty();
+      }
+    } else {
+      // Desktop: composite into the window's default framebuffer and swap from the worker.
+      webgpu::present_frame();
+      if (rmlTexture.id != 0) {
+        webgpu::composite_ui_overlay(rmlTexture, rmlSampler, rmlOverlay);
+      }
+      {
+        gl::PassEncoder uiPass(gl::PassTarget{
+            .fbo = 0,
+            .width = webgpu::g_graphicsConfig.surfaceConfiguration.width,
+            .height = webgpu::g_graphicsConfig.surfaceConfiguration.height,
+        });
+        imgui::render(uiPass, imguiDrawData);
+      }
+      webgpu::present_swap();
+      gfx::after_present();
     }
-    {
-      gl::PassEncoder uiPass(gl::PassTarget{
-          .fbo = 0,
-          .width = webgpu::g_graphicsConfig.surfaceConfiguration.width,
-          .height = webgpu::g_graphicsConfig.surfaceConfiguration.height,
-      });
-      imgui::render(uiPass, imguiDrawData);
-    }
-    webgpu::present_swap();
-    gfx::after_present();
     gfx::after_submit();
 
     TracyPlotConfig("aurora: lastVertSize", tracy::PlotFormatType::Memory, false, true, 0);

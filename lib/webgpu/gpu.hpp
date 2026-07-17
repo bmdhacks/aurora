@@ -90,14 +90,16 @@ Viewport calculate_present_viewport(uint32_t surface_width, uint32_t surface_hei
 uint32_t present_surface_width() noexcept;
 uint32_t present_surface_height() noexcept;
 // Present the finished frame's scene. Runs on the render worker (owns the GL context).
-// Binds the default framebuffer, clears to black (letterbox bars) and blits the finished
-// EFB into the centered content rect. Does NOT swap -- the caller composites the RmlUi
-// overlay + imgui on top, then calls present_swap(). Device EFB present is Phase 6.
-void present_frame() noexcept;
+// Binds targetFbo, clears to black (letterbox bars) and blits the finished EFB into the
+// centered content rect. Does NOT swap -- the caller composites the RmlUi overlay + imgui
+// on top, then swaps (desktop) or publishes the slot (device). targetFbo is 0 (window
+// default framebuffer) on desktop, or the acquired EFB slot's worker FBO on the device path.
+void present_frame(uint32_t targetFbo = 0) noexcept;
 // Composite a UI overlay texture over the just-presented scene, into the same centered content
-// rect. overlay=true blends it premultiplied (UI over scene); overlay=false draws it opaque
-// (the UI already seeded the scene as its backdrop). Runs on the render worker.
-void composite_ui_overlay(const gl::Texture& texture, const gl::Sampler& sampler, bool overlay) noexcept;
+// rect of targetFbo. overlay=true blends it premultiplied (UI over scene); overlay=false draws it
+// opaque (the UI already seeded the scene as its backdrop). Runs on the render worker.
+void composite_ui_overlay(const gl::Texture& texture, const gl::Sampler& sampler, bool overlay,
+                          uint32_t targetFbo = 0) noexcept;
 // Drop the state-cache shadow (present/composite/imgui all issued out-of-band GL) and swap the
 // window's back buffer. Runs on the render worker, after all overlays are composited.
 void present_swap() noexcept;

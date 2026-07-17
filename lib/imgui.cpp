@@ -153,11 +153,24 @@ void new_frame(const AuroraWindowSize& size) noexcept {
     ImGui_ImplSDLRenderer3_NewFrame();
     g_scale = size.scale;
   } else {
-    // Device objects were created on the worker at init; once they exist NewFrame issues no
-    // GL, so it is safe to call from the main thread here (it only rebuilds the font atlas if
-    // it was invalidated, which the static UI never does).
-    ImGui_ImplOpenGL3_NewFrame();
+    // The game rebuilds the imgui font atlas whenever the UI scale changes
+    // (dusk::ImGuiEngine_Initialize -> io.Fonts->Clear() + re-add fonts, fired on window resize),
+    // which invalidates the atlas: Fonts->IsBuilt() goes false and the ImFont objects are recreated.
+    // The backend font texture must then be rebuilt, or the next ImGui::NewFrame dereferences a font
+    // whose ContainerAtlas is gone (ContainerAtlas == nullptr -> crash; hit on device when the window
+    // resizes 320x320 -> 304x224). The old Dawn path rebuilt here too. The rebuild issues GL, so it
+    // must run where the render context is current -- the render worker (the main thread has no GL
+    // context on desktop, and only the shim's present context on device), same as init above.
+    if ((g_scale > 0.f && g_scale != size.scale) || !ImGui::GetIO().Fonts->IsBuilt()) {
+      gfx::render_worker::enqueue_work([] {
+        ImGui_ImplOpenGL3_DestroyFontsTexture();
+        ImGui_ImplOpenGL3_CreateFontsTexture();
+        gl::invalidate_texture_bindings();
+      });
+      gfx::render_worker::synchronize();
+    }
     g_scale = size.scale;
+    ImGui_ImplOpenGL3_NewFrame();
   }
   ImGui_ImplSDL3_NewFrame();
 

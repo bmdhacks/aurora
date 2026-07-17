@@ -15,6 +15,7 @@
 
 #include "../gfx/render_worker.hpp"
 #include "../internal.hpp"
+#include "../webgpu/sdl2shim_present.hpp"
 #include "../window.hpp"
 #include "context.hpp"
 #include "fbo_cache.hpp"
@@ -36,6 +37,10 @@ namespace {
 Module Log("aurora::gl");
 
 SDL_Window* g_sdlWindow = nullptr;
+// The SDL_GL context created on the shim path to make the shim's sdl2 driver borrow and publish
+// the firmware EGL context. It stays current on the main thread for the process lifetime (main
+// owns present/blit-and-swap); SDL_Quit tears it down. Not used on the desktop path.
+SDL_GLContext g_shimBootstrapCtx = nullptr;
 AuroraSampler g_Resampler = SAMPLER_BILINEAR;
 
 bool has_gl_extension(const char* name) {
@@ -103,19 +108,62 @@ bool initialize(AuroraBackend backend, bool allowCpu) {
     return false;
   }
 
-  // TODO(Phase 6): pick ContextMode::Sdl2Shim when the shim's borrowed-EGL driver
-  // is active, feeding the published EGLDisplay/getProc. Desktop is the dev path.
+  // Detect the SDL2-shim (device) path: the launcher pins SDL_VIDEODRIVER=sdl2 and the shim
+  // publishes its borrowed EGLDisplay/context/getProc as window properties at GL-context creation.
+  // A real desktop driver (x11/wayland) means the SDL_GL dev path.
   gl::ContextConfig cfg{
       .mode = gl::ContextMode::Desktop,
       .sdlWindow = g_sdlWindow,
   };
+  void* shimEglDisplay = nullptr;
+  const char* videoDriver = SDL_GetCurrentVideoDriver();
+  if (videoDriver != nullptr && std::strcmp(videoDriver, "sdl2") == 0) {
+    // The window is created with EXTERNAL_GRAPHICS_CONTEXT=true (window.cpp), so the shim does not
+    // borrow/publish the firmware EGL context until its sdl2 driver's GL_CreateContext hook runs.
+    // Until then the sdl2_backend.* properties are null. SDL_GL_CreateContext triggers that hook:
+    // the shim binds the firmware context, makes it current on this (main) thread, and publishes
+    // egl_display/egl_context/egl_surface/gl_get_proc. This bootstrap context IS the borrowed
+    // context; the main thread keeps it current forever (present/blit-and-swap). Re-binding it
+    // later via SDL is forbidden (SDL TLS desync, #79) -- but this one-time creation is exactly
+    // what the old Dawn path did. Leave it current; never SDL_GL_MakeCurrent it again.
+    SDL_PropertiesID props = SDL_GetWindowProperties(g_sdlWindow);
+    if (SDL_GetPointerProperty(props, "SDL.window.sdl2_backend.egl_display", nullptr) == nullptr) {
+      SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
+      SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
+      SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
+      SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
+      g_shimBootstrapCtx = SDL_GL_CreateContext(g_sdlWindow);
+      if (g_shimBootstrapCtx == nullptr) {
+        Log.error("[gl] SDL2-shim bootstrap SDL_GL_CreateContext failed: {}", SDL_GetError());
+        return false;
+      }
+      SDL_GL_SetSwapInterval(0);
+      props = SDL_GetWindowProperties(g_sdlWindow);
+    }
+    void* eglDisplay = SDL_GetPointerProperty(props, "SDL.window.sdl2_backend.egl_display", nullptr);
+    void* eglContext = SDL_GetPointerProperty(props, "SDL.window.sdl2_backend.egl_context", nullptr);
+    auto* getProc = reinterpret_cast<gl::ProcAddressFn>(
+        SDL_GetPointerProperty(props, "SDL.window.sdl2_backend.gl_get_proc", nullptr));
+    if (eglDisplay == nullptr || getProc == nullptr) {
+      Log.error("[gl] SDL_VIDEODRIVER=sdl2 but the shim published no EGLDisplay/getProc; cannot init");
+      return false;
+    }
+    cfg.mode = gl::ContextMode::Sdl2Shim;
+    cfg.eglDisplay = eglDisplay;
+    cfg.shareEglContext = eglContext;
+    cfg.shimGetProc = getProc;
+    shimEglDisplay = eglDisplay;
+    Log.info("[gl] SDL2-shim device path: EGLDisplay={} shimContext={}", eglDisplay, eglContext);
+  }
+
   if (!gl::create_contexts(cfg)) {
     Log.error("[gl] context creation failed");
     return false;
   }
 
-  // The render context is current on this (main) thread right now. Query caps and
-  // the UBO alignment, then release it so the render worker can take ownership.
+  // Query caps + the UBO alignment. Desktop: the render context is current on this (main) thread.
+  // Device: the shim's borrowed context is current (create_device leaves it; our render context is
+  // never bound on main) -- caps are display-global so this is equivalent.
   query_caps();
 
   const auto size = window::get_window_size();
@@ -127,14 +175,34 @@ bool initialize(AuroraBackend backend, bool allowCpu) {
   g_graphicsConfig.depthFormat = gl::TextureFormat::Depth32Float;
   g_graphicsConfig.msaaSamples = 1;
 
-  gl::make_none_current();
+  // Desktop: release the render context so the render worker can take ownership. Device: the main
+  // thread KEEPS the shim's borrowed context current (it owns present/blit-and-swap), and our
+  // render context was never bound on main, so there is nothing to release -- do NOT unbind, or
+  // main would drop the shim context (breaking present).
+  if (cfg.mode == gl::ContextMode::Desktop) {
+    gl::make_none_current();
+  } else {
+    // Bring up the EFB present now, on the main thread with the shim context current. The shared
+    // textures are the native drawable size (the final composited frame); the worker aliases them
+    // on its first frame. EFB-or-bust: it is the only path that reaches the Mali panel.
+    if (!sdl2shim_present::initialize(shimEglDisplay, g_presentWidth, g_presentHeight,
+                                      g_graphicsConfig.surfaceConfiguration.format)) {
+      Log.error("[gl] EFB present init failed on the SDL2-shim path; no way to reach the panel");
+      return false;
+    }
+  }
 
-  Log.info("[gl] backend up: {}x{} RGBA8 (bc={}, astc={}, aniso={})", size.fb_width, size.fb_height,
-           g_bcTexturesSupported, g_astcTexturesSupported, g_graphicsConfig.textureAnisotropy);
+  Log.info("[gl] backend up: {}x{} RGBA8 present {}x{} mode={} (bc={}, astc={}, aniso={})", size.fb_width,
+           size.fb_height, g_presentWidth, g_presentHeight,
+           cfg.mode == gl::ContextMode::Sdl2Shim ? "sdl2-shim" : "desktop", g_bcTexturesSupported,
+           g_astcTexturesSupported, g_graphicsConfig.textureAnisotropy);
   return true;
 }
 
 void shutdown() {
+  // EFB present teardown first: its shim-side textures/EGLImages live in the shim context, which is
+  // current on this (main) thread. No-op on desktop. Runs before destroy_contexts frees our own.
+  sdl2shim_present::shutdown();
   // The render targets are GL objects owned by the context; destroy_contexts frees them.
   g_frameBuffer = {};
   g_frameBufferResolved = {};
@@ -377,14 +445,14 @@ static gl::GLuint present_ui_program() {
   return g_presentUiProgram;
 }
 
-void present_frame() noexcept {
-  // Runs on the render worker (owns the GL context). Desktop present: clear the window's
-  // default framebuffer to black (letterbox bars) and blit the finished color target into
-  // the centered content rect with a linear filter. No Y-flip -- both the source EFB and
-  // the default framebuffer are GL bottom-left origin (S1c). Does NOT swap; the caller
-  // composites the UI overlay + imgui, then calls present_swap(). Phase 6 replaces this with
-  // the SDL2-shim EFB slot hand-off on the device path.
-  gl::gl.BindFramebuffer(gl::GL_FRAMEBUFFER, 0);
+void present_frame(uint32_t targetFbo) noexcept {
+  // Runs on the render worker (owns the GL context). Clear the present target to black (letterbox
+  // bars) and blit the finished color target into the centered content rect with a linear filter.
+  // No Y-flip -- both the source EFB and the target are GL bottom-left origin (S1c). Does NOT swap;
+  // the caller composites the UI overlay + imgui, then swaps (desktop) or publishes the slot
+  // (device). targetFbo is 0 (window default framebuffer) on desktop, or the acquired EFB slot's
+  // worker FBO on the SDL2-shim device path.
+  gl::gl.BindFramebuffer(gl::GL_FRAMEBUFFER, targetFbo);
   gl::gl.Disable(gl::GL_SCISSOR_TEST);
   gl::gl.ColorMask(gl::GL_TRUE, gl::GL_TRUE, gl::GL_TRUE, gl::GL_TRUE);
   gl::gl.ClearColor(0.f, 0.f, 0.f, 1.f);
@@ -397,18 +465,19 @@ void present_frame() noexcept {
     const auto viewport = calculate_present_viewport(surfaceWidth, surfaceHeight, source.size.width, source.size.height);
     const gl::GLuint readFbo = gl::get_framebuffer(source.texture);
     gl::gl.BindFramebuffer(gl::GL_READ_FRAMEBUFFER, readFbo);
-    gl::gl.BindFramebuffer(gl::GL_DRAW_FRAMEBUFFER, 0);
+    gl::gl.BindFramebuffer(gl::GL_DRAW_FRAMEBUFFER, targetFbo);
     const auto dstX0 = static_cast<gl::GLint>(viewport.left);
     const auto dstY0 = static_cast<gl::GLint>(viewport.top);
     const auto dstX1 = dstX0 + static_cast<gl::GLint>(viewport.width);
     const auto dstY1 = dstY0 + static_cast<gl::GLint>(viewport.height);
     gl::gl.BlitFramebuffer(0, 0, static_cast<gl::GLint>(source.size.width), static_cast<gl::GLint>(source.size.height),
                            dstX0, dstY0, dstX1, dstY1, gl::GL_COLOR_BUFFER_BIT, gl::GL_LINEAR);
-    gl::gl.BindFramebuffer(gl::GL_FRAMEBUFFER, 0);
+    gl::gl.BindFramebuffer(gl::GL_FRAMEBUFFER, targetFbo);
   }
 }
 
-void composite_ui_overlay(const gl::Texture& texture, const gl::Sampler& sampler, bool overlay) noexcept {
+void composite_ui_overlay(const gl::Texture& texture, const gl::Sampler& sampler, bool overlay,
+                          uint32_t targetFbo) noexcept {
   const gl::GLuint program = present_ui_program();
   if (program == 0 || texture.id == 0) {
     return;
@@ -422,7 +491,7 @@ void composite_ui_overlay(const gl::Texture& texture, const gl::Sampler& sampler
   // Same centered content rect the scene was blitted into (letterbox preserved).
   const auto viewport = calculate_present_viewport(surfaceWidth, surfaceHeight, source.size.width, source.size.height);
 
-  gl::gl.BindFramebuffer(gl::GL_FRAMEBUFFER, 0);
+  gl::gl.BindFramebuffer(gl::GL_FRAMEBUFFER, targetFbo);
   gl::gl.Disable(gl::GL_SCISSOR_TEST);
   gl::gl.ColorMask(gl::GL_TRUE, gl::GL_TRUE, gl::GL_TRUE, gl::GL_TRUE);
   gl::gl.Viewport(static_cast<gl::GLint>(viewport.left), static_cast<gl::GLint>(viewport.top),

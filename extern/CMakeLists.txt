@@ -215,7 +215,19 @@ if (AURORA_ENABLE_GX)
       ${imgui_SOURCE_DIR}/backends/imgui_impl_sdlrenderer3.cpp
       ${imgui_SOURCE_DIR}/backends/imgui_impl_opengl3.cpp
     )
-    target_link_libraries(imgui_backends PRIVATE imgui ${AURORA_SDL3_TARGET})
+    # imgui_impl_opengl3 renders on our GLES 3.0 context. Without IMGUI_IMPL_OPENGL_ES3 it
+    # compiles the desktop-GL path, whose embedded gl3w loader dlopen()s libGL.so -- absent on
+    # Mali/PowerVR (loader init fails -> "Failed to initialize OpenGL loader!" -> NewFrame
+    # null-derefs, the device crash). ES3 makes it #include <GLES3/gl3.h> and call GLES entry
+    # points directly (only core ES3 calls; the desktop-only glPolygonMode/DrawElementsBaseVertex/
+    # ClipControl are #if-gated out), resolved from libGLESv2 -- libmali on device, Mesa on the
+    # dev box. Linking libGLESv2 is exactly what every normal SDL+GLES app does (Normalcy rule 7).
+    target_compile_definitions(imgui_backends PRIVATE IMGUI_IMPL_OPENGL_ES3)
+    find_library(AURORA_GLESV2_LIB GLESv2)
+    if (NOT AURORA_GLESV2_LIB)
+      set(AURORA_GLESV2_LIB GLESv2) # fall back to the linker's own -lGLESv2 search
+    endif ()
+    target_link_libraries(imgui_backends PRIVATE imgui ${AURORA_SDL3_TARGET} ${AURORA_GLESV2_LIB})
     target_link_libraries(imgui PUBLIC imgui_backends)
 
     if (TARGET Freetype::Freetype)
