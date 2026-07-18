@@ -1,8 +1,10 @@
 #include "common.hpp"
 
 #include "../internal.hpp"
+#include "../gl/textures.hpp"
 #include "../webgpu/gpu.hpp"
 #include "aurora/aurora.h"
+#include "render_worker.hpp"
 #include "texture.hpp"
 #include "texture_convert.hpp"
 #include "../gx/gx_fmt.hpp"
@@ -26,6 +28,22 @@ gl::Extent3D physical_size(gl::Extent3D size, TextureFormatInfo info) {
   return {.width = width, .height = height, .depthOrArrayLayers = size.depthOrArrayLayers};
 }
 } // namespace
+
+TextureRef::~TextureRef() {
+  if (texture.id == 0) {
+    return;
+  }
+  // The last handle can drop on any thread; the render worker owns the context, so
+  // marshal the delete there (fire-and-forget -- glDeleteTextures on an id still
+  // referenced by in-flight commands is defined: the driver defers the free). When
+  // the worker is already gone this is gfx::shutdown() teardown -- the context died
+  // with the worker, so skip the GL call rather than issue it with no context.
+  if (render_worker::is_running() && !render_worker::is_worker_thread()) {
+    render_worker::enqueue_work([tex = texture]() mutable { gl::destroy_texture(tex); });
+  } else if (render_worker::is_worker_thread()) {
+    gl::destroy_texture(texture);
+  }
+}
 
 TextureHandle new_static_texture_2d(uint32_t width, uint32_t height, uint32_t mips, u32 format, ArrayRef<uint8_t> data,
                                     bool tlut, const char* label) noexcept {

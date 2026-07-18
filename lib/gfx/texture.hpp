@@ -60,6 +60,14 @@ struct TextureRef {
   , format(format)
   , mipCount(mipCount)
   , gxFormat(gxFormat) {}
+
+  // Owns the GL texture: the views are copies of the same gl::Texture, so exactly one
+  // glDeleteTextures per ref. Without this every dropped handle (TLUT rebuild, tex-data
+  // version bump, area unload) leaked its GL texture into pinned driver memory -- the
+  // G31 OOM. Deletion marshals to the render worker (context owner); see texture.cpp.
+  ~TextureRef();
+  TextureRef(const TextureRef&) = delete;
+  TextureRef& operator=(const TextureRef&) = delete;
 };
 
 TextureHandle new_static_texture_2d(uint32_t width, uint32_t height, uint32_t mips, u32 gxFormat,

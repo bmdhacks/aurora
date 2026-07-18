@@ -2246,7 +2246,19 @@ gl::Sampler create_gl_sampler(const gl::SamplerDescriptor& descriptor) {
 }
 
 gl::Sampler sampler_ref(const gl::SamplerDescriptor& descriptor) {
-  const auto id = xxh3_hash_s(&descriptor, sizeof(descriptor));
+  // Hash explicit fields, never the raw struct: SamplerDescriptor mixes uint8_t enums
+  // with floats, so it has padding bytes. Hashing stack garbage in the padding made
+  // every lookup unique -- the cache never hit and each textured draw minted a fresh
+  // GL sampler (~50k live samplers in minutes; the G31 GPU-memory OOM).
+  const uint32_t key[4] = {
+      static_cast<uint32_t>(descriptor.addressU) | static_cast<uint32_t>(descriptor.addressV) << 8 |
+          static_cast<uint32_t>(descriptor.addressW) << 16 | static_cast<uint32_t>(descriptor.magFilter) << 24,
+      static_cast<uint32_t>(descriptor.minFilter) | static_cast<uint32_t>(descriptor.mipmapFilter) << 8 |
+          static_cast<uint32_t>(descriptor.maxAnisotropy) << 16,
+      std::bit_cast<uint32_t>(descriptor.lodMinClamp),
+      std::bit_cast<uint32_t>(descriptor.lodMaxClamp),
+  };
+  const auto id = xxh3_hash_s(key, sizeof(key));
   {
     std::lock_guard lock{g_samplerCacheMutex};
     if (const auto it = g_cachedSamplers.find(id); it != g_cachedSamplers.end()) {
