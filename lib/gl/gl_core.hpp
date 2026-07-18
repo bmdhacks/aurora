@@ -260,6 +260,14 @@ inline constexpr GLenum GL_LINK_STATUS = 0x8B82;
 inline constexpr GLenum GL_INFO_LOG_LENGTH = 0x8B84;
 inline constexpr GLenum GL_UNIFORM_BLOCK_DATA_SIZE = 0x8A40;
 
+// Program binary (ES 3.0 core: glGetProgramBinary/glProgramBinary, the persistent
+// shader-cache path). RETRIEVABLE_HINT must be set before link for some drivers to
+// keep the binary retrievable.
+inline constexpr GLenum GL_PROGRAM_BINARY_RETRIEVABLE_HINT = 0x8257;
+inline constexpr GLenum GL_PROGRAM_BINARY_LENGTH = 0x8741;
+inline constexpr GLenum GL_NUM_PROGRAM_BINARY_FORMATS = 0x87FE;
+inline constexpr GLenum GL_PROGRAM_BINARY_FORMATS = 0x87FF;
+
 // Sync
 inline constexpr GLenum GL_SYNC_GPU_COMMANDS_COMPLETE = 0x9117;
 inline constexpr GLenum GL_ALREADY_SIGNALED = 0x911A;
@@ -399,6 +407,10 @@ struct GlProcTable {
   GLuint (*GetUniformBlockIndex)(GLuint, const GLchar*) = nullptr;
   void (*UniformBlockBinding)(GLuint, GLuint, GLuint) = nullptr;
   void (*GetActiveUniformBlockiv)(GLuint, GLuint, GLenum, GLint*) = nullptr;
+  // Program binary (optional -- gated on GL_NUM_PROGRAM_BINARY_FORMATS > 0)
+  void (*GetProgramBinary)(GLuint, GLsizei, GLsizei*, GLenum*, void*) = nullptr;
+  void (*ProgramBinary)(GLuint, GLenum, const void*, GLsizei) = nullptr;
+  void (*ProgramParameteri)(GLuint, GLenum, GLint) = nullptr;
 
   // Fixed-function state
   void (*Enable)(GLenum) = nullptr;

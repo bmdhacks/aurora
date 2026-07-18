@@ -157,6 +157,19 @@ bool load(ProcAddressFn getProc) {
   REQ(GetUniformBlockIndex, "glGetUniformBlockIndex")
   REQ(UniformBlockBinding, "glUniformBlockBinding")
   REQ(GetActiveUniformBlockiv, "glGetActiveUniformBlockiv")
+  // Program binary (ES 3.0 core, but OPT: the binary cache degrades to source
+  // compile when absent, and the ProgramParameteri hint is inert on drivers that
+  // do not need it). glProgramBinary is the base spelling; some GLES stacks only
+  // export the OES alias.
+  OPT(GetProgramBinary, "glGetProgramBinary")
+  if (gl.GetProgramBinary == nullptr) {
+    OPT(GetProgramBinary, "glGetProgramBinaryOES")
+  }
+  OPT(ProgramBinary, "glProgramBinary")
+  if (gl.ProgramBinary == nullptr) {
+    OPT(ProgramBinary, "glProgramBinaryOES")
+  }
+  OPT(ProgramParameteri, "glProgramParameteri")
 
   // Fixed-function state
   REQ(Enable, "glEnable")

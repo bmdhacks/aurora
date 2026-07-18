@@ -70,6 +70,7 @@ if (AURORA_ENABLE_GX)
             lib/gl/backend.cpp
             lib/gl/pass.cpp
             lib/gl/program.cpp
+            lib/gl/binary_cache.cpp
             lib/gl/textures.cpp
             lib/gl/buffers.cpp
             lib/gl/fbo_cache.cpp

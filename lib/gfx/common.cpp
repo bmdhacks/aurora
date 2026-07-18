@@ -3,6 +3,7 @@
 #include "clear.hpp"
 #include "depth_peek.hpp"
 #include "../internal.hpp"
+#include "../gl/binary_cache.hpp"
 #include "../gl/context.hpp"
 #include "../gl/fbo_cache.hpp"
 #include "../gl/state.hpp"
@@ -1376,6 +1377,9 @@ void shutdown() {
     g_presentTimes.clear();
   }
   shutdown_pipeline_cache();
+  // After the pipeline cache -- its compiler thread is the last caller of gl::compile_program, so no
+  // more binary-cache stores can be enqueued once it has joined.
+  gl::binary_cache_shutdown();
   depth_peek::shutdown();
   tex_copy_conv::shutdown();
   tex_palette_conv::shutdown();

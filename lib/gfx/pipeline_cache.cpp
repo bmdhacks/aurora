@@ -2,7 +2,9 @@
 
 #include "clear.hpp"
 #include "../fs_helper.hpp"
+#include "../gl/binary_cache.hpp"
 #include "../gl/context.hpp"
+#include "../gx/gx.hpp"
 #include "../gx/pipeline.hpp"
 #ifdef AURORA_ENABLE_RMLUI
 #include "../rmlui/pipeline.hpp"
@@ -341,6 +343,10 @@ static AtomicStatRef createdPipelines{g_stats.createdPipelines};
 static std::atomic<PipelineRef> g_inFlightPipeline{0};
 static std::atomic<int64_t> g_inFlightPipelineSinceMs{0};
 
+// When the boot precompile began (steady_clock ms), for the drain summary line. Set when the
+// warm-cache load arms g_gpuCachePrunePending; read once when the queue drains.
+static std::atomic<int64_t> g_bootPrecompileStartMs{0};
+
 static int64_t steady_now_ms() {
   return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch())
       .count();
@@ -433,9 +439,22 @@ static std::optional<PendingPipeline> take_pending_pipeline(PipelineRef hash) {
 static void notify_pipeline_ready(bool queued) {
   ++createdPipelines;
   if (queued && --queuedPipelines == 0 && g_gpuCachePrunePending.exchange(false, std::memory_order_acq_rel)) {
-    // The Dawn GPU blob cache (gpu_cache.cpp) is deleted in the GL backend — the
-    // driver's own on-disk shader cache does warm boots (Normalcy rule 2), so there
-    // is nothing to prune here. pipeline_cache.db (pipeline *configs*) is untouched.
+    // The warm-cache boot precompile has fully drained. The Dawn GPU blob cache (gpu_cache.cpp) is
+    // gone, so there is nothing to prune (Normalcy rule 2) — but this is the moment the process has
+    // survived feeding every cached program binary back through glProgramBinary, so let the binary
+    // cache disarm its crash sentinel, and log one summary of the boot compile work.
+    gl::binary_cache_precompile_drained();
+    const int64_t elapsedMs = steady_now_ms() - g_bootPrecompileStartMs.load(std::memory_order_relaxed);
+    if (gl::binary_cache_enabled()) {
+      Log.info("[pipeline-cache] boot precompile done: {} pipelines built, {} unique GX programs, "
+               "{} program-binary hits, {} source compiles, {} ms",
+               static_cast<uint32_t>(createdPipelines), gx::shader_program_count(), gl::binary_cache_hits(),
+               gl::binary_cache_misses(), elapsedMs);
+    } else {
+      Log.info("[pipeline-cache] boot precompile done: {} pipelines built, {} unique GX programs, {} ms "
+               "(program-binary cache off)",
+               static_cast<uint32_t>(createdPipelines), gx::shader_program_count(), elapsedMs);
+    }
   }
   g_pipelineReadyCv.notify_all();
 }
@@ -1219,6 +1238,7 @@ void initialize_pipeline_cache() {
   const size_t loadedCount = load_pipeline_cache();
   if (!g_pipelineCacheBroken && loadedCount > 0) {
     g_gpuCachePrunePending = true;
+    g_bootPrecompileStartMs.store(steady_now_ms(), std::memory_order_relaxed);
   }
 
   if (!g_pipelineCacheBroken) {

@@ -17,6 +17,7 @@
 #include "../internal.hpp"
 #include "../webgpu/sdl2shim_present.hpp"
 #include "../window.hpp"
+#include "binary_cache.hpp"
 #include "context.hpp"
 #include "fbo_cache.hpp"
 #include "gl_core.hpp"
@@ -175,6 +176,11 @@ bool initialize(AuroraBackend backend, bool allowCpu) {
   // Device: the shim's borrowed context is current (create_device leaves it; our render context is
   // never bound on main) -- caps are display-global so this is equivalent.
   query_caps();
+
+  // Open the persistent program-binary cache now: a context is current (GL strings for the driver
+  // fingerprint are readable) and this runs before gfx::initialize -> initialize_pipeline_cache
+  // begins the boot precompile that will feed cached binaries back through glProgramBinary.
+  gl::binary_cache_initialize();
 
   const auto size = window::get_window_size();
   g_graphicsConfig.surfaceConfiguration.format = gl::TextureFormat::RGBA8Unorm;

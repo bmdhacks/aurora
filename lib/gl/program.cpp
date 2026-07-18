@@ -1,6 +1,7 @@
 #include "program.hpp"
 
 #include "../internal.hpp"
+#include "binary_cache.hpp"
 
 #include <fmt/format.h>
 
@@ -42,6 +43,22 @@ GLuint compile_stage(GLenum stage, const char* source, const char* label) {
 } // namespace
 
 GLuint compile_program(const char* vertexSource, const char* fragmentSource, const char* label) {
+  const uint64_t cacheKey = binary_cache_key(vertexSource, fragmentSource);
+
+  // 1) Persistent program-binary cache. Try to link from a stored binary on a throwaway program
+  //    object; a rejected binary is discarded and we fall through to a clean source compile (no
+  //    reuse-after-failed-glProgramBinary hazard). Disabled cache -> straight to source.
+  if (binary_cache_enabled()) {
+    const GLuint cached = gl.CreateProgram();
+    if (cached != 0) {
+      if (binary_cache_try_load(cacheKey, cached)) {
+        return cached;
+      }
+      gl.DeleteProgram(cached);
+    }
+  }
+
+  // 2) Compile + link from source.
   const GLuint vs = compile_stage(GL_VERTEX_SHADER, vertexSource, label);
   if (vs == 0) {
     return 0;
@@ -55,6 +72,10 @@ GLuint compile_program(const char* vertexSource, const char* fragmentSource, con
   const GLuint program = gl.CreateProgram();
   gl.AttachShader(program, vs);
   gl.AttachShader(program, fs);
+  if (binary_cache_enabled() && gl.ProgramParameteri != nullptr) {
+    // Some drivers only keep the binary retrievable when this is set before linking.
+    gl.ProgramParameteri(program, GL_PROGRAM_BINARY_RETRIEVABLE_HINT, GL_TRUE);
+  }
   gl.LinkProgram(program);
   // The shader objects are reference-counted by the program; drop our references
   // regardless of link result.
@@ -72,6 +93,9 @@ GLuint compile_program(const char* vertexSource, const char* fragmentSource, con
     gl.DeleteProgram(program);
     return 0;
   }
+
+  // 3) Persist the freshly linked binary for the next boot.
+  binary_cache_store(cacheKey, program);
   return program;
 }
 
