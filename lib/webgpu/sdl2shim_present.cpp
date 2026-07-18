@@ -3,6 +3,7 @@
 #include <array>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdlib>
 #include <mutex>
 
 #include <SDL3/SDL_video.h>
@@ -64,6 +65,7 @@ constexpr int32_t EGL_TRUE = 1;
 // wait returns immediately; the bound only exists so a wedged fence produces one logged, torn
 // frame instead of a silent hang.
 constexpr uint64_t RevSyncWaitTimeoutNs = 2'000'000'000;
+constexpr uint64_t FwdSyncWaitTimeoutNs = 2'000'000'000;
 
 using GlGenTexturesFn = void (*)(int32_t, uint32_t*);
 using GlBindTextureFn = void (*)(uint32_t, uint32_t);
@@ -161,6 +163,14 @@ int32_t g_framesOwed = 0;     // end_frames enqueued but not yet presented/dropp
 bool g_hasReadyFrame = false;
 uint32_t g_readySlot = 0;
 bool g_aborting = false;
+
+bool strict_present_sync() {
+  static const bool enabled = [] {
+    const char* value = std::getenv("AURORA_SDL2SHIM_STRICT_PRESENT_SYNC");
+    return value != nullptr && value[0] != '\0' && value[0] != '0';
+  }();
+  return enabled;
+}
 
 WGPUDevice device_handle() { return g_device.Get(); }
 
@@ -330,9 +340,17 @@ void blit_and_swap(Slot& slot) {
   int drawableHeight = static_cast<int>(g_height);
   SDL_GetWindowSizeInPixels(window, &drawableWidth, &drawableHeight);
 
-  // Wait, on the GPU, for Dawn to finish rendering this slot. This does not block the CPU.
+  // Affected cross-context EGL implementations can expose stale image contents after a server
+  // wait. The strict path waits for completion on the CPU before issuing the blit.
   if (slot.fwdSync != nullptr) {
-    g_gl.WaitSyncKHR(g_display, slot.fwdSync, 0);
+    if (strict_present_sync()) {
+      const int32_t waited = g_gl.ClientWaitSyncKHR(g_display, slot.fwdSync, 0, FwdSyncWaitTimeoutNs);
+      if (waited != EGL_CONDITION_SATISFIED_KHR) {
+        Log.warn("[sdl2shim-efb] forward-fence wait returned 0x{:x}; presenting frame anyway", waited);
+      }
+    } else {
+      g_gl.WaitSyncKHR(g_display, slot.fwdSync, 0);
+    }
   }
 
   g_gl.BindFramebuffer(GL_READ_FRAMEBUFFER, slot.readFbo);
