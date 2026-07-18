@@ -316,6 +316,26 @@ bool create_window(AuroraBackend backend) {
     height = 480;
   }
 
+  // Device (sdl2 shim) path: the firmware SDL2 creates its fbdev surface at exactly the size we
+  // request and there is no compositor to place or scale it, so a window that is not the panel size
+  // shows up clipped and offset -- and SDL_WINDOW_FULLSCREEN is a no-op through the shim, so it
+  // cannot fix that. Size the window to the panel's native mode (the shim republishes the firmware
+  // SDL2 desktop mode as this SDL3 display), which makes every handheld fill its own panel with no
+  // per-device window-size config. Desktop keeps the configured/default size. The min-size clamp
+  // above stays as the floor for the pathological "mode query failed" case.
+  if (sdl2ShimDriver) {
+    const SDL_DisplayID display = SDL_GetPrimaryDisplay();
+    const SDL_DisplayMode* mode = display != 0 ? SDL_GetDesktopDisplayMode(display) : nullptr;
+    if (mode != nullptr && mode->w > 0 && mode->h > 0) {
+      width = mode->w;
+      height = mode->h;
+      Log.info("Device panel mode is {}x{}; sizing the window to fill it", width, height);
+    } else {
+      Log.warn("Could not query the device panel mode ({}); leaving window at {}x{}",
+               SDL_GetError(), width, height);
+    }
+  }
+
   Sint32 posX = g_config.windowPosX;
   Sint32 posY = g_config.windowPosY;
   if (posX < 0 || posY < 0) {
