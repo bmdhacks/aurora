@@ -506,6 +506,11 @@ void populate_pipeline_config(PipelineConfig& config, GXPrimitive primitive, GXV
 gl::Pipeline build_pipeline(const PipelineConfig& config, uint32_t program, const char* label) noexcept;
 std::string build_shader_source(const ShaderConfig& config) noexcept;
 uint32_t build_shader(const ShaderConfig& config) noexcept;
+// Distinct-GLSL-program count (the dedup denominator) and teardown for the build_shader program
+// cache, which shares one linked GL program across pipelines that differ only in fixed-function
+// state. The programs live with the GL context, so this only drops the lookup table.
+size_t shader_program_count() noexcept;
+void clear_shader_program_cache() noexcept;
 GXBindGroups build_bind_groups(const ShaderInfo& info) noexcept;
 
 u8 comp_type_size(GXAttr attr, GXCompType type) noexcept;

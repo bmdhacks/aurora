@@ -9,6 +9,7 @@
 
 #include <dolphin/gx/GXEnum.h>
 
+#include <absl/container/flat_hash_map.h>
 #include <absl/container/flat_hash_set.h>
 #include <mutex>
 #include <string_view>
@@ -24,6 +25,16 @@ using namespace std::string_view_literals;
 static Module Log("aurora::gfx::gx");
 
 absl::flat_hash_set<gfx::ShaderRef> g_seenShaders;
+
+// GLSL program dedup: distinct GX PipelineConfigs that differ only in fixed-function state (blend,
+// depth, cull) share the same ShaderConfig and therefore the same linked GL program. Compiling once
+// and returning the shared GL name across those pipelines cuts cold-boot compiles (the long pole)
+// and keeps the program-binary cache smaller. Programs are never deleted mid-run (they live with the
+// context), so sharing one GLuint across pipelines is safe. Single-compiler by construction (builds
+// run on the pipeline-compiler thread, or the render worker in threadless mode); the mutex is cheap
+// insurance, not contended.
+static std::mutex g_programCacheMutex;
+static absl::flat_hash_map<gfx::ShaderRef, uint32_t> g_programByShaderHash;
 
 static inline std::string_view chan_comp(GXTevColorChan chan) noexcept {
   switch (chan) {
@@ -1424,6 +1435,13 @@ std::string build_shader_source(const ShaderConfig& config) noexcept {
 uint32_t build_shader(const ShaderConfig& config) noexcept {
   ZoneScoped;
   const auto hash = xxh3_hash(config);
+  {
+    std::lock_guard lock{g_programCacheMutex};
+    const auto it = g_programByShaderHash.find(hash);
+    if (it != g_programByShaderHash.end()) {
+      return it->second;
+    }
+  }
   const auto info = build_shader_info(config);
   const auto program = emit_glsl(config, info);
   if (EnableDebugPrints && !g_seenShaders.contains(hash)) {
@@ -1436,6 +1454,20 @@ uint32_t build_shader(const ShaderConfig& config) noexcept {
     return 0;
   }
   gl::configure_gx_program(gl_program, info.uniformSize);
+  {
+    std::lock_guard lock{g_programCacheMutex};
+    g_programByShaderHash.emplace(hash, gl_program);
+  }
   return gl_program;
+}
+
+size_t shader_program_count() noexcept {
+  std::lock_guard lock{g_programCacheMutex};
+  return g_programByShaderHash.size();
+}
+
+void clear_shader_program_cache() noexcept {
+  std::lock_guard lock{g_programCacheMutex};
+  g_programByShaderHash.clear();
 }
 } // namespace aurora::gx

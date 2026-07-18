@@ -831,6 +831,7 @@ void shutdown() noexcept {
   g_gxState.loadedTextures.fill({});
   g_gxState.loadedTluts.fill({});
   clear_copy_texture_cache();
+  clear_shader_program_cache();
 }
 } // namespace aurora::gx
 
