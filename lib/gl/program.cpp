@@ -2,6 +2,7 @@
 
 #include "../internal.hpp"
 #include "binary_cache.hpp"
+#include "census.hpp"
 
 #include <fmt/format.h>
 
@@ -52,6 +53,7 @@ GLuint compile_program(const char* vertexSource, const char* fragmentSource, con
     const GLuint cached = gl.CreateProgram();
     if (cached != 0) {
       if (binary_cache_try_load(cacheKey, cached)) {
+        census::programs.add(0);
         return cached;
       }
       gl.DeleteProgram(cached);
@@ -96,6 +98,7 @@ GLuint compile_program(const char* vertexSource, const char* fragmentSource, con
 
   // 3) Persist the freshly linked binary for the next boot.
   binary_cache_store(cacheKey, program);
+  census::programs.add(0);
   return program;
 }
 

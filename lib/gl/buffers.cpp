@@ -1,5 +1,6 @@
 #include "buffers.hpp"
 
+#include "census.hpp"
 #include "../internal.hpp"
 #include "../webgpu/gpu.hpp"
 
@@ -35,6 +36,7 @@ Buffer create_buffer(GLenum target, uint64_t size, bool dynamic, bool persistent
   } else {
     gl.BufferData(target, static_cast<GLsizeiptr>(size), nullptr, dynamic ? GL_DYNAMIC_DRAW : GL_STATIC_DRAW);
   }
+  census::buffers.add(static_cast<int64_t>(size));
   return Buffer{.id = id, .target = target, .size = size, .mapped = mapped};
 }
 
@@ -54,6 +56,7 @@ void upload_buffer(const Buffer& buffer, uint64_t offset, const void* data, uint
 
 void destroy_buffer(Buffer& buffer) noexcept {
   if (buffer.id != 0) {
+    census::buffers.sub(static_cast<int64_t>(buffer.size));
     if (buffer.mapped != nullptr && gl.UnmapBuffer != nullptr) {
       gl.BindBuffer(buffer.target, buffer.id);
       gl.UnmapBuffer(buffer.target);

@@ -1,5 +1,6 @@
 #include "fbo_cache.hpp"
 
+#include "census.hpp"
 #include "../internal.hpp"
 
 #include <vector>
@@ -40,6 +41,7 @@ GLuint get_framebuffer(const Texture& color, const Texture* depth) {
   if (status != GL_FRAMEBUFFER_COMPLETE) {
     Log.error("get_framebuffer: incomplete FBO (color={}, depth={}) status={:#x}", color.id, depthId, status);
   }
+  census::fbos.add(0);
   s_entries.push_back({color.id, depthId, fbo});
   return fbo;
 }
@@ -47,6 +49,7 @@ GLuint get_framebuffer(const Texture& color, const Texture* depth) {
 void clear_framebuffer_cache() noexcept {
   for (auto& e : s_entries) {
     if (e.fbo != 0) {
+      census::fbos.sub(0);
       gl.DeleteFramebuffers(1, &e.fbo);
     }
   }
@@ -60,6 +63,7 @@ void invalidate_framebuffers_for(GLuint textureId) noexcept {
   for (auto it = s_entries.begin(); it != s_entries.end();) {
     if (it->color == textureId || it->depth == textureId) {
       if (it->fbo != 0) {
+        census::fbos.sub(0);
         gl.DeleteFramebuffers(1, &it->fbo);
       }
       it = s_entries.erase(it);

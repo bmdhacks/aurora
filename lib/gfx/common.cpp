@@ -4,6 +4,7 @@
 #include "depth_peek.hpp"
 #include "../internal.hpp"
 #include "../gl/binary_cache.hpp"
+#include "../gl/census.hpp"
 #include "../gl/context.hpp"
 #include "../gl/fbo_cache.hpp"
 #include "../gl/state.hpp"
@@ -1624,6 +1625,7 @@ void end_frame(EndFrameCallback callback) {
     g_frameSlots.release(frameSlot);
     expire_cached_bind_groups();
     process_events();
+    gl::census::log_tick();
   });
 }
 

@@ -1,5 +1,6 @@
 #include "textures.hpp"
 
+#include "census.hpp"
 #include "../internal.hpp"
 
 #include <vector>
@@ -32,6 +33,30 @@ GLint address_enum(AddressMode mode) {
   default:
     return GL_CLAMP_TO_EDGE;
   }
+}
+
+// GPU storage the full declared mip chain occupies (glTexStorage2D allocates every
+// level up front, whether or not it is ever uploaded).
+int64_t texture_gpu_bytes(TextureFormat format, Extent3D size, uint32_t levels) {
+  const auto info = gl_format(format);
+  if (!info.valid) {
+    return 0;
+  }
+  int64_t total = 0;
+  uint32_t w = size.width;
+  uint32_t h = size.height;
+  for (uint32_t l = 0; l < levels; ++l) {
+    if (info.compressed) {
+      const int64_t blocksW = (w + info.blockWidth - 1) / info.blockWidth;
+      const int64_t blocksH = (h + info.blockHeight - 1) / info.blockHeight;
+      total += blocksW * blocksH * info.blockBytes;
+    } else {
+      total += static_cast<int64_t>(w) * h * info.bytesPerPixel;
+    }
+    w = w > 1 ? w / 2 : 1;
+    h = h > 1 ? h / 2 : 1;
+  }
+  return total;
 }
 } // namespace
 
@@ -152,6 +177,7 @@ Texture create_texture(TextureFormat format, Extent3D size, uint32_t mips, bool 
     gl.TexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, static_cast<GLsizei>(size.width), static_cast<GLsizei>(size.height),
                      info.external, info.type, zeros.data());
   }
+  census::textures.add(texture_gpu_bytes(format, size, levels));
   return Texture{
       .id = id,
       .format = format,
@@ -196,6 +222,7 @@ void upload_texture(const Texture& texture, uint32_t level, Origin3D offset, Ext
 
 void destroy_texture(Texture& texture) noexcept {
   if (texture.id != 0) {
+    census::textures.sub(texture_gpu_bytes(texture.format, texture.size, texture.mips));
     gl.DeleteTextures(1, &texture.id);
     texture.id = 0;
   }
@@ -214,11 +241,13 @@ Sampler create_sampler(const SamplerDescriptor& desc, bool anisotropySupported) 
   if (anisotropySupported && desc.maxAnisotropy > 1) {
     gl.SamplerParameterf(id, GL_TEXTURE_MAX_ANISOTROPY_EXT, static_cast<GLfloat>(desc.maxAnisotropy));
   }
+  census::samplers.add(0);
   return Sampler{.id = id};
 }
 
 void destroy_sampler(Sampler& sampler) noexcept {
   if (sampler.id != 0) {
+    census::samplers.sub(0);
     gl.DeleteSamplers(1, &sampler.id);
     sampler.id = 0;
   }
