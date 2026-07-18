@@ -18,6 +18,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <optional>
+#include <set>
 #include <vector>
 
 namespace aurora::gx::fifo {
@@ -1908,13 +1909,31 @@ static constexpr bool kLogNativeDecline = false;
 static bool native_decline(int reason, GXVtxFmt fmt, int attr) {
   if constexpr (kLogNativeDecline) {
     static Module Log("aurora::gx");
-    static int counts[8] = {};
-    static const char* const reasons[8] = {"NBT-normal",     "undecodable-type", "nonresident-index-array",
-                                            "non-direct-type", ">16-attrs",       "no-position",
-                                            "?",              "?"};
-    if (reason >= 0 && reason < 8 && counts[reason]++ < 6) {
-      Log.warn("native fetch DECLINED reason={} fmt={} attr={} -> storage fallback (breaks on Mali)",
-               reasons[reason], static_cast<int>(fmt), attr);
+    static const char* const reasons[8] = {"NBT-normal",      "undecodable-type", "nonresident-index-array",
+                                            "non-direct-type", ">16-attrs",        "no-position",
+                                            "?",               "?"};
+    // Dedup by unique declined layout so the boot flood can't exhaust a fixed budget
+    // before an in-game dialog/HUD layout first appears — each distinct layout logs once.
+    static std::set<std::string> seen;
+    const auto& vf = g_gxState.vtxFmts[fmt];
+    std::string layout;
+    for (int i = GX_VA_PNMTXIDX; i <= GX_VA_TEX7; ++i) {
+      const auto t = g_gxState.vtxDesc[i];
+      if (t == GX_NONE) {
+        continue;
+      }
+      const auto& af = vf.attrs[i];
+      layout += fmt::format(" a{}:desc{}/type{}/cnt{}/frac{}", i, static_cast<int>(t), static_cast<int>(af.type),
+                            static_cast<int>(af.cnt), static_cast<int>(af.frac));
+      if (t == GX_INDEX8 || t == GX_INDEX16) {
+        const auto& arr = g_gxState.arrays[i];
+        layout += fmt::format("[arrData={} sz={} str={}]", arr.data != nullptr, arr.size, arr.stride);
+      }
+    }
+    const std::string key = fmt::format("r{}f{}{}", reason, static_cast<int>(fmt), layout);
+    if (seen.size() < 64 && seen.insert(key).second) {
+      Log.warn("[decline-diag] reason={} fmt={} badAttr={} |{}", reasons[(reason < 0 || reason > 7) ? 6 : reason],
+               static_cast<int>(fmt), attr, layout);
     }
   }
   return false;
