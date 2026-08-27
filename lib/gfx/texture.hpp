@@ -2,25 +2,31 @@
 #include <dolphin/gx.h>
 
 #include <utility>
+#include <vector>
 
-#include "types.hpp"
+#include "common.hpp"
 
 namespace aurora::gfx {
+// A pending texture upload. On GL this is a direct glTexSubImage2D from CPU memory
+// (the WebGPU staging-buffer + CopyBufferToTexture path is gone): `range` indexes
+// the frame's textureUpload ByteBuffer, or `data` points at caller-owned bytes.
 struct TextureUpload {
-  wgpu::TexelCopyBufferLayout layout;
-  wgpu::TexelCopyTextureInfo tex;
-  wgpu::Extent3D size;
-  wgpu::Buffer buffer;
+  gl::Texture tex;
+  gl::Origin3D origin;
+  gl::Extent3D size;
+  uint32_t level = 0;
+  uint32_t bytesPerRow = 0;    // source row stride; 0 = tightly packed
+  Range range;                 // offset/length into the frame textureUpload buffer
+  const uint8_t* data = nullptr; // when set, upload from here instead of the frame buffer
 
-  TextureUpload(wgpu::TexelCopyBufferLayout layout, wgpu::TexelCopyTextureInfo tex, wgpu::Extent3D size) noexcept
-  : layout(layout), tex(std::move(tex)), size(size) {}
-  TextureUpload(wgpu::TexelCopyBufferLayout layout, wgpu::TexelCopyTextureInfo tex, wgpu::Extent3D size,
-                wgpu::Buffer buffer) noexcept
-  : layout(layout), tex(std::move(tex)), size(size), buffer(std::move(buffer)) {}
+  TextureUpload() noexcept = default;
+  TextureUpload(gl::Texture tex, gl::Origin3D origin, gl::Extent3D size, uint32_t level, uint32_t bytesPerRow,
+                Range range) noexcept
+  : tex(tex), origin(origin), size(size), level(level), bytesPerRow(bytesPerRow), range(range) {}
 };
 void queue_texture_upload(TextureUpload upload);
-void queue_texture_upload_data(const uint8_t* data, uint32_t bytesPerRow, uint32_t rowsPerImage,
-                               wgpu::TexelCopyTextureInfo tex, wgpu::Extent3D size);
+void queue_texture_upload_data(const uint8_t* data, uint32_t bytesPerRow, uint32_t rowsPerImage, gl::Texture tex,
+                               gl::Origin3D origin, gl::Extent3D size, uint32_t level = 0);
 
 struct TextureFormatInfo {
   uint8_t blockWidth;
@@ -28,32 +34,49 @@ struct TextureFormatInfo {
   uint8_t blockSize;
   bool compressed;
 };
-TextureFormatInfo format_info(wgpu::TextureFormat format) noexcept;
-uint64_t calc_texture_size(wgpu::TextureFormat format, uint32_t width, uint32_t height, uint32_t mips) noexcept;
-bool is_block_aligned(wgpu::TextureFormat format, uint32_t width, uint32_t height) noexcept;
+TextureFormatInfo format_info(gl::TextureFormat format) noexcept;
+uint64_t calc_texture_size(gl::TextureFormat format, uint32_t width, uint32_t height, uint32_t mips) noexcept;
+bool is_block_aligned(gl::TextureFormat format, uint32_t width, uint32_t height) noexcept;
 
 constexpr u32 InvalidTextureFormat = -1;
+// In GL the sample view and attachment view are just the texture; both fields keep
+// their names (call sites unchanged) but hold copies of the same gl::Texture.
 struct TextureRef {
-  wgpu::Texture texture;
-  wgpu::TextureView sampleTextureView;
-  wgpu::TextureView attachmentTextureView;
-  wgpu::Extent3D size;
-  wgpu::TextureFormat format;
+  gl::Texture texture;
+  gl::Texture sampleTextureView;
+  gl::Texture attachmentTextureView;
+  gl::Extent3D size;
+  gl::TextureFormat format;
   uint32_t mipCount;
   u32 gxFormat;
   bool hasArbitraryMips = false;
   bool isReplacement = false;
 
-  TextureRef(wgpu::Texture texture, wgpu::TextureView sampleTextureView, wgpu::TextureView attachmentTextureView,
-             wgpu::Extent3D size, wgpu::TextureFormat format, uint32_t mipCount, u32 gxFormat)
-  : texture(std::move(texture))
-  , sampleTextureView(std::move(sampleTextureView))
-  , attachmentTextureView(std::move(attachmentTextureView))
+  TextureRef(gl::Texture texture, gl::Texture sampleTextureView, gl::Texture attachmentTextureView, gl::Extent3D size,
+             gl::TextureFormat format, uint32_t mipCount, u32 gxFormat)
+  : texture(texture)
+  , sampleTextureView(sampleTextureView)
+  , attachmentTextureView(attachmentTextureView)
   , size(size)
   , format(format)
   , mipCount(mipCount)
   , gxFormat(gxFormat) {}
+
+  // Owns the GL texture: the views are copies of the same gl::Texture, so exactly one
+  // glDeleteTextures per ref. Without this every dropped handle (TLUT rebuild, tex-data
+  // version bump, area unload) leaked its GL texture into pinned driver memory -- the
+  // G31 OOM. Deletion marshals to the render worker (context owner); see texture.cpp.
+  ~TextureRef();
+  TextureRef(const TextureRef&) = delete;
+  TextureRef& operator=(const TextureRef&) = delete;
 };
+
+// Deferred GL-texture deletion (see ~TextureRef in texture.cpp for why deletes must
+// not jump the render-worker queue). Any thread may defer; end_frame() snapshots the
+// accumulated list into the frame's end-of-frame worker item, which destroys them
+// after every pass of the frame has executed.
+void defer_texture_destroy(const gl::Texture& texture) noexcept;
+std::vector<gl::Texture> take_deferred_texture_destroys() noexcept;
 
 TextureHandle new_static_texture_2d(uint32_t width, uint32_t height, uint32_t mips, u32 gxFormat,
                                     ArrayRef<uint8_t> data, bool tlut, const char* label) noexcept;
@@ -132,13 +155,11 @@ namespace aurora::gfx {
 struct TextureBind {
   TextureHandle ref;
   GXTexObj_ texObj;
-  uint64_t generation = 0;
 
   TextureBind() noexcept = default;
-  TextureBind(const GXTexObj_& obj, TextureHandle handle, uint64_t bindGeneration = 0) noexcept
-  : ref(std::move(handle)), texObj(obj), generation(bindGeneration) {}
+  TextureBind(const GXTexObj_& obj, TextureHandle handle) noexcept : ref(std::move(handle)), texObj(obj) {}
   void reset() noexcept { ref.reset(); }
-  [[nodiscard]] wgpu::SamplerDescriptor get_descriptor() const noexcept;
+  [[nodiscard]] gl::SamplerDescriptor get_descriptor() const noexcept;
   operator bool() const noexcept { return ref.operator bool(); }
 };
 } // namespace aurora::gfx

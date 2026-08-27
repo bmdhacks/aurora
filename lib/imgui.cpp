@@ -8,72 +8,35 @@
 #include <utility>
 #include <vector>
 
-#include <webgpu/webgpu_cpp.h>
 #include <SDL3/SDL_events.h>
 #include <SDL3/SDL_render.h>
 
 #include "internal.hpp"
 #include "gfx/render_worker.hpp"
+#include "gl/gl_core.hpp"
+#include "gl/pass.hpp"
+#include "gl/state.hpp"
+#include "gl/textures.hpp"
 #include "webgpu/gpu.hpp"
 #include "window.hpp"
 
-#define IMGUI_IMPL_WEBGPU_BACKEND_DAWN
+// The GLES imgui backend is imgui_impl_opengl3 driven with a "#version 300 es" init
+// string. Its GL objects live on the render worker's context, so init/shutdown/render
+// and user-texture uploads are all marshaled there. The SDL_Renderer path stays for the
+// headless/NULL backend (no GL context).
+#include "backends/imgui_impl_opengl3.h"
 #include "backends/imgui_impl_sdl3.h"
 #include "backends/imgui_impl_sdlrenderer3.h"
-#include "backends/imgui_impl_wgpu.h"
 #include "tracy/Tracy.hpp"
 
 namespace aurora::imgui {
-namespace {
-float g_scale;
-std::string g_imguiSettings{};
-std::string g_imguiLog{};
-bool g_useSdlRenderer = false;
+static float g_scale;
+static std::string g_imguiSettings{};
+static std::string g_imguiLog{};
+static bool g_useSdlRenderer = false;
 
-std::vector<SDL_Texture*> g_sdlTextures;
-std::vector<wgpu::Texture> g_wgpuTextures;
-
-wgpu::Buffer create_texture_upload_buffer(uint32_t width, uint32_t height, const uint8_t* data,
-                                          uint32_t copyBytesPerRow) {
-  const uint32_t rowBytes = width * 4;
-  const uint64_t uploadSize = static_cast<uint64_t>(copyBytesPerRow) * height;
-  const wgpu::BufferDescriptor desc{
-      .label = "imgui texture upload buffer",
-      .usage = wgpu::BufferUsage::CopySrc,
-      .size = uploadSize,
-      .mappedAtCreation = true,
-  };
-  auto buffer = webgpu::g_device.CreateBuffer(&desc);
-  auto* dst = static_cast<uint8_t*>(buffer.GetMappedRange(0, uploadSize));
-  for (uint32_t row = 0; row < height; ++row) {
-    std::memcpy(dst, data, rowBytes);
-    dst += copyBytesPerRow;
-    data += rowBytes;
-  }
-  buffer.Unmap();
-  return buffer;
-}
-
-void enqueue_texture_upload(wgpu::Buffer buffer, wgpu::TexelCopyTextureInfo dst, wgpu::TexelCopyBufferLayout layout,
-                            wgpu::Extent3D size) {
-  gfx::render_worker::enqueue_work([buffer = std::move(buffer), dst = std::move(dst), layout, size] {
-    const wgpu::CommandEncoderDescriptor encoderDesc{
-        .label = "imgui texture upload encoder",
-    };
-    auto encoder = webgpu::g_device.CreateCommandEncoder(&encoderDesc);
-    const wgpu::TexelCopyBufferInfo src{
-        .layout = layout,
-        .buffer = buffer,
-    };
-    encoder.CopyBufferToTexture(&src, &dst, &size);
-    constexpr wgpu::CommandBufferDescriptor commandBufferDesc{
-        .label = "imgui texture upload command buffer",
-    };
-    auto commandBuffer = encoder.Finish(&commandBufferDesc);
-    webgpu::g_queue.Submit(1, &commandBuffer);
-  });
-}
-} // namespace
+static std::vector<SDL_Texture*> g_sdlTextures;
+static std::vector<gl::Texture> g_glTextures;
 
 struct DrawData::Impl {
   ImDrawData drawData;
@@ -98,10 +61,15 @@ void initialize() noexcept {
   if (g_useSdlRenderer) {
     ImGui_ImplSDLRenderer3_Init(renderer);
   } else {
-    ImGui_ImplWGPU_InitInfo info;
-    info.Device = webgpu::g_device.Get();
-    info.RenderTargetFormat = static_cast<WGPUTextureFormat>(webgpu::g_graphicsConfig.surfaceConfiguration.format);
-    ImGui_ImplWGPU_Init(&info);
+    // The imgui GL objects (shaders + font atlas texture) must be created on the render
+    // worker's context, so init there and force device-object creation (NewFrame lazily
+    // builds them) before the first real frame renders on the worker.
+    gfx::render_worker::enqueue_work([] {
+      ImGui_ImplOpenGL3_Init("#version 300 es");
+      ImGui_ImplOpenGL3_NewFrame();
+      gl::invalidate_texture_bindings();
+    });
+    gfx::render_worker::synchronize();
   }
 }
 
@@ -110,7 +78,8 @@ void shutdown() noexcept {
   if (g_useSdlRenderer) {
     ImGui_ImplSDLRenderer3_Shutdown();
   } else {
-    ImGui_ImplWGPU_Shutdown();
+    gfx::render_worker::enqueue_work([] { ImGui_ImplOpenGL3_Shutdown(); });
+    gfx::render_worker::synchronize();
   }
   ImGui_ImplSDL3_Shutdown();
   ImGui::DestroyContext();
@@ -118,7 +87,7 @@ void shutdown() noexcept {
     SDL_DestroyTexture(texture);
   }
   g_sdlTextures.clear();
-  g_wgpuTextures.clear();
+  g_glTextures.clear();
 }
 
 void process_event(const SDL_Event& event) noexcept {
@@ -184,16 +153,24 @@ void new_frame(const AuroraWindowSize& size) noexcept {
     ImGui_ImplSDLRenderer3_NewFrame();
     g_scale = size.scale;
   } else {
-    if (g_scale != size.scale) {
-      if (g_scale > 0.f) {
-        ImGui_ImplWGPU_CreateDeviceObjects();
-      }
-      g_scale = size.scale;
+    // The game rebuilds the imgui font atlas whenever the UI scale changes
+    // (dusk::ImGuiEngine_Initialize -> io.Fonts->Clear() + re-add fonts, fired on window resize),
+    // which invalidates the atlas: Fonts->IsBuilt() goes false and the ImFont objects are recreated.
+    // The backend font texture must then be rebuilt, or the next ImGui::NewFrame dereferences a font
+    // whose ContainerAtlas is gone (ContainerAtlas == nullptr -> crash; hit on device when the window
+    // resizes 320x320 -> 304x224). The old Dawn path rebuilt here too. The rebuild issues GL, so it
+    // must run where the render context is current -- the render worker (the main thread has no GL
+    // context on desktop, and only the shim's present context on device), same as init above.
+    if ((g_scale > 0.f && g_scale != size.scale) || !ImGui::GetIO().Fonts->IsBuilt()) {
+      gfx::render_worker::enqueue_work([] {
+        ImGui_ImplOpenGL3_DestroyFontsTexture();
+        ImGui_ImplOpenGL3_CreateFontsTexture();
+        gl::invalidate_texture_bindings();
+      });
+      gfx::render_worker::synchronize();
     }
-    if (!ImGui::GetIO().Fonts->IsBuilt()) {
-      ImGui_ImplWGPU_CreateDeviceObjects();
-    }
-    ImGui_ImplWGPU_NewFrame();
+    g_scale = size.scale;
+    ImGui_ImplOpenGL3_NewFrame();
   }
   ImGui_ImplSDL3_NewFrame();
 
@@ -220,7 +197,7 @@ DrawData freeze() noexcept {
   return DrawData{std::move(frozen)};
 }
 
-void render(const wgpu::RenderPassEncoder& pass, const DrawData& drawData) noexcept {
+void render(gl::PassEncoder& pass, const DrawData& drawData) noexcept {
   ZoneScoped;
 
   if (!drawData.m_impl) {
@@ -236,9 +213,13 @@ void render(const wgpu::RenderPassEncoder& pass, const DrawData& drawData) noexc
     ImGui_ImplSDLRenderer3_RenderDrawData(data, renderer);
     SDL_RenderPresent(renderer);
   } else {
-    pass.PushDebugGroup("Aurora: Dear Imgui");
-    ImGui_ImplWGPU_RenderDrawData(data, pass.Get());
-    pass.PopDebugGroup();
+    // Runs on the render worker (end-frame callback). Draw over the bound framebuffer (the
+    // window's default framebuffer, on top of the presented scene + RmlUi overlay).
+    // ImGui_ImplOpenGL3_RenderDrawData sets its own viewport/program/blend from the draw data.
+    gl::gl.BindFramebuffer(gl::GL_FRAMEBUFFER, pass.target().fbo);
+    ImGui_ImplOpenGL3_RenderDrawData(data);
+    // imgui restored raw GL it does not track; drop the state-cache shadow.
+    gl::reset_state_cache();
   }
 }
 
@@ -250,43 +231,24 @@ ImTextureID add_texture(uint32_t width, uint32_t height, const uint8_t* data) no
     g_sdlTextures.push_back(texture);
     return reinterpret_cast<ImTextureID>(texture);
   }
-  const wgpu::Extent3D size{
-      .width = width,
-      .height = height,
-      .depthOrArrayLayers = 1,
-  };
-  const wgpu::TextureDescriptor textureDescriptor{
-      .label = "imgui texture",
-      .usage = wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::CopyDst,
-      .dimension = wgpu::TextureDimension::e2D,
-      .size = size,
-      .format = wgpu::TextureFormat::RGBA8Unorm,
-      .mipLevelCount = 1,
-      .sampleCount = 1,
-  };
-  const wgpu::TextureViewDescriptor textureViewDescriptor{
-      .label = "imgui texture view",
-      .format = wgpu::TextureFormat::RGBA8Unorm,
-      .dimension = wgpu::TextureViewDimension::e2D,
-      .mipLevelCount = WGPU_MIP_LEVEL_COUNT_UNDEFINED,
-      .arrayLayerCount = WGPU_ARRAY_LAYER_COUNT_UNDEFINED,
-  };
-  auto texture = webgpu::g_device.CreateTexture(&textureDescriptor);
-  auto textureView = texture.CreateView(&textureViewDescriptor);
-  {
-    const wgpu::TexelCopyTextureInfo dstView{
-        .texture = texture,
-    };
-    const uint32_t copyBytesPerRow = AURORA_ALIGN(width * 4, 256);
-    const wgpu::TexelCopyBufferLayout dataLayout{
-        .bytesPerRow = copyBytesPerRow,
-        .rowsPerImage = height,
-    };
-    enqueue_texture_upload(create_texture_upload_buffer(width, height, data, copyBytesPerRow), dstView, dataLayout,
-                           size);
-  }
-  g_wgpuTextures.push_back(texture);
-  return reinterpret_cast<ImTextureID>(textureView.MoveToCHandle());
+  // Create + upload a GL texture on the render worker; imgui uses the GL texture name as the
+  // ImTextureID directly (ImGui_ImplOpenGL3 binds it with glBindTexture and sampler 0, so set
+  // linear filtering on the texture itself).
+  gl::Texture texture;
+  const gl::Extent3D size{width, height, 1};
+  gfx::render_worker::enqueue_work([&] {
+    texture = gl::create_texture(gl::TextureFormat::RGBA8Unorm, size, 1, /*renderable=*/false);
+    gl::gl.BindTexture(gl::GL_TEXTURE_2D, texture.id);
+    gl::gl.TexParameteri(gl::GL_TEXTURE_2D, gl::GL_TEXTURE_MIN_FILTER, gl::GL_LINEAR);
+    gl::gl.TexParameteri(gl::GL_TEXTURE_2D, gl::GL_TEXTURE_MAG_FILTER, gl::GL_LINEAR);
+    gl::gl.PixelStorei(gl::GL_UNPACK_ALIGNMENT, 4);
+    gl::gl.TexSubImage2D(gl::GL_TEXTURE_2D, 0, 0, 0, static_cast<gl::GLsizei>(width),
+                         static_cast<gl::GLsizei>(height), gl::GL_RGBA, gl::GL_UNSIGNED_BYTE, data);
+    gl::invalidate_texture_bindings();
+  });
+  gfx::render_worker::synchronize();
+  g_glTextures.push_back(texture);
+  return static_cast<ImTextureID>(texture.id);
 }
 } // namespace aurora::imgui
 

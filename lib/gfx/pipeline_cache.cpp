@@ -1,10 +1,11 @@
 #include "pipeline_cache.hpp"
 
 #include "clear.hpp"
-#include "resources.hpp"
-#include "hash.hpp"
+#include "../fs_helper.hpp"
+#include "../gl/binary_cache.hpp"
+#include "../gl/context.hpp"
+#include "../gx/gx.hpp"
 #include "../gx/pipeline.hpp"
-#include "../io.hpp"
 #ifdef AURORA_ENABLE_RMLUI
 #include "../rmlui/pipeline.hpp"
 #endif
@@ -13,6 +14,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <deque>
 #include <filesystem>
@@ -35,7 +37,7 @@ constexpr const char* InitialPipelineCacheName = "initial_pipeline_cache.db";
 constexpr const char* SdlVfsName = "aurora_pipeline_cache_sdl_vfs";
 
 struct CachedPipeline {
-  wgpu::RenderPipeline pipeline;
+  gl::Pipeline pipeline;
   uint32_t firstFrameUsed = UINT32_MAX;
 };
 
@@ -316,8 +318,8 @@ static bool register_sdl_vfs() {
 }
 
 #if defined(__cpp_lib_atomic_ref)
-static std::atomic_ref queuedPipelines{detail::resources().stats.queuedPipelines};
-static std::atomic_ref createdPipelines{detail::resources().stats.createdPipelines};
+static std::atomic_ref queuedPipelines{g_stats.queuedPipelines};
+static std::atomic_ref createdPipelines{g_stats.createdPipelines};
 #else
 struct AtomicStatRef {
   uint32_t& ref;
@@ -329,10 +331,26 @@ struct AtomicStatRef {
     __atomic_store_n(&ref, val, __ATOMIC_RELAXED);
     return val;
   }
+  operator uint32_t() const { return __atomic_load_n(&ref, __ATOMIC_RELAXED); }
 };
-static AtomicStatRef queuedPipelines{detail::resources().stats.queuedPipelines};
-static AtomicStatRef createdPipelines{detail::resources().stats.createdPipelines};
+static AtomicStatRef queuedPipelines{g_stats.queuedPipelines};
+static AtomicStatRef createdPipelines{g_stats.createdPipelines};
 #endif
+
+// Which pipeline the worker is currently inside create() for, and since when (steady_clock ms).
+// 0 = idle. Lets a stalled blocking waiter name the build that is wedging the worker — a create()
+// parked inside the driver can't log from its own thread.
+static std::atomic<PipelineRef> g_inFlightPipeline{0};
+static std::atomic<int64_t> g_inFlightPipelineSinceMs{0};
+
+// When the boot precompile began (steady_clock ms), for the drain summary line. Set when the
+// warm-cache load arms g_gpuCachePrunePending; read once when the queue drains.
+static std::atomic<int64_t> g_bootPrecompileStartMs{0};
+
+static int64_t steady_now_ms() {
+  return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
 
 template <typename PipelineConfig>
 static PipelineCacheWrite make_pipeline_cache_write(ShaderType type, PipelineRef hash, const PipelineConfig& config,
@@ -421,8 +439,22 @@ static std::optional<PendingPipeline> take_pending_pipeline(PipelineRef hash) {
 static void notify_pipeline_ready(bool queued) {
   ++createdPipelines;
   if (queued && --queuedPipelines == 0 && g_gpuCachePrunePending.exchange(false, std::memory_order_acq_rel)) {
-    // Prune GPU cache entries after fully loading the pipeline cache.
-    webgpu::cache_prune();
+    // The warm-cache boot precompile has fully drained. The Dawn GPU blob cache (gpu_cache.cpp) is
+    // gone, so there is nothing to prune (Normalcy rule 2) — but this is the moment the process has
+    // survived feeding every cached program binary back through glProgramBinary, so let the binary
+    // cache disarm its crash sentinel, and log one summary of the boot compile work.
+    gl::binary_cache_precompile_drained();
+    const int64_t elapsedMs = steady_now_ms() - g_bootPrecompileStartMs.load(std::memory_order_relaxed);
+    if (gl::binary_cache_enabled()) {
+      Log.info("[pipeline-cache] boot precompile done: {} pipelines built, {} unique GX programs, "
+               "{} program-binary hits, {} source compiles, {} ms",
+               static_cast<uint32_t>(createdPipelines), gx::shader_program_count(), gl::binary_cache_hits(),
+               gl::binary_cache_misses(), elapsedMs);
+    } else {
+      Log.info("[pipeline-cache] boot precompile done: {} pipelines built, {} unique GX programs, {} ms "
+               "(program-binary cache off)",
+               static_cast<uint32_t>(createdPipelines), gx::shader_program_count(), elapsedMs);
+    }
   }
   g_pipelineReadyCv.notify_all();
 }
@@ -539,8 +571,27 @@ static PipelineRef find_pipeline_impl(ShaderType type, const PipelineConfig& con
   }
 
   if (blocking && !pipelineReady) {
+    // Bounded, never infinite: this wait runs on the game thread, and on Mali-G31 a pipeline
+    // build can wedge inside libmali — an unbounded wait here turns that into a silent black
+    // screen (game loop parked before its first [clock] line). If the build doesn't land in
+    // time, name the culprit and return; bind_pipeline() skips draws whose pipeline isn't
+    // ready, so the cost of bailing is a missing UI element for a few frames, not a hang.
     std::unique_lock lock{g_pipelineMutex};
-    g_pipelineReadyCv.wait(lock, [=] { return g_pipelines.contains(hash) || g_pipelineThreadEnd; });
+    int stalls = 0;
+    while (!g_pipelineReadyCv.wait_for(lock, std::chrono::seconds{5},
+                                       [=] { return g_pipelines.contains(hash) || g_pipelineThreadEnd; })) {
+      const PipelineRef inFlight = g_inFlightPipeline.load(std::memory_order_relaxed);
+      const int64_t inFlightMs =
+          inFlight != 0 ? steady_now_ms() - g_inFlightPipelineSinceMs.load(std::memory_order_relaxed) : 0;
+      Log.warn("[pipeline-cache] blocking wait for {:016x} stalled {}s (worker in-flight {:016x} for {} ms, "
+               "priority={} background={} counter={})",
+               hash, (stalls + 1) * 5, inFlight, inFlightMs, g_pipelineQueue.size(), g_backgroundPipelineQueue.size(),
+               static_cast<uint32_t>(queuedPipelines));
+      if (++stalls >= 2) {
+        Log.error("[pipeline-cache] giving up blocking wait for {:016x}; draws will be skipped until it builds", hash);
+        break;
+      }
+    }
     auto pipelineIt = g_pipelines.find(hash);
     if (pipelineIt != g_pipelines.end() && persist && firstFrameUsed < pipelineIt->second.firstFrameUsed) {
       pipelineIt->second.firstFrameUsed = firstFrameUsed;
@@ -727,7 +778,7 @@ static bool prepare_pipeline_cache_db() {
     return true;
   }
 
-  const auto path = io::fs_path_to_string(io::fs_path_from_string(g_config.cachePath) / "pipeline_cache.db");
+  const auto path = fs_path_to_string(std::filesystem::path{g_config.cachePath} / "pipeline_cache.db");
   auto ret = sqlite3_open(path.c_str(), &g_pipelineCacheDb);
   if (ret != SQLITE_OK) {
     Log.error("Failed to open pipeline cache database: {}", sqlite3_errmsg(g_pipelineCacheDb));
@@ -968,6 +1019,26 @@ static void pipeline_worker() {
   tracy::SetThreadName("Pipeline compilation thread");
 #endif
 
+  // The dedicated compiler thread owns the share context for its whole life (Normalcy
+  // Doctrine rule 3): GLSL compile/link (glCreateShader/glLinkProgram) needs a current
+  // context, and objects it creates are shared with the render worker's context (a
+  // glFlush after link, in configure_gx_program, makes them visible). Runs once per
+  // thread entry (this function is the dedicated thread's body). In threadless mode it
+  // runs per-frame on the render worker, which already owns the render context.
+  if (g_hasPipelineThread) {
+    if (!gl::make_share_current()) {
+      Log.error("[pipeline-cache] compiler thread could not bind the share context; GLSL compile will fail");
+    }
+  }
+
+  // DIAGNOSTIC (queuedPipelines stuck >0 with idle thread, observed G31 2026-07-10): announce
+  // this thread's lifetime, dump the accounting whenever we sleep >10s with a nonzero counter,
+  // and time each build. Remove once the leak is root-caused. (Lifetime logs are gated on
+  // g_hasPipelineThread: in threadless mode this function runs once per frame.)
+  if (g_hasPipelineThread) {
+    Log.info("[pipeline-cache] compilation thread started");
+  }
+
   bool hasMore = false;
   while (g_hasPipelineThread || g_pipelinesPerFrame < BuildPipelinesPerFrame) {
     PendingPipeline pending;
@@ -975,9 +1046,21 @@ static void pipeline_worker() {
       std::unique_lock lock{g_pipelineMutex};
       if (g_hasPipelineThread) {
         if (!hasMore) {
-          g_pipelineQueueCv.wait(lock, [] {
+          while (!g_pipelineQueueCv.wait_for(lock, std::chrono::seconds{10}, [] {
             return !g_pipelineQueue.empty() || !g_backgroundPipelineQueue.empty() || g_pipelineThreadEnd;
-          });
+          })) {
+            const uint32_t counted = queuedPipelines;
+            if (counted != 0) {
+              std::string pendingHashes;
+              for (const auto hash : g_pendingPipelines) {
+                fmt::format_to(std::back_inserter(pendingHashes), " {:016x}", hash);
+              }
+              Log.warn("[pipeline-cache] counter says {} queued but queues are empty "
+                       "(priority={} background={} pendingSet={}:{}) — accounting leak",
+                       counted, g_pipelineQueue.size(), g_backgroundPipelineQueue.size(),
+                       g_pendingPipelines.size(), pendingHashes);
+            }
+          }
         }
       } else if (g_pipelineQueue.empty() && g_backgroundPipelineQueue.empty()) {
         return;
@@ -985,11 +1068,28 @@ static void pipeline_worker() {
       if (g_pipelineThreadEnd) {
         break;
       }
+      // hasMore was computed under a previous hold of the mutex; re-validate rather than call
+      // front() on an empty deque if the state moved underneath us.
+      if (g_pipelineQueue.empty() && g_backgroundPipelineQueue.empty()) {
+        Log.warn("[pipeline-cache] hasMore was stale: both queues empty after skip-wait (counter {})",
+                 static_cast<uint32_t>(queuedPipelines));
+        hasMore = false;
+        continue;
+      }
       auto& source = !g_pipelineQueue.empty() ? g_pipelineQueue : g_backgroundPipelineQueue;
       pending = std::move(source.front());
       source.pop_front();
     }
+    const auto buildStart = std::chrono::steady_clock::now();
+    g_inFlightPipelineSinceMs.store(steady_now_ms(), std::memory_order_relaxed);
+    g_inFlightPipeline.store(pending.hash, std::memory_order_relaxed);
     auto result = pending.create();
+    g_inFlightPipeline.store(0, std::memory_order_relaxed);
+    const auto buildMs =
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - buildStart).count();
+    if (buildMs > 500) {
+      Log.warn("[pipeline-cache] pipeline {:016x} took {} ms to build", pending.hash, buildMs);
+    }
     {
       std::lock_guard lock{g_pipelineMutex};
       g_pipelines.try_emplace(pending.hash, CachedPipeline{
@@ -1003,6 +1103,10 @@ static void pipeline_worker() {
       ++g_pipelinesPerFrame;
     }
     notify_pipeline_ready(true);
+  }
+  if (g_hasPipelineThread) {
+    Log.info("[pipeline-cache] compilation thread exiting (end={} queued={})",
+             g_pipelineThreadEnd.load(), static_cast<uint32_t>(queuedPipelines));
   }
 }
 
@@ -1122,7 +1226,9 @@ void initialize_pipeline_cache() {
   g_pipelineThreadEnd = false;
   g_gpuCachePrunePending = false;
 
-  if (webgpu::g_backendType == wgpu::BackendType::WebGPU) {
+  // A dedicated compiler thread needs its own share context; without one, compile
+  // inline on the render worker (threadless) so GLSL compilation always has a context.
+  if (webgpu::g_backendType == BACKEND_WEBGPU || !gl::has_share_context()) {
     g_hasPipelineThread = false;
   } else {
     g_hasPipelineThread = true;
@@ -1132,6 +1238,7 @@ void initialize_pipeline_cache() {
   const size_t loadedCount = load_pipeline_cache();
   if (!g_pipelineCacheBroken && loadedCount > 0) {
     g_gpuCachePrunePending = true;
+    g_bootPrecompileStartMs.store(steady_now_ms(), std::memory_order_relaxed);
   }
 
   if (!g_pipelineCacheBroken) {
@@ -1174,7 +1281,7 @@ void end_pipeline_frame() {
   }
 }
 
-bool get_pipeline(PipelineRef ref, wgpu::RenderPipeline& pipeline) {
+bool get_pipeline(PipelineRef ref, gl::Pipeline& pipeline) {
   std::lock_guard guard{g_pipelineMutex};
   const auto it = g_pipelines.find(ref);
   if (it == g_pipelines.end()) {

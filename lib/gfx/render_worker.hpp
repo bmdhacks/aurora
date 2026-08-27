@@ -83,6 +83,9 @@ void enqueue_work(WorkCallback work);
 void synchronize();
 
 bool is_worker_thread() noexcept;
+// False when the worker was never started (single-threaded mode): enqueue() then executes
+// work inline on the calling thread.
+bool is_running() noexcept;
 bool is_idle() noexcept;
 
 } // namespace aurora::gfx::render_worker

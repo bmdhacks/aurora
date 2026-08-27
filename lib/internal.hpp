@@ -162,6 +162,9 @@ ALWAYS_INLINE constexpr auto underlying(T value) noexcept -> std::underlying_typ
 #else
 #define CHECK(cond, msg, ...) AURORA_ASSERT(cond, msg, ##__VA_ARGS__)
 #endif
+// Fork compat: our GLES-era code spells this ASSERT. Defined unconditionally,
+// unlike upstream's CHECK which is compiled out under NDEBUG.
+#define ASSERT(cond, msg, ...) AURORA_ASSERT(cond, msg, ##__VA_ARGS__)
 #define DEFAULT_FATAL(msg, ...) UNLIKELY default : FATAL(msg, ##__VA_ARGS__)
 #define TRY(cond, msg, ...)                                                                                            \
   if (!(cond))                                                                                                         \
