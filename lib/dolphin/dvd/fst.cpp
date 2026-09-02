@@ -112,7 +112,7 @@ void mergeOverlayFileIntoContext(const IterateContext& context, OverlayFileEntry
   std::string_view filePath = overlayFile.fileName;
   std::string currentPath;
 
-  assert(filePath.starts_with('/'));
+  assert(filePath.rfind('/', 0) == 0);
   filePath = filePath.substr(1);
   while (true) {
     const auto nextDelim = filePath.find('/');
@@ -227,7 +227,7 @@ s32 calcEntryCount(const IterateNode& node) {
 bool validateOverlayFile(const AuroraOverlayFile& file) {
   const std::string_view name(file.fileName);
 
-  if (!name.starts_with('/')) {
+  if (name.rfind('/', 0) != 0) {
     Log.error("Overlay path {} does not start with /", name);
     return false;
   }

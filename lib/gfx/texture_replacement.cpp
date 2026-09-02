@@ -409,7 +409,7 @@ std::optional<TextureSourceKey> parse_replacement_filename(std::string_view file
 
   const std::string_view stem = filename.substr(0, dot);
   constexpr std::string_view prefix = "tex1_";
-  if (!stem.starts_with(prefix)) {
+  if (stem.rfind(prefix, 0) != 0) {
     return std::nullopt;
   }
 

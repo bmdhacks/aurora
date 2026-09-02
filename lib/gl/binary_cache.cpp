@@ -478,7 +478,7 @@ void binary_cache_store(uint64_t key, GLuint program) {
   }
   {
     std::lock_guard lock{g_mapMutex};
-    if (g_map.contains(key)) {
+    if (g_map.count(key) != 0) {
       return;
     }
   }
